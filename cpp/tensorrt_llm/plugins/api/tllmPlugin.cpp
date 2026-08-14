@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include "tensorrt_llm/plugins/doraPlugin/doraPlugin.h"
 #include "tensorrt_llm/plugins/fp8RowwiseGemmPlugin/fp8RowwiseGemmPlugin.h"
 #include "tensorrt_llm/plugins/fusedLayernormPlugin/fusedLayernormPlugin.h"
+#include "tensorrt_llm/plugins/gatedDeltaRulePlugin/gatedDeltaRulePlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
@@ -299,13 +300,15 @@ extern "C"
 #endif // ENABLE_MULTI_DEVICE
 
         static tensorrt_llm::plugins::DoraPluginCreator doraPluginCreator;
+        static tensorrt_llm::plugins::GatedDeltaRulePluginCreator gatedDeltaRulePluginCreator;
 
         static std::array creators
             = { creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
 #if ENABLE_MULTI_DEVICE
                   creatorInterfacePtr(cpSplitPluginCreator),
 #endif // ENABLE_MULTI_DEVICE
-                  creatorInterfacePtr(doraPluginCreator) };
+                  creatorInterfacePtr(doraPluginCreator),
+                  creatorInterfacePtr(gatedDeltaRulePluginCreator) };
 
         nbCreators = creators.size();
         return creators.data();
