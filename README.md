@@ -18,6 +18,53 @@ TensorRT LLM
 ---
 <div align="left">
 
+## About This Fork
+
+This repository is a downstream fork of
+[NVIDIA/TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). The upstream
+project classifies the TensorRT backend and its engine-building workflow as a
+legacy path. This fork intentionally continues to maintain and extend that
+path for users who depend on TensorRT engines and the associated C++ runtime.
+
+The primary goals of this fork are to:
+
+* Keep the TensorRT engine pipeline buildable and usable with current NVIDIA
+  software stacks.
+* Add new model architectures, TensorRT plugins, and optimized CUDA kernels to
+  the engine pipeline.
+* Preserve integration with the C++ Executor, in-flight batching, paged cache
+  management, and TensorRT engine serialization.
+* Incorporate compatible fixes and improvements from the upstream project
+  without abandoning the engine-based workflow.
+* Validate new operators against reliable reference implementations before
+  performance optimization.
+
+This fork does not aim to replace the upstream PyTorch or AutoDeploy backends.
+Unless this README or fork-specific documentation says otherwise, the upstream
+TensorRT-LLM documentation and development guidance still apply.
+
+### Current Development Focus
+
+The current focus is Qwen3.5 Gated DeltaNet support in the TensorRT engine
+pipeline, beginning with a TensorRT V3 plugin for the gated delta rule.
+
+The V1 implementation targets homogeneous prefill or decode batches. Mixed
+prefill/decode batches and speculative decoding are intentionally outside the
+V1 scope and must be prevented by the upstream scheduler. A missing initial
+state is defined as an all-zero state. For paged state, prefill updates the
+state pool in place and exposes the final state, while decode updates the state
+pool in place.
+
+The planned implementation order is:
+
+1. Finalize the plugin interface and state-update contract.
+2. Add reference-based correctness tests for prefill, decode, and state
+   updates.
+3. Implement and validate the decode kernel.
+4. Implement and validate the chunked prefill kernel.
+5. Integrate the plugin into the Qwen3.5 TensorRT engine graph and runtime
+   pipeline.
+
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
