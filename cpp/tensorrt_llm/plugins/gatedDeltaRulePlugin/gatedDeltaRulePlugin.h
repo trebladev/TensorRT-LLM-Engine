@@ -37,7 +37,8 @@ namespace tensorrt_llm::plugins
 //   9. host_has_initial_state: [N], int8 on the host.
 // Outputs:
 //   0. output: same shape and type as value.
-//   1. final_state: [N, Hv, V, K], only present when paged_state is disabled.
+//   1. final_state: [N, Hv, V, K], float32. In paged mode it is valid for context requests and ignored for
+//      generation requests; the state pool is updated in place in both phases.
 class GatedDeltaRulePlugin : public BasePluginV3
 {
 public:

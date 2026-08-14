@@ -149,8 +149,8 @@ int32_t GatedDeltaRulePlugin::getOutputDataTypes(
         if (!mPagedState)
         {
             TLLM_CHECK(inputTypes[static_cast<int32_t>(InputIdx::kState)] == mStateType);
-            outputTypes[1] = mStateType;
         }
+        outputTypes[1] = mStateType;
     }
     catch (std::exception const& e)
     {
@@ -169,7 +169,15 @@ int32_t GatedDeltaRulePlugin::getOutputShapes(DimsExprs const* inputs, int32_t n
         TLLM_CHECK(nbShapeInputs == 0);
         TLLM_CHECK(nbOutputs == getNbOutputs());
         outputs[0] = inputs[static_cast<int32_t>(InputIdx::kValue)];
-        if (!mPagedState)
+        if (mPagedState)
+        {
+            outputs[1].nbDims = 4;
+            outputs[1].d[0] = inputs[static_cast<int32_t>(InputIdx::kHostRequestTypes)].d[0];
+            outputs[1].d[1] = exprBuilder.constant(mNumVHeads);
+            outputs[1].d[2] = exprBuilder.constant(mHeadVDim);
+            outputs[1].d[3] = exprBuilder.constant(mHeadKDim);
+        }
+        else
         {
             outputs[1] = inputs[static_cast<int32_t>(InputIdx::kState)];
         }
@@ -218,7 +226,7 @@ bool GatedDeltaRulePlugin::supportsFormatCombination(
     {
         return type == DataType::kINT8 && isLinear;
     }
-    if (!mPagedState && pos == nbInputs + 1)
+    if (pos == nbInputs + 1)
     {
         return type == mStateType && isLinear;
     }
@@ -227,7 +235,7 @@ bool GatedDeltaRulePlugin::supportsFormatCombination(
 
 int32_t GatedDeltaRulePlugin::getNbOutputs() const noexcept
 {
-    return mPagedState ? 1 : 2;
+    return 2;
 }
 
 size_t GatedDeltaRulePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
