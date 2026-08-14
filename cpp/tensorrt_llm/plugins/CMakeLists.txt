@@ -108,6 +108,15 @@ if(WIN32)
 endif()
 
 add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
+
+if(NOT WIN32)
+  include(tllm_cubin_archive)
+  tllm_add_cubin_archive_sources(
+    ${PLUGIN_SHARED_TARGET}
+    "${CMAKE_CURRENT_SOURCE_DIR}/gatedDeltaRulePlugin/cubin"
+    ARCHS 89)
+endif()
+
 add_cuda_architectures(${PLUGIN_SHARED_TARGET} 89)
 
 target_include_directories(

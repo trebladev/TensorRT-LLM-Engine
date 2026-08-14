@@ -19,10 +19,13 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace tensorrt_llm::plugins
 {
+
+class GatedDeltaRuleDecodeRunner;
 
 // Inputs:
 //   0. query: [B, S, Hq, K] or [1, T, Hq, K] in packed mode.
@@ -123,6 +126,8 @@ private:
     bool mRemoveInputPadding;
     bool mPagedState;
     bool mUseQkL2norm;
+
+    std::shared_ptr<GatedDeltaRuleDecodeRunner> mDecodeRunner;
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFieldsToSerialize{};
