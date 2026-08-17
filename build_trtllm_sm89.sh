@@ -9,17 +9,18 @@ cd "${project_dir}"
 
 nccl_version="2.29.2"
 job_count="${JOB_COUNT:-48}"
-skip_python_env_check=true
+skip_python_env_check=false
 
 usage() {
     cat <<'EOF'
 Usage: build_trtllm_sm89.sh [OPTION]
 
 Options:
-  --skip-python-env-check  Skip Python environment setup/checks and invoke
-                           CMake directly (default).
+  --skip-python-env-check  Skip Python environment setup/checks, invoke CMake
+                           directly, and do not package a wheel.
   --check-python-env       Run the original Python environment setup/checks
-                           through scripts/build_wheel.py.
+                           and package wheels through scripts/build_wheel.py
+                           (default).
   -h, --help               Show this help message.
 EOF
 }
@@ -195,6 +196,19 @@ def setup_venv_with_nccl_restore(*args, **kwargs):
     )
     (nccl_root / "lib/libnccl.so").unlink(missing_ok=True)
     (nccl_root / "lib/libnccl.so").symlink_to("libnccl.so.2")
+
+    torch_library_dir = subprocess.check_output(
+        [
+            str(venv_python),
+            "-c",
+            "from pathlib import Path; import torch; "
+            "print(Path(torch.__file__).resolve().parent / 'lib')",
+        ],
+        text=True,
+    ).strip()
+    os.environ["LD_LIBRARY_PATH"] = (
+        f"{torch_library_dir}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    )
     return venv_python, venv_conan
 
 
@@ -202,8 +216,8 @@ build_wheel.setup_venv = setup_venv_with_nccl_restore
 build_wheel.main(
     use_ccache=True,
     cuda_architectures="89-real",
-    skip_building_wheel=True,
-    linking_install_binary=True,
+    skip_building_wheel=False,
+    linking_install_binary=False,
     nccl_root=str(nccl_root),
     extra_cmake_vars=[
         f"NCCL_LIBRARY={nccl_root / 'lib/libnccl.so'}",

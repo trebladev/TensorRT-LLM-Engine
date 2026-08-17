@@ -17,11 +17,13 @@
 #include "gatedDeltaRulePlugin.h"
 
 #include "gatedDeltaRuleDecodeRunner.h"
+#include "gatedDeltaRulePrefillRunner.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 using namespace nvinfer1;
@@ -244,7 +246,31 @@ int32_t GatedDeltaRulePlugin::getNbOutputs() const noexcept
 size_t GatedDeltaRulePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
-    return 0;
+    try
+    {
+        TLLM_CHECK(nbInputs == static_cast<int32_t>(InputIdx::kNumInputs));
+        TLLM_CHECK(nbOutputs == getNbOutputs());
+        auto const queryIdx = static_cast<int32_t>(InputIdx::kQuery);
+        auto const requestTypesIdx = static_cast<int32_t>(InputIdx::kHostRequestTypes);
+        auto const& queryDims = inputs[queryIdx].max;
+        auto const& requestTypesDims = inputs[requestTypesIdx].max;
+        TLLM_CHECK(queryDims.nbDims == 4);
+        TLLM_CHECK(requestTypesDims.nbDims == 1);
+        TLLM_CHECK(queryDims.d[0] > 0 && queryDims.d[1] > 0);
+        TLLM_CHECK(requestTypesDims.d[0] > 0);
+        int64_t const totalTokens64 = static_cast<int64_t>(queryDims.d[0]) * queryDims.d[1];
+        TLLM_CHECK_WITH_INFO(totalTokens64 <= std::numeric_limits<int32_t>::max(),
+            "GatedDeltaRulePlugin maximum token count exceeds INT32_MAX");
+        int32_t const totalTokens = static_cast<int32_t>(totalTokens64);
+        int32_t const numRequests = requestTypesDims.d[0];
+        return GatedDeltaRulePrefillRunner::getWorkspaceSize(
+            totalTokens, numRequests, mNumQHeads, mNumVHeads, mHeadKDim, mHeadVDim);
+    }
+    catch (std::exception const& e)
+    {
+        caughtError(e);
+        return 0;
+    }
 }
 
 int32_t GatedDeltaRulePlugin::getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept
@@ -286,8 +312,102 @@ int32_t GatedDeltaRulePlugin::onShapeChange(
 int32_t GatedDeltaRulePlugin::enqueuePrefill(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    TLLM_LOG_ERROR("GatedDeltaRulePlugin prefill kernel is not implemented");
-    return -1;
+    try
+    {
+        (void) outputDesc;
+        TLLM_CHECK_WITH_INFO(mType == DataType::kBF16, "GatedDeltaRulePlugin AOT prefill only supports BF16");
+        TLLM_CHECK_WITH_INFO(mStateType == DataType::kFLOAT, "GatedDeltaRulePlugin AOT prefill requires FP32 state");
+        TLLM_CHECK_WITH_INFO(mChunkSize == 64, "GatedDeltaRulePlugin AOT prefill requires chunk_size=64");
+        TLLM_CHECK_WITH_INFO(
+            mRemoveInputPadding, "GatedDeltaRulePlugin AOT prefill currently requires remove_input_padding=true");
+        TLLM_CHECK_WITH_INFO(mUseQkL2norm, "GatedDeltaRulePlugin AOT prefill requires Q/K L2 normalization");
+        TLLM_CHECK_WITH_INFO(mPrefillRunner != nullptr, "GatedDeltaRulePlugin prefill runner is not initialized");
+
+        auto const queryIdx = static_cast<int32_t>(InputIdx::kQuery);
+        auto const keyIdx = static_cast<int32_t>(InputIdx::kKey);
+        auto const valueIdx = static_cast<int32_t>(InputIdx::kValue);
+        auto const logDecayIdx = static_cast<int32_t>(InputIdx::kLogDecay);
+        auto const betaIdx = static_cast<int32_t>(InputIdx::kBeta);
+        auto const stateIdx = static_cast<int32_t>(InputIdx::kState);
+        auto const requestTypesIdx = static_cast<int32_t>(InputIdx::kHostRequestTypes);
+        auto const cuSeqLensIdx = static_cast<int32_t>(InputIdx::kCuSeqLens);
+        auto const stateSlotMappingIdx = static_cast<int32_t>(InputIdx::kStateSlotMapping);
+        auto const hasInitialStateIdx = static_cast<int32_t>(InputIdx::kHostHasInitialState);
+
+        auto const& queryDims = inputDesc[queryIdx].dims;
+        auto const& keyDims = inputDesc[keyIdx].dims;
+        auto const& valueDims = inputDesc[valueIdx].dims;
+        auto const& logDecayDims = inputDesc[logDecayIdx].dims;
+        auto const& betaDims = inputDesc[betaIdx].dims;
+        TLLM_CHECK_WITH_INFO(queryDims.nbDims == 4 && keyDims.nbDims == 4 && valueDims.nbDims == 4,
+            "GatedDeltaRulePlugin prefill expects rank-4 Q/K/V tensors");
+        TLLM_CHECK_WITH_INFO(queryDims.d[0] == 1 && keyDims.d[0] == 1 && valueDims.d[0] == 1,
+            "GatedDeltaRulePlugin packed prefill expects Q/K/V batch dimension 1");
+        int32_t const totalTokens = queryDims.d[1];
+        TLLM_CHECK_WITH_INFO(keyDims.d[1] == totalTokens && valueDims.d[1] == totalTokens,
+            "GatedDeltaRulePlugin prefill Q/K/V token counts must match");
+        TLLM_CHECK_WITH_INFO(queryDims.d[2] == mNumQHeads && queryDims.d[3] == mHeadKDim,
+            "GatedDeltaRulePlugin prefill query shape does not match the configured heads");
+        TLLM_CHECK_WITH_INFO(keyDims.d[2] == mNumQHeads && keyDims.d[3] == mHeadKDim,
+            "GatedDeltaRulePlugin prefill key shape does not match the configured heads");
+        TLLM_CHECK_WITH_INFO(valueDims.d[2] == mNumVHeads && valueDims.d[3] == mHeadVDim,
+            "GatedDeltaRulePlugin prefill value shape does not match the configured heads");
+        TLLM_CHECK_WITH_INFO(logDecayDims.nbDims == 3 && betaDims.nbDims == 3 && logDecayDims.d[0] == 1
+                && betaDims.d[0] == 1 && logDecayDims.d[1] == totalTokens && betaDims.d[1] == totalTokens
+                && logDecayDims.d[2] == mNumVHeads && betaDims.d[2] == mNumVHeads,
+            "GatedDeltaRulePlugin prefill log_decay/beta shapes must be [1, T, Hv]");
+
+        auto const& requestTypesDims = inputDesc[requestTypesIdx].dims;
+        auto const& stateSlotMappingDims = inputDesc[stateSlotMappingIdx].dims;
+        auto const& hasInitialStateDims = inputDesc[hasInitialStateIdx].dims;
+        TLLM_CHECK_WITH_INFO(requestTypesDims.nbDims == 1 && requestTypesDims.d[0] > 0,
+            "GatedDeltaRulePlugin prefill host_request_types shape must be [N]");
+        int32_t const numRequests = requestTypesDims.d[0];
+        TLLM_CHECK_WITH_INFO(stateSlotMappingDims.nbDims == 1 && stateSlotMappingDims.d[0] == numRequests,
+            "GatedDeltaRulePlugin prefill state_slot_mapping shape must be [N]");
+        TLLM_CHECK_WITH_INFO(hasInitialStateDims.nbDims == 1 && hasInitialStateDims.d[0] == numRequests,
+            "GatedDeltaRulePlugin prefill host_has_initial_state shape must be [N]");
+        TLLM_CHECK_WITH_INFO(
+            inputDesc[cuSeqLensIdx].dims.nbDims == 1 && inputDesc[cuSeqLensIdx].dims.d[0] == numRequests + 1,
+            "GatedDeltaRulePlugin prefill cu_seqlens shape must be [N + 1]");
+
+        void* state{};
+        auto const& stateDims = inputDesc[stateIdx].dims;
+        if (mPagedState)
+        {
+            TLLM_CHECK_WITH_INFO(stateDims.nbDims == 1 && stateDims.d[0] == 1,
+                "GatedDeltaRulePlugin paged state input must contain one host pointer");
+            state = *reinterpret_cast<void**>(const_cast<void*>(inputs[stateIdx]));
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(stateDims.nbDims == 4 && stateDims.d[0] >= numRequests && stateDims.d[1] == mNumVHeads
+                    && stateDims.d[2] == mHeadVDim && stateDims.d[3] == mHeadKDim,
+                "GatedDeltaRulePlugin prefill state shape must be [S, Hv, V, K] with S >= N");
+            state = outputs[1];
+            if (inputs[stateIdx] != outputs[1])
+            {
+                size_t stateBytes = sizeof(float);
+                for (int32_t dimIdx = 0; dimIdx < stateDims.nbDims; ++dimIdx)
+                {
+                    stateBytes *= static_cast<size_t>(stateDims.d[dimIdx]);
+                }
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(state, inputs[stateIdx], stateBytes, cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+
+        GatedDeltaRulePrefillParams params{inputs[queryIdx], inputs[keyIdx], inputs[valueIdx], inputs[logDecayIdx],
+            inputs[betaIdx], outputs[0], state, outputs[1], static_cast<int32_t const*>(inputs[stateSlotMappingIdx]),
+            static_cast<int32_t const*>(inputs[cuSeqLensIdx]), static_cast<int8_t const*>(inputs[hasInitialStateIdx]),
+            workspace, totalTokens, numRequests, mPagedState};
+        mPrefillRunner->run(params, stream);
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        caughtError(e);
+        return -1;
+    }
 }
 
 int32_t GatedDeltaRulePlugin::enqueueDecode(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
@@ -413,6 +533,8 @@ IPluginV3* GatedDeltaRulePlugin::attachToContext(IPluginResourceContext* context
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->mDecodeRunner
             = std::make_shared<GatedDeltaRuleDecodeRunner>(mNumQHeads, mNumVHeads, mHeadKDim, mHeadVDim);
+        plugin->mPrefillRunner
+            = std::make_shared<GatedDeltaRulePrefillRunner>(mNumQHeads, mNumVHeads, mHeadKDim, mHeadVDim);
         return plugin.release();
     }
     catch (std::exception const& e)

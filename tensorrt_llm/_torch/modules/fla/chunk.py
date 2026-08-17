@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk.py
 # -*- coding: utf-8 -*-
@@ -9,16 +24,14 @@ from einops import rearrange
 
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import \
     chunk_gated_delta_rule_fwd_h
+from tensorrt_llm._torch.modules.fla.chunk_fwd import \
+    chunk_gated_delta_rule_fwd_intra
 from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
-from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import \
-    chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
-from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
 from tensorrt_llm._torch.modules.fla.utils import (SUPPRESS_LEVEL,
                                                    autocast_custom_fwd,
                                                    input_guard)
-from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
 
 
 def chunk_gated_delta_rule_fwd(
@@ -36,19 +49,13 @@ def chunk_gated_delta_rule_fwd(
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(k=k,
-                                 beta=beta,
-                                 g_cumsum=g,
-                                 cu_seqlens=cu_seqlens,
-                                 output_dtype=torch.float32)
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
+    w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
+        g=g,
         beta=beta,
-        A=A,
-        g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        chunk_size=64,
     )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,

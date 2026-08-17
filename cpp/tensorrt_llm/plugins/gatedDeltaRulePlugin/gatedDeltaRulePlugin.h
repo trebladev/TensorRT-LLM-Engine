@@ -26,6 +26,7 @@ namespace tensorrt_llm::plugins
 {
 
 class GatedDeltaRuleDecodeRunner;
+class GatedDeltaRulePrefillRunner;
 
 // Inputs:
 //   0. query: [B, S, Hq, K] or [1, T, Hq, K] in packed mode.
@@ -128,6 +129,7 @@ private:
     bool mUseQkL2norm;
 
     std::shared_ptr<GatedDeltaRuleDecodeRunner> mDecodeRunner;
+    std::shared_ptr<GatedDeltaRulePrefillRunner> mPrefillRunner;
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFieldsToSerialize{};

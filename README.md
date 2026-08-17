@@ -55,15 +55,25 @@ state is defined as an all-zero state. For paged state, prefill updates the
 state pool in place and exposes the final state, while decode updates the state
 pool in place.
 
-The planned implementation order is:
+See the [Gated Delta Rule plugin README](cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/README.md)
+for Triton cubin generation, plugin build commands, supported configurations,
+and build verification instructions.
 
-1. Finalize the plugin interface and state-update contract.
-2. Add reference-based correctness tests for prefill, decode, and state
-   updates.
-3. Implement and validate the decode kernel.
-4. Implement and validate the chunked prefill kernel.
-5. Integrate the plugin into the Qwen3.5 TensorRT engine graph and runtime
-   pipeline.
+The current implementation progress is:
+
+- [x] Finalize the plugin interface and state-update contract.
+- [x] Add reference-based correctness tests for prefill, decode, and state
+  updates.
+- [x] Implement and validate the decode kernel.
+- [x] Implement and validate the chunked prefill kernel, including packed
+  multi-request batches and sequences longer than 8K.
+- [x] Validate paged-state prefill followed by multi-step decode, including
+  non-contiguous and out-of-order state-slot mappings.
+- [x] Validate dynamic TensorRT optimization profiles for context
+  `[1, T, ...]` up to `T=8193` and generation `[B, 1, ...]` up to `B=8`.
+- [x] Complete an SM89 wheel build with the plugin and checked-in cubins.
+- [ ] Integrate the plugin into the Qwen3.5 TensorRT engine graph and runtime
+  pipeline.
 
 ## Tech Blogs
 
