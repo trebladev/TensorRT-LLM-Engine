@@ -29,7 +29,7 @@ from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
 from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
-from tensorrt_llm.plugin import TRT_LLM_PLUGIN_NAMESPACE
+from tensorrt_llm.layers import GatedDeltaRule
 
 HEAD_K_DIM = 128
 HEAD_V_DIM = 128
@@ -43,55 +43,6 @@ QWEN3_5_CONFIGS = (
 )
 SHORT_PREFILL_SEQUENCE_LENGTHS = (17, 64, 81)
 LONG_PREFILL_SEQUENCE_LENGTHS = (32, 96, 127, 4000, 8193)
-
-
-def _make_plugin_field(
-    name: str,
-    value: int,
-    dtype: type[np.integer],
-    field_type: trt.PluginFieldType,
-) -> trt.PluginField:
-    return trt.PluginField(name, np.array([value], dtype=dtype), field_type)
-
-
-def _add_gated_delta_rule_plugin(
-    inputs: list[Tensor],
-    num_q_heads: int,
-    num_v_heads: int,
-    remove_input_padding: bool = False,
-    paged_state: bool = False,
-) -> trt.IPluginV3Layer:
-    creator = trt.get_plugin_registry().get_creator("GatedDeltaRule", "1", TRT_LLM_PLUGIN_NAMESPACE)
-    assert creator is not None
-
-    fields = trt.PluginFieldCollection(
-        [
-            _make_plugin_field("num_q_heads", num_q_heads, np.int32, trt.PluginFieldType.INT32),
-            _make_plugin_field("num_v_heads", num_v_heads, np.int32, trt.PluginFieldType.INT32),
-            _make_plugin_field("head_k_dim", HEAD_K_DIM, np.int32, trt.PluginFieldType.INT32),
-            _make_plugin_field("head_v_dim", HEAD_V_DIM, np.int32, trt.PluginFieldType.INT32),
-            _make_plugin_field("chunk_size", CHUNK_SIZE, np.int32, trt.PluginFieldType.INT32),
-            _make_plugin_field("type_id", int(trt.bfloat16), np.int32, trt.PluginFieldType.INT32),
-            _make_plugin_field(
-                "state_type_id", int(trt.float32), np.int32, trt.PluginFieldType.INT32
-            ),
-            _make_plugin_field(
-                "remove_input_padding", int(remove_input_padding), np.int8, trt.PluginFieldType.INT8
-            ),
-            _make_plugin_field(
-                "paged_state", int(paged_state), np.int8, trt.PluginFieldType.INT8
-            ),
-            _make_plugin_field("use_qk_l2norm", 1, np.int8, trt.PluginFieldType.INT8),
-        ]
-    )
-    plugin = creator.create_plugin("gated_delta_rule", fields, trt.TensorRTPhase.BUILD)
-    assert plugin is not None
-
-    layer = tensorrt_llm.default_trtnet().add_plugin_v3(
-        [tensor.trt_tensor for tensor in inputs], [], plugin
-    )
-    assert layer is not None
-    return layer
 
 
 def _build_gated_delta_rule_session(
@@ -136,30 +87,30 @@ def _build_gated_delta_rule_session(
             location=trt.TensorLocation.HOST,
         )
 
-        layer = _add_gated_delta_rule_plugin(
-            [
-                query_tensor,
-                key_tensor,
-                value_tensor,
-                log_decay_tensor,
-                beta_tensor,
-                state_tensor,
-                host_request_types_tensor,
-                cu_seqlens_tensor,
-                state_slot_mapping_tensor,
-                host_has_initial_state_tensor,
-            ],
-            num_q_heads,
-            num_v_heads,
+        gated_delta_rule_layer = GatedDeltaRule(
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            head_k_dim=HEAD_K_DIM,
+            head_v_dim=HEAD_V_DIM,
+            chunk_size=CHUNK_SIZE,
+            dtype=trt.bfloat16,
             remove_input_padding=remove_input_padding,
             paged_state=paged_state,
         )
-        output_tensor = layer.get_output(0)
-        output_tensor.name = "output"
-        network.trt_network.mark_output(output_tensor)
-        final_state_tensor = layer.get_output(1)
-        final_state_tensor.name = "final_state"
-        network.trt_network.mark_output(final_state_tensor)
+        output_tensor, final_state_tensor = gated_delta_rule_layer(
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            log_decay_tensor,
+            beta_tensor,
+            state_tensor,
+            host_request_types_tensor,
+            cu_seqlens_tensor,
+            state_slot_mapping_tensor,
+            host_has_initial_state_tensor,
+        )
+        output_tensor.mark_output("output")
+        final_state_tensor.mark_output("final_state")
 
     builder_config = builder.create_builder_config(precision="bfloat16")
     for shape_ranges in optimization_profiles:
@@ -314,28 +265,30 @@ def test_gated_delta_rule_decode(
             location=trt.TensorLocation.HOST,
         )
 
-        layer = _add_gated_delta_rule_plugin(
-            [
-                query_tensor,
-                key_tensor,
-                value_tensor,
-                log_decay_tensor,
-                beta_tensor,
-                state_tensor,
-                host_request_types_tensor,
-                cu_seqlens_tensor,
-                state_slot_mapping_tensor,
-                host_has_initial_state_tensor,
-            ],
-            num_q_heads,
-            num_v_heads,
+        gated_delta_rule_layer = GatedDeltaRule(
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            head_k_dim=HEAD_K_DIM,
+            head_v_dim=HEAD_V_DIM,
+            chunk_size=CHUNK_SIZE,
+            dtype=trt.bfloat16,
+            remove_input_padding=False,
+            paged_state=False,
         )
-        output_tensor = layer.get_output(0)
-        output_tensor.name = "output"
-        network.trt_network.mark_output(output_tensor)
-        final_state_tensor = layer.get_output(1)
-        final_state_tensor.name = "final_state"
-        network.trt_network.mark_output(final_state_tensor)
+        output_tensor, final_state_tensor = gated_delta_rule_layer(
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            log_decay_tensor,
+            beta_tensor,
+            state_tensor,
+            host_request_types_tensor,
+            cu_seqlens_tensor,
+            state_slot_mapping_tensor,
+            host_has_initial_state_tensor,
+        )
+        output_tensor.mark_output("output")
+        final_state_tensor.mark_output("final_state")
 
     builder_config = builder.create_builder_config(precision="bfloat16")
     engine = builder.build_engine(network, builder_config)
@@ -576,29 +529,30 @@ def test_gated_delta_rule_packed_prefill(
             location=trt.TensorLocation.HOST,
         )
 
-        layer = _add_gated_delta_rule_plugin(
-            [
-                query_tensor,
-                key_tensor,
-                value_tensor,
-                log_decay_tensor,
-                beta_tensor,
-                state_tensor,
-                host_request_types_tensor,
-                cu_seqlens_tensor,
-                state_slot_mapping_tensor,
-                host_has_initial_state_tensor,
-            ],
-            num_q_heads,
-            num_v_heads,
+        gated_delta_rule_layer = GatedDeltaRule(
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            head_k_dim=HEAD_K_DIM,
+            head_v_dim=HEAD_V_DIM,
+            chunk_size=CHUNK_SIZE,
+            dtype=trt.bfloat16,
             remove_input_padding=True,
+            paged_state=False,
         )
-        output_tensor = layer.get_output(0)
-        output_tensor.name = "output"
-        network.trt_network.mark_output(output_tensor)
-        final_state_tensor = layer.get_output(1)
-        final_state_tensor.name = "final_state"
-        network.trt_network.mark_output(final_state_tensor)
+        output_tensor, final_state_tensor = gated_delta_rule_layer(
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            log_decay_tensor,
+            beta_tensor,
+            state_tensor,
+            host_request_types_tensor,
+            cu_seqlens_tensor,
+            state_slot_mapping_tensor,
+            host_has_initial_state_tensor,
+        )
+        output_tensor.mark_output("output")
+        final_state_tensor.mark_output("final_state")
 
     builder_config = builder.create_builder_config(precision="bfloat16")
     engine = builder.build_engine(network, builder_config)
@@ -647,7 +601,6 @@ def test_gated_delta_rule_packed_prefill(
     torch.testing.assert_close(output.float(), output_ref.float(), atol=output_atol, rtol=2e-2)
     state_atol = 1e-1 if use_chunk_reference else 1e-2
     torch.testing.assert_close(final_state, final_state_ref, atol=state_atol, rtol=1e-2)
-
 
 
 def test_gated_delta_rule_paged_state_prefill_decode_continuity() -> None:

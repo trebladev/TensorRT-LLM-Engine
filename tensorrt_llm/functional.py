@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -7689,3 +7689,72 @@ def cp_split_plugin(
     _add_plugin_info(layer, plg_creator, "cp_split", pfc)
     return _create_tensor(layer.get_output(0),
                           layer), _create_tensor(layer.get_output(2), layer)
+
+
+def gated_delta_rule(query: Tensor,
+                     key: Tensor,
+                     value: Tensor,
+                     log_decay: Tensor,
+                     beta: Tensor,
+                     state: Tensor,
+                     host_request_types: Tensor,
+                     cu_seqlens: Tensor,
+                     state_slot_mapping: Tensor,
+                     host_has_initial_state: Tensor,
+                     num_q_heads: int,
+                     num_v_heads: int,
+                     head_k_dim: int,
+                     head_v_dim: int,
+                     chunk_size: int,
+                     dtype: Union[str, trt.DataType],
+                     state_dtype: Union[str, trt.DataType] = 'float32',
+                     remove_input_padding: Optional[bool] = None,
+                     paged_state: Optional[bool] = None,
+                     use_qk_l2norm: bool = True) -> Tuple[Tensor, Tensor]:
+    """Add a Gated Delta Rule operation implemented by an IPluginV3 layer."""
+    plg_creator = trt.get_plugin_registry().get_creator(
+        'GatedDeltaRule', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    if isinstance(dtype, str):
+        dtype = str_dtype_to_trt(dtype)
+    if isinstance(state_dtype, str):
+        state_dtype = str_dtype_to_trt(state_dtype)
+    if remove_input_padding is None:
+        remove_input_padding = default_net().plugin_config.remove_input_padding
+    if paged_state is None:
+        paged_state = default_net().plugin_config.paged_state
+
+    def int32_field(name: str, value: int) -> trt.PluginField:
+        return trt.PluginField(name, np.array([int(value)], dtype=np.int32),
+                               trt.PluginFieldType.INT32)
+
+    def int8_field(name: str, value: bool) -> trt.PluginField:
+        return trt.PluginField(name, np.array([np.int8(value)], dtype=np.int8),
+                               trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection([
+        int32_field('num_q_heads', num_q_heads),
+        int32_field('num_v_heads', num_v_heads),
+        int32_field('head_k_dim', head_k_dim),
+        int32_field('head_v_dim', head_v_dim),
+        int32_field('chunk_size', chunk_size),
+        int32_field('type_id', int(dtype)),
+        int32_field('state_type_id', int(state_dtype)),
+        int8_field('remove_input_padding', remove_input_padding),
+        int8_field('paged_state', paged_state),
+        int8_field('use_qk_l2norm', use_qk_l2norm),
+    ])
+    plugin = plg_creator.create_plugin('gated_delta_rule', pfc,
+                                       trt.TensorRTPhase.BUILD)
+    assert plugin is not None
+
+    plug_inputs = [
+        query, key, value, log_decay, beta, state, host_request_types,
+        cu_seqlens, state_slot_mapping, host_has_initial_state
+    ]
+    layer = default_trtnet().add_plugin_v3(
+        [tensor.trt_tensor for tensor in plug_inputs], [], plugin)
+    _add_plugin_info(layer, plg_creator, 'gated_delta_rule', pfc)
+    return _create_tensor(layer.get_output(0),
+                          layer), _create_tensor(layer.get_output(1), layer)

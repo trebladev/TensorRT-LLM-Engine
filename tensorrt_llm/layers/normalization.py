@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 from typing import Optional
 
-from ..functional import (ACT2FN, Tensor, chunk, group_norm, layer_norm,
+from ..functional import (ACT2FN, Tensor, cast, chunk, group_norm, layer_norm,
                           rms_norm, unsqueeze)
 from ..mapping import Mapping
 from ..module import Module
@@ -91,6 +91,17 @@ class RmsNorm(Module):
         if normalized_shape is None:
             normalized_shape = self.normalized_shape
         return rms_norm(x, normalized_shape, self.num_groups, weight, self.eps)
+
+
+class RmsNormGate(RmsNorm):
+    """Apply RMS normalization followed by a SiLU gate."""
+
+    def forward(self, x, gate, normalized_shape=None):
+        output = super().forward(x, normalized_shape=normalized_shape)
+        output_dtype = output.dtype
+        fp32_output = cast(output, 'float32')
+        fp32_gate = ACT2FN['silu'](cast(gate, 'float32'))
+        return cast(fp32_output * fp32_gate, output_dtype)
 
 
 class GroupNorm(Module):

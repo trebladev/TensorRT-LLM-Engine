@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -158,6 +158,56 @@ class TestLayer(unittest.TestCase):
         np.testing.assert_allclose(ref.cpu().numpy(),
                                    outputs['output'],
                                    atol=1e-6)
+
+    @parameterized.expand([['float32'], ['bfloat16']],
+                          name_func=unittest_name_func)
+    def test_rms_norm_gate(self, dtype):
+        test_shape = [2, 5, 10, 16]
+        eps = 1e-6
+        torch.manual_seed(0)
+        torch_dtype = str_dtype_to_torch(dtype)
+        x_data = torch.randn(*test_shape, dtype=torch_dtype)
+        gate_data = torch.randn(*test_shape, dtype=torch_dtype)
+        weight_data = torch.randn(test_shape[-1], dtype=torch_dtype)
+
+        builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            x = Tensor(name='x',
+                       shape=x_data.shape,
+                       dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            gate = Tensor(name='gate',
+                          shape=gate_data.shape,
+                          dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            norm = tensorrt_llm.layers.RmsNormGate(test_shape[-1],
+                                                   eps=eps,
+                                                   dtype=dtype)
+            norm.weight.value = torch_to_numpy(weight_data.cpu())
+            output = norm(x, gate)
+            output.mark_output('output')
+
+        build_engine = EngineFromNetwork(
+            (builder.trt_builder, net.trt_network),
+            CreateConfig(bf16=dtype == 'bfloat16',
+                         precision_constraints='obey'))
+        with TrtRunner(build_engine) as runner:
+            output = runner.infer(feed_dict={
+                'x': x_data,
+                'gate': gate_data
+            })['output']
+
+        x_fp32 = x_data.float()
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        normalized = x_fp32 * torch.rsqrt(variance + eps)
+        normalized = normalized.to(torch_dtype) * weight_data
+        ref = (normalized.float() *
+               torch.nn.functional.silu(gate_data.float())).to(torch_dtype)
+
+        atol = 1e-6 if dtype == 'float32' else 5e-2
+        np.testing.assert_allclose(ref.float().cpu().numpy(),
+                                   output.float().cpu().numpy(),
+                                   atol=atol)
 
     def test_group_rms_norm_float32(self):
         # test data

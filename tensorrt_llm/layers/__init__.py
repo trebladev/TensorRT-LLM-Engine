@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,12 +21,13 @@ from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
 from .cast import Cast
 from .conv import Conv1d, Conv2d, Conv3d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
+from .gated_delta_rule import GatedDeltaRule
 from .language_adapter import LanguageAdapter, LanguageAdapterConfig
 from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
 from .moe import MOE, MoeConfig, SharedMoE
-from .normalization import GroupNorm, LayerNorm, RmsNorm
+from .normalization import GroupNorm, LayerNorm, RmsNorm, RmsNormGate
 from .pooling import AvgPool2d
 from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
 from .ssm import Mamba, Mamba2
@@ -34,6 +35,7 @@ from .ssm import Mamba, Mamba2
 __all__ = [
     'LayerNorm',
     'RmsNorm',
+    'RmsNormGate',
     'ColumnLinear',
     'Linear',
     'RowLinear',
@@ -46,6 +48,7 @@ __all__ = [
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',
+    'GatedDeltaRule',
     'Conv2d',
     'ConvTranspose2d',
     'Conv1d',
