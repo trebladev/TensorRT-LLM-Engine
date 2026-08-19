@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +58,8 @@ from .nemotron_nas.model import DeciLMForCausalLM
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
+from .qwen35.config import Qwen35Config
+from .qwen35.model import Qwen35ForCausalLM
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
@@ -112,6 +114,8 @@ __all__ = [
     'BaichuanForCausalLM',
     'QWenConfig'
     'QWenForCausalLM',
+    'Qwen35Config',
+    'Qwen35ForCausalLM',
     'QWenModel',
     'EncoderModel',
     'DecoderModel',
@@ -197,6 +201,7 @@ MODEL_MAP = {
     'Qwen2VLModel': QWenForCausalLM,
     'Qwen3ForCausalLM': QWenForCausalLM,
     'Qwen3MoeForCausalLM': QWenForCausalLM,
+    'Qwen35ForCausalLM': Qwen35ForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
