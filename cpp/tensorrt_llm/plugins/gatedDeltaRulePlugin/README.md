@@ -49,12 +49,15 @@ The tested long packed batch uses sequence lengths `(32, 96, 127, 4000, 8193)`.
 Stateful coverage validates `paged_state=true` prefill followed by three decode
 steps, with every step consuming the state written by the preceding step. It
 also validates a non-contiguous, out-of-order `state_slot_mapping` of
-`[6, 2, 5]` against an eight-slot state pool.
+`[6, 2, 5]` against an eight-slot state pool. Combined-record coverage stores
+the FP32 Gated Delta Rule state before a BF16 convolution-state tail in every
+slot, validates the configured byte stride in prefill and decode, and verifies
+that convolution tails and unused slots remain bitwise unchanged.
 
 Dynamic-shape coverage builds two TensorRT optimization profiles. The context
 profile accepts packed inputs shaped `[1, T, ...]` through `T=8193`, and the
 generation profile accepts decode inputs shaped `[B, 1, ...]` through `B=8`.
-The complete standalone functional test file currently passes all 26 cases.
+The complete standalone functional test file currently passes all 27 cases.
 
 A complete SM89 wheel build has been verified with the plugin and all
 checked-in decode and prefill cubin archives included. The repository
@@ -62,10 +65,15 @@ checked-in decode and prefill cubin archives included. The repository
 `--skip-python-env-check` only for the direct CMake path that does not package a
 wheel.
 
-The remaining integration work is to connect the plugin to the Qwen3.5
-TensorRT engine graph and runtime pipeline. Padded prefill tensors with a Q/K/V
-batch dimension greater than one, mixed prefill/decode batches, non-SM89 cubins,
-and additional head configurations are not currently supported.
+The Qwen3.5 TensorRT graph now passes the combined-record stride to the plugin
+and declares recurrent-state pointers, convolution-state pointers, and
+`host_has_initial_state` as host inputs. Remaining end-to-end runtime work
+includes populating `state_slot_mapping` with KVCacheManager physical block
+indices, binding both state pointers to the unified state pool, and teaching
+MambaConv1d the same combined-record stride and initial-state semantics. Padded
+prefill tensors with a Q/K/V batch dimension greater than one, mixed
+prefill/decode batches, non-SM89 cubins, and additional head configurations are
+not currently supported.
 
 ## Prerequisites
 
@@ -145,5 +153,5 @@ cmake --build cpp/build --target nvinfer_plugin_tensorrt_llm --parallel 8
 The functional coverage is located in
 `tests/unittest/trt/functional/test_gated_delta_rule_plugin.py`. It covers
 decode, packed-ragged prefill, paged-state continuity, arbitrary state-slot
-mapping, and dynamic context/generation profiles for value-head counts 16, 32,
-and 48.
+mapping, combined recurrent/convolution records, and dynamic
+context/generation profiles for value-head counts 16, 32, and 48.

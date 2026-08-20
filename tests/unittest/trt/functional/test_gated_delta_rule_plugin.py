@@ -52,6 +52,7 @@ def _build_gated_delta_rule_session(
     *,
     paged_state: bool,
     remove_input_padding: bool,
+    state_slot_stride_bytes: int = 0,
     optimization_profiles: tuple[
         dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]], ...
     ] = (),
@@ -94,6 +95,7 @@ def _build_gated_delta_rule_session(
             head_v_dim=HEAD_V_DIM,
             chunk_size=CHUNK_SIZE,
             dtype=trt.bfloat16,
+            state_slot_stride_bytes=state_slot_stride_bytes,
             remove_input_padding=remove_input_padding,
             paged_state=paged_state,
         )
@@ -822,6 +824,161 @@ def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping() -> None:
         initial_state_pool.index_select(0, unused_slots),
         atol=0,
         rtol=0,
+    )
+
+
+def test_gated_delta_rule_paged_state_combined_record_stride() -> None:
+    torch.manual_seed(2468)
+    device = "cuda"
+    num_q_heads = 16
+    num_v_heads = 16
+    num_slots = 8
+    sequence_lengths = (17, 33, 65)
+    num_requests = len(sequence_lengths)
+    total_tokens = sum(sequence_lengths)
+
+    gated_delta_state_bytes = num_v_heads * HEAD_V_DIM * HEAD_K_DIM * torch.float32.itemsize
+    conv_dim = 2 * num_q_heads * HEAD_K_DIM + num_v_heads * HEAD_V_DIM
+    conv_state_bytes = 3 * conv_dim * torch.bfloat16.itemsize
+    state_slot_stride_bytes = gated_delta_state_bytes + conv_state_bytes
+    state_slot_stride_elements = state_slot_stride_bytes // torch.float32.itemsize
+
+    record_pool = torch.full(
+        (num_slots, state_slot_stride_bytes),
+        0xA5,
+        dtype=torch.uint8,
+        device=device,
+    )
+    state_pool = torch.as_strided(
+        record_pool.view(torch.float32),
+        size=(num_slots, num_v_heads, HEAD_V_DIM, HEAD_K_DIM),
+        stride=(state_slot_stride_elements, HEAD_V_DIM * HEAD_K_DIM, HEAD_K_DIM, 1),
+    )
+    state_pool.copy_(0.02 * torch.randn_like(state_pool))
+    initial_state_pool = state_pool.clone()
+    initial_record_pool = record_pool.clone()
+    conv_tail = record_pool[:, gated_delta_state_bytes:].clone()
+
+    state_pointer = torch.tensor([state_pool.data_ptr()], dtype=torch.int64)
+    state_slot_mapping = torch.tensor([6, 2, 5], device=device, dtype=torch.int32)
+    host_has_initial_state = torch.tensor([1, 0, 1], dtype=torch.int8)
+    host_request_types = torch.zeros(num_requests, dtype=torch.int32)
+    cu_seqlens = torch.tensor(
+        [0, *np.cumsum(sequence_lengths).tolist()], device=device, dtype=torch.int32
+    )
+    query = torch.randn(
+        1, total_tokens, num_q_heads, HEAD_K_DIM, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn_like(query)
+    value = torch.randn(
+        1, total_tokens, num_v_heads, HEAD_V_DIM, device=device, dtype=torch.bfloat16
+    )
+    log_decay = -0.1 * torch.rand(1, total_tokens, num_v_heads, device=device)
+    beta = torch.sigmoid(torch.randn(1, total_tokens, num_v_heads, device=device))
+    prefill_inputs = {
+        "query": query,
+        "key": key,
+        "value": value,
+        "log_decay": log_decay,
+        "beta": beta,
+        "state": state_pointer,
+        "host_request_types": host_request_types,
+        "cu_seqlens": cu_seqlens,
+        "state_slot_mapping": state_slot_mapping,
+        "host_has_initial_state": host_has_initial_state,
+    }
+    prefill_session = _build_gated_delta_rule_session(
+        {name: tuple(tensor.shape) for name, tensor in prefill_inputs.items()},
+        num_q_heads,
+        num_v_heads,
+        paged_state=True,
+        remove_input_padding=True,
+        state_slot_stride_bytes=state_slot_stride_bytes,
+    )
+    output, final_state = _run_gated_delta_rule_session(prefill_session, prefill_inputs)
+    output_ref, expected_state_pool = _gated_delta_rule_prefill_reference(
+        query,
+        key,
+        value,
+        log_decay,
+        beta,
+        initial_state_pool,
+        cu_seqlens,
+        state_slot_mapping,
+        host_has_initial_state,
+    )
+
+    torch.testing.assert_close(output.float(), output_ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(state_pool, expected_state_pool, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        final_state,
+        expected_state_pool.index_select(0, state_slot_mapping.to(torch.long)),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.equal(record_pool[:, gated_delta_state_bytes:], conv_tail)
+    unused_slots = torch.tensor([0, 1, 3, 4, 7], device=device, dtype=torch.long)
+    assert torch.equal(
+        record_pool.index_select(0, unused_slots),
+        initial_record_pool.index_select(0, unused_slots),
+    )
+
+    expected_state_pool = state_pool.clone()
+    host_request_types = torch.ones(num_requests, dtype=torch.int32)
+    host_has_initial_state = torch.ones(num_requests, dtype=torch.int8)
+    cu_seqlens = torch.arange(num_requests + 1, device=device, dtype=torch.int32)
+    query = torch.randn(
+        num_requests, 1, num_q_heads, HEAD_K_DIM, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn_like(query)
+    value = torch.randn(
+        num_requests,
+        1,
+        num_v_heads,
+        HEAD_V_DIM,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    log_decay = -0.1 * torch.rand(num_requests, 1, num_v_heads, device=device)
+    beta = torch.sigmoid(torch.randn(num_requests, 1, num_v_heads, device=device))
+    decode_inputs = {
+        "query": query,
+        "key": key,
+        "value": value,
+        "log_decay": log_decay,
+        "beta": beta,
+        "state": state_pointer,
+        "host_request_types": host_request_types,
+        "cu_seqlens": cu_seqlens,
+        "state_slot_mapping": state_slot_mapping,
+        "host_has_initial_state": host_has_initial_state,
+    }
+    decode_session = _build_gated_delta_rule_session(
+        {name: tuple(tensor.shape) for name, tensor in decode_inputs.items()},
+        num_q_heads,
+        num_v_heads,
+        paged_state=True,
+        remove_input_padding=True,
+        state_slot_stride_bytes=state_slot_stride_bytes,
+    )
+    output, _ = _run_gated_delta_rule_session(decode_session, decode_inputs)
+    output_ref, expected_state_pool = _gated_delta_rule_paged_decode_reference(
+        query,
+        key,
+        value,
+        log_decay,
+        beta,
+        expected_state_pool,
+        state_slot_mapping,
+        host_has_initial_state,
+    )
+
+    torch.testing.assert_close(output.float(), output_ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(state_pool, expected_state_pool, atol=2e-3, rtol=2e-3)
+    assert torch.equal(record_pool[:, gated_delta_state_bytes:], conv_tail)
+    assert torch.equal(
+        record_pool.index_select(0, unused_slots),
+        initial_record_pool.index_select(0, unused_slots),
     )
 
 
