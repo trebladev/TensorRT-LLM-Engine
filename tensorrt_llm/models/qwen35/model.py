@@ -59,6 +59,10 @@ if TYPE_CHECKING:
     import transformers
 
 
+_BF16_ELEMENT_BYTES = 2
+_FP32_ELEMENT_BYTES = 4
+
+
 class _AttentionGate:
     def __init__(self) -> None:
         self.value: Tensor | None = None
@@ -198,6 +202,11 @@ class Qwen35LinearAttention(Module):
         self.conv1d = MambaConv1d(
             self.conv_dim, config.linear_conv_kernel_dim, dtype=config.dtype, apply_silu=True
         )
+        gated_delta_state_bytes = (
+            self.num_v_heads * self.head_v_dim * self.head_k_dim * _FP32_ELEMENT_BYTES
+        )
+        conv_state_bytes = (config.linear_conv_kernel_dim - 1) * self.conv_dim * _BF16_ELEMENT_BYTES
+        state_slot_stride_bytes = gated_delta_state_bytes + conv_state_bytes
         self.dt_bias = Parameter(shape=(self.num_v_heads,), dtype="float32")
         self.A_log = Parameter(shape=(self.num_v_heads,), dtype="float32")
         self.gated_delta_rule = GatedDeltaRule(
@@ -208,6 +217,7 @@ class Qwen35LinearAttention(Module):
             chunk_size=config.gated_delta_chunk_size,
             dtype=config.dtype,
             state_dtype=config.state_dtype,
+            state_slot_stride_bytes=state_slot_stride_bytes,
             remove_input_padding=True,
             use_qk_l2norm=True,
         )
@@ -560,12 +570,14 @@ class Qwen35ForCausalLM(PretrainedModel):
                     dtype=trt.int64,
                     shape=[1],
                     dim_range=one_dim_range,
+                    location=trt.TensorLocation.HOST,
                 )
                 recurrent_state = Tensor(
                     name=f"recurrent_state_ptr_{layer_idx}",
                     dtype=trt.int64,
                     shape=[1],
                     dim_range=one_dim_range,
+                    location=trt.TensorLocation.HOST,
                 )
             else:
                 conv_state = Tensor(
@@ -598,7 +610,11 @@ class Qwen35ForCausalLM(PretrainedModel):
                 name="state_slot_mapping", dtype=trt.int32, shape=[-1], dim_range=batch_dim_range
             ),
             "host_has_initial_state": Tensor(
-                name="host_has_initial_state", dtype=trt.int8, shape=[-1], dim_range=batch_dim_range
+                name="host_has_initial_state",
+                dtype=trt.int8,
+                shape=[-1],
+                dim_range=batch_dim_range,
+                location=trt.TensorLocation.HOST,
             ),
         }
 
