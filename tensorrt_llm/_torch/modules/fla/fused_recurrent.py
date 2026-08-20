@@ -335,6 +335,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o,
     h0_source,
     h0_indices,
+    h0_stride,
     cu_seqlens,
     scale,
     intermediate_states_buffer,
@@ -391,7 +392,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
             # Pool layout [slots, HV, V, K], K innermost (stride 1).
-            p_h0 = (h0_source + idx * HV * V * K + i_hv * V * K + o_k[:, None] +
+            p_h0 = (h0_source + idx * h0_stride + i_hv * V * K + o_k[:, None] +
                     o_v[None, :] * K)
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -455,7 +456,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     if not DISABLE_STATE_UPDATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:  # Add bounds checking
-            p_h0 = (h0_source + idx * HV * V * K + i_hv * V * K + o_k[:, None] +
+            p_h0 = (h0_source + idx * h0_stride + i_hv * V * K + o_k[:, None] +
                     o_v[None, :] * K)
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
@@ -502,6 +503,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        h0_stride=initial_state_source.stride(0),
         cu_seqlens=cu_seqlens,
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,

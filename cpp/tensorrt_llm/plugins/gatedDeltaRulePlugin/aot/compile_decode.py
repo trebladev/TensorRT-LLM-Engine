@@ -35,7 +35,7 @@ BLOCK_K = 128
 BLOCK_V = 8
 NUM_WARPS = 1
 NUM_STAGES = 3
-EXPECTED_SHARED_MEMORY = 16
+EXPECTED_SHARED_MEMORY = 256
 KERNEL_NAME = "fused_recurrent_gated_delta_rule_update_fwd_kernel"
 
 
@@ -80,6 +80,7 @@ def _make_source(kernel: triton.runtime.JITFunction, num_v_heads: int) -> triton
         "*bf16:16",
         "*fp32:16",
         "*i32:16",
+        "i64",
         "*i32:16",
         "fp32",
         "*fp32:16",

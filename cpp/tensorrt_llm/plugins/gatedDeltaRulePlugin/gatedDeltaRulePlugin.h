@@ -34,7 +34,9 @@ class GatedDeltaRulePrefillRunner;
 //   2. value: [B, S, Hv, V] or [1, T, Hv, V] in packed mode.
 //   3. log_decay: [B, S, Hv] or [1, T, Hv], float32.
 //   4. beta: [B, S, Hv] or [1, T, Hv], float32.
-//   5. state: [N, Hv, V, K], or host [1] containing a state-pool pointer when paged_state is enabled.
+//   5. state: [N, Hv, V, K], or host [1] containing a state-pool pointer when paged_state is enabled. The paged
+//      pointer addresses the GatedDeltaRule subsection of slot 0; state_slot_stride_bytes is the byte distance
+//      between adjacent slots.
 //   6. host_request_types: [N], int32 on the host. 0 is context and 1 is generation.
 //   7. cu_seqlens: [N + 1], int32.
 //   8. state_slot_mapping: [N], int32.
@@ -48,8 +50,8 @@ class GatedDeltaRulePlugin : public BasePluginV3
 public:
     GatedDeltaRulePlugin() = delete;
     GatedDeltaRulePlugin(int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim, int32_t chunkSize,
-        nvinfer1::DataType type, nvinfer1::DataType stateType, bool removeInputPadding, bool pagedState,
-        bool useQkL2norm);
+        nvinfer1::DataType type, nvinfer1::DataType stateType, int64_t stateSlotStrideBytes, bool removeInputPadding,
+        bool pagedState, bool useQkL2norm);
     GatedDeltaRulePlugin(GatedDeltaRulePlugin const& plugin) = default;
 
     // IPluginV3 methods
@@ -112,6 +114,7 @@ private:
 
     void initFieldsToSerialize();
     void validateConfig() const;
+    [[nodiscard]] int64_t getStateSlotStrideElements() const;
     int32_t enqueuePrefill(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
     int32_t enqueueDecode(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
@@ -124,6 +127,7 @@ private:
     int32_t mChunkSize;
     nvinfer1::DataType mType;
     nvinfer1::DataType mStateType;
+    int64_t mStateSlotStrideBytes;
     bool mRemoveInputPadding;
     bool mPagedState;
     bool mUseQkL2norm;

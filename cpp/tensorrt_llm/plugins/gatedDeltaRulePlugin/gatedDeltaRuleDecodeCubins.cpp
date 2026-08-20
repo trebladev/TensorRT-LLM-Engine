@@ -46,7 +46,7 @@ auto const& getCubins()
     constexpr int32_t kNumQHeads = 16;
     constexpr int32_t kHeadKDim = 128;
     constexpr int32_t kHeadVDim = 128;
-    constexpr int32_t kSharedMemoryBytes = 16;
+    constexpr int32_t kSharedMemoryBytes = 256;
     constexpr char const* kKernelName = "fused_recurrent_gated_delta_rule_update_fwd_kernel";
     static std::array<GatedDeltaRuleDecodeCubin, 3> const cubins{{
         {kSm, kNumQHeads, 16, kHeadKDim, kHeadVDim,

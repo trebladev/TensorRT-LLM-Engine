@@ -97,6 +97,10 @@ void GatedDeltaRuleDecodeRunner::run(GatedDeltaRuleDecodeParams const& params, c
     CUdeviceptr output = reinterpret_cast<CUdeviceptr>(params.output);
     CUdeviceptr state = reinterpret_cast<CUdeviceptr>(params.state);
     CUdeviceptr stateSlotMapping = reinterpret_cast<CUdeviceptr>(params.stateSlotMapping);
+    int64_t stateStride = params.stateSlotStrideElements;
+    int64_t const tightStateStride = static_cast<int64_t>(mNumVHeads) * mHeadVDim * mHeadKDim;
+    TLLM_CHECK_WITH_INFO(
+        stateStride >= tightStateStride, "GatedDeltaRule state slot stride is smaller than the compact state");
     CUdeviceptr cuSeqLens = reinterpret_cast<CUdeviceptr>(params.cuSeqLens);
     float scale = 1.0F / std::sqrt(static_cast<float>(mHeadKDim));
     CUdeviceptr intermediateStatesBuffer{};
@@ -105,8 +109,8 @@ void GatedDeltaRuleDecodeRunner::run(GatedDeltaRuleDecodeParams const& params, c
     CUdeviceptr globalScratch{};
     CUdeviceptr profileScratch{};
 
-    void* kernelParams[] = {&query, &key, &value, &logDecay, &beta, &output, &state, &stateSlotMapping, &cuSeqLens,
-        &scale, &intermediateStatesBuffer, &cacheSteps, &totalTokens, &globalScratch, &profileScratch};
+    void* kernelParams[] = {&query, &key, &value, &logDecay, &beta, &output, &state, &stateSlotMapping, &stateStride,
+        &cuSeqLens, &scale, &intermediateStatesBuffer, &cacheSteps, &totalTokens, &globalScratch, &profileScratch};
 
     constexpr unsigned int kGridX = 1U;
     constexpr unsigned int kBlockX = 32U;

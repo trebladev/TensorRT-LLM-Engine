@@ -58,6 +58,7 @@ def prepare_chunk_metadata_kernel(
 def zero_missing_states_kernel(
     state,
     state_slot_mapping,
+    state_stride,
     has_initial_state,
     num_requests,
     H: tl.constexpr,
@@ -73,7 +74,7 @@ def zero_missing_states_kernel(
         return
 
     state_slot = tl.load(state_slot_mapping + request_idx).to(tl.int64)
-    state += (state_slot * H + head_idx) * V * K
+    state += state_slot * state_stride + head_idx * V * K
     state_block = tl.make_block_ptr(
         state,
         (V, K),
@@ -91,6 +92,7 @@ def gather_states_kernel(
     state,
     final_state,
     state_slot_mapping,
+    state_stride,
     num_requests,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -105,7 +107,7 @@ def gather_states_kernel(
         return
 
     state_slot = tl.load(state_slot_mapping + request_idx).to(tl.int64)
-    state += (state_slot * H + head_idx) * V * K
+    state += state_slot * state_stride + head_idx * V * K
     final_state += (request_idx * H + head_idx) * V * K
     state_block = tl.make_block_ptr(
         state,

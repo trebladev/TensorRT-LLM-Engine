@@ -218,7 +218,10 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     int32_t totalTokens = params.totalTokens;
     int32_t numRequests = params.numRequests;
     int32_t maxChunksValue = static_cast<int32_t>(maxChunks);
-    int64_t stateStride = static_cast<int64_t>(mNumVHeads) * mHeadVDim * mHeadKDim;
+    int64_t stateStride = params.stateSlotStrideElements;
+    int64_t const tightStateStride = static_cast<int64_t>(mNumVHeads) * mHeadVDim * mHeadKDim;
+    TLLM_CHECK_WITH_INFO(
+        stateStride >= tightStateStride, "GatedDeltaRule state slot stride is smaller than the compact state");
     float epsilon = 1e-6F;
     float scale = 1.0F / std::sqrt(static_cast<float>(mHeadKDim));
     CUdeviceptr globalScratch{};
@@ -244,7 +247,8 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
         &cuSeqLens, &chunkIndices, &chunkOffsets, &chunkCounter, &numRequests, &globalScratch, &profileScratch};
     launch(mPrepareChunks, static_cast<unsigned int>(numRequests), 1, 1, prepareChunksParams);
 
-    void* zeroStateParams[]{&state, &stateSlotMapping, &hasInitialState, &numRequests, &globalScratch, &profileScratch};
+    void* zeroStateParams[]{
+        &state, &stateSlotMapping, &stateStride, &hasInitialState, &numRequests, &globalScratch, &profileScratch};
     launch(mZeroState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kIoBlockV)),
         static_cast<unsigned int>(numRequests * mNumVHeads), 1, zeroStateParams);
 
@@ -278,7 +282,7 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     if (params.pagedState)
     {
         void* gatherStateParams[]{
-            &state, &finalState, &stateSlotMapping, &numRequests, &globalScratch, &profileScratch};
+            &state, &finalState, &stateSlotMapping, &stateStride, &numRequests, &globalScratch, &profileScratch};
         launch(mGatherState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kIoBlockV)),
             static_cast<unsigned int>(numRequests * mNumVHeads), 1, gatherStateParams);
     }

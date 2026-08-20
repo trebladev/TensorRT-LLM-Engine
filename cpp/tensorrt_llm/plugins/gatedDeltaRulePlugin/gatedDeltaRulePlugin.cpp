@@ -34,7 +34,7 @@ using tensorrt_llm::plugins::GatedDeltaRulePluginCreator;
 namespace
 {
 
-char const* GATED_DELTA_RULE_PLUGIN_VERSION{"1"};
+char const* GATED_DELTA_RULE_PLUGIN_VERSION{"2"};
 char const* GATED_DELTA_RULE_PLUGIN_NAME{"GatedDeltaRule"};
 
 } // namespace
@@ -43,7 +43,8 @@ PluginFieldCollection GatedDeltaRulePluginCreator::mFC{};
 std::vector<PluginField> GatedDeltaRulePluginCreator::mPluginAttributes;
 
 GatedDeltaRulePlugin::GatedDeltaRulePlugin(int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim,
-    int32_t chunkSize, DataType type, DataType stateType, bool removeInputPadding, bool pagedState, bool useQkL2norm)
+    int32_t chunkSize, DataType type, DataType stateType, int64_t stateSlotStrideBytes, bool removeInputPadding,
+    bool pagedState, bool useQkL2norm)
     : mNumQHeads(numQHeads)
     , mNumVHeads(numVHeads)
     , mHeadKDim(headKDim)
@@ -51,6 +52,7 @@ GatedDeltaRulePlugin::GatedDeltaRulePlugin(int32_t numQHeads, int32_t numVHeads,
     , mChunkSize(chunkSize)
     , mType(type)
     , mStateType(stateType)
+    , mStateSlotStrideBytes(stateSlotStrideBytes)
     , mRemoveInputPadding(removeInputPadding)
     , mPagedState(pagedState)
     , mUseQkL2norm(useQkL2norm)
@@ -70,6 +72,25 @@ void GatedDeltaRulePlugin::validateConfig() const
     TLLM_CHECK_WITH_INFO(mType == DataType::kHALF || mType == DataType::kBF16,
         "GatedDeltaRulePlugin only supports FP16 and BF16 activations");
     TLLM_CHECK_WITH_INFO(mStateType == DataType::kFLOAT, "GatedDeltaRulePlugin state must use FP32");
+    int64_t const tightStateBytes
+        = static_cast<int64_t>(mNumVHeads) * mHeadVDim * mHeadKDim * static_cast<int64_t>(sizeof(float));
+    TLLM_CHECK_WITH_INFO(mStateSlotStrideBytes >= 0, "state_slot_stride_bytes must be non-negative");
+    if (mStateSlotStrideBytes != 0)
+    {
+        TLLM_CHECK_WITH_INFO(mStateSlotStrideBytes >= tightStateBytes,
+            "state_slot_stride_bytes must be at least the compact GatedDeltaRule state size");
+        TLLM_CHECK_WITH_INFO(mStateSlotStrideBytes % static_cast<int64_t>(sizeof(float)) == 0,
+            "state_slot_stride_bytes must be divisible by the FP32 state element size");
+    }
+}
+
+int64_t GatedDeltaRulePlugin::getStateSlotStrideElements() const
+{
+    if (!mPagedState || mStateSlotStrideBytes == 0)
+    {
+        return static_cast<int64_t>(mNumVHeads) * mHeadVDim * mHeadKDim;
+    }
+    return mStateSlotStrideBytes / static_cast<int64_t>(sizeof(float));
 }
 
 void GatedDeltaRulePlugin::initFieldsToSerialize()
@@ -82,6 +103,7 @@ void GatedDeltaRulePlugin::initFieldsToSerialize()
     mDataToSerialize.emplace_back("chunk_size", &mChunkSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("type_id", &mType, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("state_type_id", &mStateType, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("state_slot_stride_bytes", &mStateSlotStrideBytes, PluginFieldType::kINT64, 1);
     mDataToSerialize.emplace_back("remove_input_padding", &mRemoveInputPadding, PluginFieldType::kINT8, 1);
     mDataToSerialize.emplace_back("paged_state", &mPagedState, PluginFieldType::kINT8, 1);
     mDataToSerialize.emplace_back("use_qk_l2norm", &mUseQkL2norm, PluginFieldType::kINT8, 1);
@@ -105,7 +127,7 @@ IPluginV3* GatedDeltaRulePlugin::clone() noexcept
     try
     {
         auto plugin = std::make_unique<GatedDeltaRulePlugin>(mNumQHeads, mNumVHeads, mHeadKDim, mHeadVDim, mChunkSize,
-            mType, mStateType, mRemoveInputPadding, mPagedState, mUseQkL2norm);
+            mType, mStateType, mStateSlotStrideBytes, mRemoveInputPadding, mPagedState, mUseQkL2norm);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin.release();
     }
@@ -397,9 +419,9 @@ int32_t GatedDeltaRulePlugin::enqueuePrefill(PluginTensorDesc const* inputDesc, 
         }
 
         GatedDeltaRulePrefillParams params{inputs[queryIdx], inputs[keyIdx], inputs[valueIdx], inputs[logDecayIdx],
-            inputs[betaIdx], outputs[0], state, outputs[1], static_cast<int32_t const*>(inputs[stateSlotMappingIdx]),
-            static_cast<int32_t const*>(inputs[cuSeqLensIdx]), static_cast<int8_t const*>(inputs[hasInitialStateIdx]),
-            workspace, totalTokens, numRequests, mPagedState};
+            inputs[betaIdx], outputs[0], state, getStateSlotStrideElements(), outputs[1],
+            static_cast<int32_t const*>(inputs[stateSlotMappingIdx]), static_cast<int32_t const*>(inputs[cuSeqLensIdx]),
+            static_cast<int8_t const*>(inputs[hasInitialStateIdx]), workspace, totalTokens, numRequests, mPagedState};
         mPrefillRunner->run(params, stream);
         return 0;
     }
@@ -472,8 +494,9 @@ int32_t GatedDeltaRulePlugin::enqueueDecode(PluginTensorDesc const* inputDesc, P
         }
 
         GatedDeltaRuleDecodeParams params{inputs[queryIdx], inputs[keyIdx], inputs[valueIdx], inputs[logDecayIdx],
-            inputs[betaIdx], outputs[0], state, static_cast<int32_t const*>(inputs[stateSlotMappingIdx]),
-            static_cast<int32_t const*>(inputs[cuSeqLensIdx]), numRequests};
+            inputs[betaIdx], outputs[0], state, getStateSlotStrideElements(),
+            static_cast<int32_t const*>(inputs[stateSlotMappingIdx]), static_cast<int32_t const*>(inputs[cuSeqLensIdx]),
+            numRequests};
         mDecodeRunner->run(params, stream);
         return 0;
     }
@@ -529,7 +552,7 @@ IPluginV3* GatedDeltaRulePlugin::attachToContext(IPluginResourceContext* context
     try
     {
         auto plugin = std::make_unique<GatedDeltaRulePlugin>(mNumQHeads, mNumVHeads, mHeadKDim, mHeadVDim, mChunkSize,
-            mType, mStateType, mRemoveInputPadding, mPagedState, mUseQkL2norm);
+            mType, mStateType, mStateSlotStrideBytes, mRemoveInputPadding, mPagedState, mUseQkL2norm);
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->mDecodeRunner
             = std::make_shared<GatedDeltaRuleDecodeRunner>(mNumQHeads, mNumVHeads, mHeadKDim, mHeadVDim);
@@ -559,6 +582,7 @@ GatedDeltaRulePluginCreator::GatedDeltaRulePluginCreator()
     mPluginAttributes.emplace_back("chunk_size", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("type_id", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("state_type_id", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back("state_slot_stride_bytes", nullptr, PluginFieldType::kINT64, 1);
     mPluginAttributes.emplace_back("remove_input_padding", nullptr, PluginFieldType::kINT8, 1);
     mPluginAttributes.emplace_back("paged_state", nullptr, PluginFieldType::kINT8, 1);
     mPluginAttributes.emplace_back("use_qk_l2norm", nullptr, PluginFieldType::kINT8, 1);
@@ -594,6 +618,7 @@ IPluginV3* GatedDeltaRulePluginCreator::createPlugin(
         int32_t chunkSize{};
         DataType type{};
         DataType stateType{};
+        int64_t stateSlotStrideBytes{};
         bool removeInputPadding{};
         bool pagedState{};
         bool useQkL2norm{};
@@ -604,6 +629,7 @@ IPluginV3* GatedDeltaRulePluginCreator::createPlugin(
         bool hasChunkSize{false};
         bool hasType{false};
         bool hasStateType{false};
+        bool hasStateSlotStrideBytes{false};
         bool hasRemoveInputPadding{false};
         bool hasPagedState{false};
         bool hasUseQkL2norm{false};
@@ -654,6 +680,12 @@ IPluginV3* GatedDeltaRulePluginCreator::createPlugin(
                 stateType = static_cast<DataType>(*static_cast<int32_t const*>(field.data));
                 hasStateType = true;
             }
+            else if (std::strcmp(field.name, "state_slot_stride_bytes") == 0)
+            {
+                TLLM_CHECK(field.type == PluginFieldType::kINT64 && field.length == 1);
+                stateSlotStrideBytes = *static_cast<int64_t const*>(field.data);
+                hasStateSlotStrideBytes = true;
+            }
             else if (std::strcmp(field.name, "remove_input_padding") == 0)
             {
                 TLLM_CHECK(field.type == PluginFieldType::kINT8 && field.length == 1);
@@ -679,9 +711,9 @@ IPluginV3* GatedDeltaRulePluginCreator::createPlugin(
         }
 
         TLLM_CHECK(hasNumQHeads && hasNumVHeads && hasHeadKDim && hasHeadVDim && hasChunkSize && hasType && hasStateType
-            && hasRemoveInputPadding && hasPagedState && hasUseQkL2norm);
+            && hasStateSlotStrideBytes && hasRemoveInputPadding && hasPagedState && hasUseQkL2norm);
         auto plugin = std::make_unique<GatedDeltaRulePlugin>(numQHeads, numVHeads, headKDim, headVDim, chunkSize, type,
-            stateType, removeInputPadding, pagedState, useQkL2norm);
+            stateType, stateSlotStrideBytes, removeInputPadding, pagedState, useQkL2norm);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin.release();
     }

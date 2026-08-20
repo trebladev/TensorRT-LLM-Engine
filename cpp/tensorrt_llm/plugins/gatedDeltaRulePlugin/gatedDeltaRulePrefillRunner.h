@@ -38,6 +38,7 @@ struct GatedDeltaRulePrefillParams
     void const* beta;
     void* output;
     void* state;
+    int64_t stateSlotStrideElements;
     void* finalState;
     int32_t const* stateSlotMapping;
     int32_t const* cuSeqLens;

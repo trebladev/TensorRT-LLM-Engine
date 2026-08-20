@@ -33,6 +33,7 @@ class GatedDeltaRule(Module):
         chunk_size: int,
         dtype: Union[str, trt.DataType],
         state_dtype: Union[str, trt.DataType] = "float32",
+        state_slot_stride_bytes: int = 0,
         remove_input_padding: Optional[bool] = None,
         paged_state: Optional[bool] = None,
         use_qk_l2norm: bool = True,
@@ -45,6 +46,7 @@ class GatedDeltaRule(Module):
         self.chunk_size = chunk_size
         self.dtype = dtype
         self.state_dtype = state_dtype
+        self.state_slot_stride_bytes = state_slot_stride_bytes
         self.remove_input_padding = remove_input_padding
         self.paged_state = paged_state
         self.use_qk_l2norm = use_qk_l2norm
@@ -80,6 +82,7 @@ class GatedDeltaRule(Module):
             chunk_size=self.chunk_size,
             dtype=self.dtype,
             state_dtype=self.state_dtype,
+            state_slot_stride_bytes=self.state_slot_stride_bytes,
             remove_input_padding=self.remove_input_padding,
             paged_state=self.paged_state,
             use_qk_l2norm=self.use_qk_l2norm,

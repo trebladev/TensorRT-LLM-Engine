@@ -7708,12 +7708,13 @@ def gated_delta_rule(query: Tensor,
                      chunk_size: int,
                      dtype: Union[str, trt.DataType],
                      state_dtype: Union[str, trt.DataType] = 'float32',
+                     state_slot_stride_bytes: int = 0,
                      remove_input_padding: Optional[bool] = None,
                      paged_state: Optional[bool] = None,
                      use_qk_l2norm: bool = True) -> Tuple[Tensor, Tensor]:
     """Add a Gated Delta Rule operation implemented by an IPluginV3 layer."""
     plg_creator = trt.get_plugin_registry().get_creator(
-        'GatedDeltaRule', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        'GatedDeltaRule', '2', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
 
     if isinstance(dtype, str):
@@ -7724,6 +7725,8 @@ def gated_delta_rule(query: Tensor,
         remove_input_padding = default_net().plugin_config.remove_input_padding
     if paged_state is None:
         paged_state = default_net().plugin_config.paged_state
+    if state_slot_stride_bytes < 0:
+        raise ValueError('state_slot_stride_bytes must be non-negative')
 
     def int32_field(name: str, value: int) -> trt.PluginField:
         return trt.PluginField(name, np.array([int(value)], dtype=np.int32),
@@ -7733,6 +7736,10 @@ def gated_delta_rule(query: Tensor,
         return trt.PluginField(name, np.array([np.int8(value)], dtype=np.int8),
                                trt.PluginFieldType.INT8)
 
+    def int64_field(name: str, value: int) -> trt.PluginField:
+        return trt.PluginField(name, np.array([int(value)], dtype=np.int64),
+                               trt.PluginFieldType.INT64)
+
     pfc = trt.PluginFieldCollection([
         int32_field('num_q_heads', num_q_heads),
         int32_field('num_v_heads', num_v_heads),
@@ -7741,6 +7748,8 @@ def gated_delta_rule(query: Tensor,
         int32_field('chunk_size', chunk_size),
         int32_field('type_id', int(dtype)),
         int32_field('state_type_id', int(state_dtype)),
+        int64_field('state_slot_stride_bytes',
+                    state_slot_stride_bytes if paged_state else 0),
         int8_field('remove_input_padding', remove_input_padding),
         int8_field('paged_state', paged_state),
         int8_field('use_qk_l2norm', use_qk_l2norm),

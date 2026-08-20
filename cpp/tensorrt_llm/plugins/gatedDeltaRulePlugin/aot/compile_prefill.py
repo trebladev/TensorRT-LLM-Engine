@@ -199,6 +199,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     (
                         "*fp32:16",
                         "*i32:16",
+                        "i64",
                         "*i8:16",
                         "i32",
                         str(num_v_heads),
@@ -217,6 +218,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                         "*fp32:16",
                         "*fp32:16",
                         "*i32:16",
+                        "i64",
                         "i32",
                         str(num_v_heads),
                         "128",
