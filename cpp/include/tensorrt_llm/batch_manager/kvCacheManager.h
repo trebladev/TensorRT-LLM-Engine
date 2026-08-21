@@ -1970,6 +1970,11 @@ public:
 
     [[nodiscard]] virtual OffsetTableDimensions getOffsetTableDimensions() const = 0;
 
+    [[nodiscard]] virtual OffsetTableDimensions getAttentionOffsetTableDimensions() const
+    {
+        return getOffsetTableDimensions();
+    }
+
     [[nodiscard]] virtual std::deque<executor::KVCacheEvent> getLatestEvents(
         std::optional<std::chrono::milliseconds> timeout = std::nullopt) const
         = 0;
@@ -2025,9 +2030,19 @@ public:
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockPoolPointers() const = 0;
 
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getAttentionBlockPoolPointers() const
+    {
+        return getBlockPoolPointers();
+    }
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockScalePoolPointers() const = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getLayerToPoolMapping() const = 0;
+
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getAttentionLayerToPoolMapping() const
+    {
+        return getLayerToPoolMapping();
+    }
 
     virtual void getBlockOffsetsOfBatch(
         runtime::ITensor& output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize, SizeType32 beamWidth) const
@@ -2037,6 +2052,13 @@ public:
     virtual SizeType32 copyBlockOffsets(
         runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const
         = 0;
+
+    //! @return maxBlockCount of all beams for attention pools only
+    virtual SizeType32 copyAttentionBlockOffsets(
+        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const
+    {
+        return copyBlockOffsets(output, outputSlotOffset, requestId);
+    }
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
@@ -2387,6 +2409,8 @@ public:
         return dims;
     }
 
+    [[nodiscard]] OffsetTableDimensions getAttentionOffsetTableDimensions() const override;
+
     [[nodiscard]] std::deque<executor::KVCacheEvent> getLatestEvents(
         std::optional<std::chrono::milliseconds> timeout = std::nullopt) const override
     {
@@ -2442,9 +2466,19 @@ public:
         return mBlockPoolPointers;
     }
 
+    [[nodiscard]] runtime::ITensor::SharedPtr getAttentionBlockPoolPointers() const override
+    {
+        return mAttentionBlockPoolPointers ? mAttentionBlockPoolPointers : mBlockPoolPointers;
+    }
+
     [[nodiscard]] runtime::ITensor::SharedPtr getLayerToPoolMapping() const override
     {
         return mLayerToPoolMapping;
+    }
+
+    [[nodiscard]] runtime::ITensor::SharedPtr getAttentionLayerToPoolMapping() const override
+    {
+        return mAttentionLayerToPoolMapping ? mAttentionLayerToPoolMapping : mLayerToPoolMapping;
     }
 
     [[nodiscard]] runtime::ITensor::SharedPtr getBlockScalePoolPointers() const override
@@ -2458,6 +2492,9 @@ public:
 
     //! @return maxBlockCount of all beams
     SizeType32 copyBlockOffsets(
+        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const override;
+
+    SizeType32 copyAttentionBlockOffsets(
         runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const override;
 
     [[nodiscard]] bool isEnableBlockReuse() const override
@@ -2561,6 +2598,8 @@ public:
     std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
+    [[nodiscard]] SizeType32 getRecurrentStateSlot(RequestIdType requestId, SizeType32 beamIdx = 0) const;
+
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override;
 
@@ -2654,6 +2693,8 @@ private:
     // buffers for static tensors, will be created after allocating pools
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;
+    runtime::ITensor::SharedPtr mAttentionBlockPoolPointers;
+    runtime::ITensor::SharedPtr mAttentionLayerToPoolMapping;
     runtime::ITensor::SharedPtr mBlockScalePoolPointers;
     runtime::ITensor::SharedPtr mIndexerKCachePoolPointers;
     // GPU bytes allocated for KV-cache

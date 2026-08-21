@@ -52,6 +52,26 @@ _REQUIRED_KEYS = (
 )
 
 
+def test_qwen35_layer_types_use_linear_classification() -> None:
+    config = Qwen35Config(
+        architecture="Qwen3_5ForConditionalGeneration",
+        dtype="bfloat16",
+        hidden_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        vocab_size=32_000,
+        max_position_embeddings=1024,
+        decoder_layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    )
+
+    assert config.layer_types == ["linear", "linear", "linear", "attention"]
+
+
 @pytest.fixture(scope="module")
 def qwen35_checkpoint_dir() -> Path:
     models_root = llm_models_root()
@@ -117,6 +137,8 @@ def test_qwen35_checkpoint_source_dtypes(
     assert config.dtype == "bfloat16"
     assert config.decoder_layer_types[0] == "linear_attention"
     assert config.decoder_layer_types[3] == "full_attention"
+    assert config.layer_types[0] == "linear"
+    assert config.layer_types[3] == "attention"
 
     source_fp32_keys = {
         "model.language_model.layers.0.linear_attn.norm.weight",

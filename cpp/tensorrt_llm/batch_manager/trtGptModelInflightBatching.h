@@ -304,6 +304,7 @@ private:
     std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
         uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory,
         bool const failFastOnAttentionWindowTooLarge = false);
+    void bindLinearAttentionStateTensors(KVCacheManager const& kvCacheManager, TensorMap& inputBuffers);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
     void createRuntimePerfKnobsTensor(executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
@@ -509,6 +510,10 @@ private:
     std::shared_ptr<BaseKVCacheManager> mCrossKvCacheManager = nullptr;
     // RNN state manager for recurrent layers (optional)
     std::unique_ptr<RnnStateManager> mRnnStateManager;
+    std::vector<TensorPtr> mLinearAttentionLayerStateViews;
+    std::vector<TensorPtr> mLinearAttentionRecurrentStatePointers;
+    std::vector<TensorPtr> mLinearAttentionConvStatePointers;
+
     // PEFT cache manager for LoRA tasks (optional)
     std::shared_ptr<BasePeftCacheManager> mPeftCacheManager;
     // BufferManager using a separate stream for async copy operations.

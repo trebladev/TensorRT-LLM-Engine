@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -693,6 +693,21 @@ GptJsonConfig parseJson(InputType&& input)
             }
             modelConfig.setRnnConfig(rnnConfig);
         }
+    }
+
+    if (!engineVersionNone && modelConfig.isAttentionLinearHybrid())
+    {
+        auto const& pretrainedConfig = json.at("pretrained_config");
+        ModelConfig::LinearAttentionConfig linearAttentionConfig{};
+        linearAttentionConfig.convKernel = pretrainedConfig.at("linear_conv_kernel_dim").template get<SizeType32>();
+        linearAttentionConfig.numKeyHeads = pretrainedConfig.at("linear_num_key_heads").template get<SizeType32>();
+        linearAttentionConfig.numValueHeads = pretrainedConfig.at("linear_num_value_heads").template get<SizeType32>();
+        linearAttentionConfig.keyHeadDim = pretrainedConfig.at("linear_key_head_dim").template get<SizeType32>();
+        linearAttentionConfig.valueHeadDim = pretrainedConfig.at("linear_value_head_dim").template get<SizeType32>();
+        linearAttentionConfig.stateDtype
+            = strToDType(parseJsonFieldOr(pretrainedConfig, "state_dtype", std::string("float32")));
+        linearAttentionConfig.convDtype = dataType;
+        modelConfig.setLinearAttentionConfig(linearAttentionConfig);
     }
     return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, contextParallelism,
         gpusPerNode, modelConfig, runtimeDefaults};

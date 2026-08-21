@@ -50,7 +50,7 @@ class Qwen35Config(PretrainedConfig):
     ) -> None:
         layer_type_map = {
             "full_attention": "attention",
-            "linear_attention": "recurrent",
+            "linear_attention": "linear",
         }
         unknown_layer_types = set(decoder_layer_types) - set(layer_type_map)
         if unknown_layer_types:

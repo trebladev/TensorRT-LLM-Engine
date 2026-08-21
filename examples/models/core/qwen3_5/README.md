@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > The `convert_checkpoint.py` and `trtllm-build` workflow is part of the legacy
 > TensorRT engine backend. This initial Qwen3.5 implementation is intentionally
-> limited and is not yet integrated with the standard legacy runtime path.
+> limited to dense text-only BF16 inference on one GPU.
 
 This directory contains the checkpoint conversion entry point for the dedicated
 Qwen3.5 TensorRT graph in
@@ -25,10 +25,15 @@ full-attention layers with gated-delta linear-attention layers.
 | Parallelism | TP=1, PP=1, CP=1 |
 | Position embedding | MRoPE |
 | Full attention | Supported |
-| Gated-delta linear attention | Supported with contiguous recurrent state |
+| Gated-delta linear attention | Supported with paged recurrent state |
+| KV/state management | Paged KV cache and paged linear-attention state |
+| Generation | Prefill followed by decode, beam width 1 |
+| Prefix cache / block reuse | Not supported |
+| Mixed prefill and decode batch | Not supported |
 | Quantization | Not supported |
 | Vision inputs | Not supported; vision weights are ignored during conversion |
-| Standard legacy runtime/generation | Not yet integrated |
+| Standard legacy runtime/generation | Supported through `ModelRunnerCpp` |
+| Speculative decoding, disaggregated serving, and offload | Not supported |
 
 The implementation has been validated with the `Qwen3.5-2B` Hugging Face
 checkpoint. Other dense Qwen3.5 sizes using the same text-decoder architecture
@@ -62,8 +67,8 @@ The script rejects parallel configurations other than TP=1, PP=1, and CP=1.
 
 ## Engine build
 
-The graph currently uses contiguous KV cache and recurrent state. The following
-command matches the profile used by the prefill validation test:
+The following command matches the continuous-cache profile used by the
+bottom-level `Session` validation test:
 
 ```bash
 trtllm-build \
@@ -84,6 +89,11 @@ An 8K profile has a substantial TensorRT execution-context memory requirement.
 Run the build and tests on a GPU with enough free memory for both the engine
 weights and activation workspace.
 
+For standard runtime generation, build with paged KV cache (the default). The
+runtime allocates both attention KV blocks and gated-delta recurrent-state
+blocks through the KV cache manager. Prefix-cache block reuse is disabled for
+this initial hybrid-model implementation.
+
 ## Validation
 
 Set `LLM_MODELS_ROOT` to a directory containing `Qwen3.5-2B`, then run:
@@ -98,4 +108,10 @@ The conversion test reads tensors from the real Hugging Face checkpoint and
 checks names, values, and data types. The prefill test builds one TensorRT
 engine whose maximum sequence length is 8193 and compares bottom-level
 `Session` logits against Hugging Face for batch sizes 1, 2, and 4, including an
-8193-token input.
+8193-token input. It also performs four greedy decode steps and compares every
+generated token with Hugging Face.
+
+The standard `ModelRunnerCpp` path has additionally been validated with a
+Qwen3.5-2B paged engine using paged attention KV cache and paged gated-delta
+state. A 17-token prompt followed by four greedy decode steps produced the same
+tokens as Hugging Face: `18, 19, 20, 21`.

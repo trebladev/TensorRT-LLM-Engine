@@ -29,6 +29,7 @@ from ..bindings import executor as trtllm
 from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
                                  OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
+from ..functional import RopeEmbeddingUtils
 from ..layers import MropeParams
 from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
@@ -87,6 +88,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.world_config = world_config
         self.use_kv_cache = use_kv_cache
         self.lora_manager = lora_manager
+        self._default_mrope_rotary_cos_sin: Optional[torch.Tensor] = None
 
     @classmethod
     def from_dir(
@@ -446,15 +448,24 @@ class ModelRunnerCpp(ModelRunnerMixin):
         loading_time = profiler.elapsed_time_in_sec("load tensorrt_llm engine")
         logger.info(f'Load engine takes: {loading_time} sec')
 
-        return cls(executor,
-                   max_batch_size=max_batch_size,
-                   max_input_len=max_input_len,
-                   max_seq_len=max_seq_len,
-                   max_beam_width=max_beam_width,
-                   model_config=model_config,
-                   world_config=world_config,
-                   use_kv_cache=use_kv_cache,
-                   lora_manager=lora_manager)
+        runner = cls(executor,
+                     max_batch_size=max_batch_size,
+                     max_input_len=max_input_len,
+                     max_seq_len=max_seq_len,
+                     max_beam_width=max_beam_width,
+                     model_config=model_config,
+                     world_config=world_config,
+                     use_kv_cache=use_kv_cache,
+                     lora_manager=lora_manager)
+        pretrained_config = engine_config.pretrained_config
+        if pretrained_config.architecture == 'Qwen35ForCausalLM':
+            _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                num_pos=pretrained_config.max_position_embeddings,
+                dim=pretrained_config.rotary_embedding_dim,
+                theta=pretrained_config.rotary_base)
+            runner._default_mrope_rotary_cos_sin = torch.from_numpy(
+                rotary_cos_sin)
+        return runner
 
     def _check_inputs(self, batch_input_ids: List[List[int]],
                       encoder_input_ids: Optional[List[List[int]]],
@@ -890,7 +901,15 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
-        if mrope != None:
+        if mrope is None and self._default_mrope_rotary_cos_sin is not None:
+            batch_size = len(batch_input_ids_list)
+            mrope = MropeParams(
+                mrope_rotary_cos_sin=self._default_mrope_rotary_cos_sin.expand(
+                    batch_size, -1),
+                mrope_position_deltas=torch.zeros((batch_size, 1),
+                                                  dtype=torch.int32))
+
+        if mrope is not None:
             mrope_rotary_cos_sin = mrope.mrope_rotary_cos_sin
             assert isinstance(
                 mrope_rotary_cos_sin,

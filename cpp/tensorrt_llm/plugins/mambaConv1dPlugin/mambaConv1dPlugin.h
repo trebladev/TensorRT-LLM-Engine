@@ -39,7 +39,7 @@ namespace tensorrt_llm::plugins
 //     5.  last_token_ids [batch_size] int32
 //     6.  host_context_lengths [batch_size] int32, optional for remove_input_padding
 //     7.  state_slot_mapping [batch_size] int32, optional
-//     8.  host_has_initial_state [batch_size] int8, optional host input
+//     8.  host_has_initial_state [batch_size] int8 or int32, optional host input
 // outputs
 //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     1. conv_state [batch_size, dconv - 1, dim]

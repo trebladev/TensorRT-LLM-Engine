@@ -84,10 +84,10 @@ public:
         }
 
         mMaxAttentionWindow = 0;
-        if (executorConfig.getKvCacheConfig().getMaxAttentionWindowVec().has_value())
+        auto const& maxAttentionWindowVec = executorConfig.getKvCacheConfig().getMaxAttentionWindowVec();
+        if (maxAttentionWindowVec.has_value() && !maxAttentionWindowVec.value().empty())
         {
             bool warning = false;
-            auto const& maxAttentionWindowVec = executorConfig.getKvCacheConfig().getMaxAttentionWindowVec();
             for (int maxAttenWin : maxAttentionWindowVec.value())
             {
                 mMaxAttentionWindowVec.push_back(std::min(maxAttenWin, mMaxSequenceLen));

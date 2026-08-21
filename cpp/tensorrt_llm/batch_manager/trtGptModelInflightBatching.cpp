@@ -125,6 +125,12 @@ std::map<SizeType32, SizeType32> TrtGptModelInflightBatching::calculateCacheSize
 bool TrtGptModelInflightBatching::executorConfigIsValid(
     ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
+    if (modelConfig.isAttentionLinearHybrid()
+        && (executorConfig.getKvCacheConfig().getEnableBlockReuse()
+            || executorConfig.getKvCacheConfig().getEnablePartialReuse()))
+    {
+        return false;
+    }
     // Make sure logic in this function matches fixExecutorConfig
     if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
@@ -145,6 +151,27 @@ executor::ExecutorConfig TrtGptModelInflightBatching::fixExecutorConfig(
     ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
     // Make sure logic in this function matches executorConfigIsValid
+    if (modelConfig.isAttentionLinearHybrid())
+    {
+        auto kvCacheConfig = executorConfig.getKvCacheConfig();
+        if (kvCacheConfig.getEnableBlockReuse())
+        {
+            TLLM_LOG_WARNING(
+                "Fixing executorConfig: KV cache block reuse is disabled for attention-linear hybrid "
+                "models.");
+            kvCacheConfig.setEnableBlockReuse(false);
+        }
+        if (kvCacheConfig.getEnablePartialReuse())
+        {
+            TLLM_LOG_WARNING(
+                "Fixing executorConfig: partial KV cache reuse is disabled for attention-linear hybrid "
+                "models.");
+            kvCacheConfig.setEnablePartialReuse(false);
+        }
+        auto fixedExecutorConfig = executor::ExecutorConfig(executorConfig);
+        fixedExecutorConfig.setKvCacheConfig(kvCacheConfig);
+        return fixedExecutorConfig;
+    }
     if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
         auto kvCacheConfig = executorConfig.getKvCacheConfig();
@@ -220,6 +247,47 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     mNumBuffers = (mCtxGenFusion ? 1 : 2) * mNumMicroBatches;
 
     auto const& kvCacheConfig = executorConfig.getKvCacheConfig();
+    if (mModelConfig.isAttentionLinearHybrid())
+    {
+        TLLM_CHECK_WITH_INFO(mModelConfig.hasLinearAttentionConfig(),
+            "Attention-linear hybrid model requires linear attention state metadata.");
+        TLLM_CHECK_WITH_INFO(mModelConfig.getDataType() == nvinfer1::DataType::kBF16,
+            "The initial attention-linear hybrid runtime only supports BF16 engines.");
+        TLLM_CHECK_WITH_INFO(mModelConfig.getQuantMode().value() == 0,
+            "The initial attention-linear hybrid runtime does not support quantization.");
+        TLLM_CHECK_WITH_INFO(mWorldConfig.getTensorParallelism() == 1 && mWorldConfig.getPipelineParallelism() == 1
+                && mWorldConfig.getContextParallelism() == 1,
+            "The initial attention-linear hybrid runtime only supports TP=1, PP=1, and CP=1.");
+        TLLM_CHECK_WITH_INFO(
+            getMaxBeamWidth() == 1, "The initial attention-linear hybrid runtime only supports beam width 1.");
+        TLLM_CHECK_WITH_INFO(
+            !mCtxGenFusion, "Attention-linear hybrid models require separate context and generation execution.");
+        TLLM_CHECK_WITH_INFO(mModelConfig.useGptAttentionPlugin() && mModelConfig.useMambaConv1dPlugin()
+                && mModelConfig.usePackedInput(),
+            "Attention-linear hybrid models require GPT attention, MambaConv1d, and packed input support.");
+        TLLM_CHECK_WITH_INFO(!mModelConfig.useCrossAttention(),
+            "The initial attention-linear hybrid runtime does not support cross attention.");
+        TLLM_CHECK_WITH_INFO(mModelConfig.getSpeculativeDecodingMode().isNone(),
+            "The initial attention-linear hybrid runtime does not support speculative decoding.");
+        TLLM_CHECK_WITH_INFO(
+            mModelConfig.getKVCacheType() == ModelConfig::KVCacheType::kPAGED && mModelConfig.usePagedState(),
+            "Attention-linear hybrid models require paged KV cache and paged state.");
+        TLLM_CHECK_WITH_INFO(!kvCacheConfig.getEnableBlockReuse() && !kvCacheConfig.getEnablePartialReuse(),
+            "Attention-linear hybrid models do not yet support KV cache block or partial reuse.");
+        TLLM_CHECK_WITH_INFO(!kvCacheConfig.getHostCacheSize().has_value()
+                && !kvCacheConfig.getSecondaryOffloadMinPriority().has_value() && !kvCacheConfig.getUseUvm(),
+            "Attention-linear hybrid models do not yet support KV cache offload or UVM.");
+        TLLM_CHECK_WITH_INFO(!executorConfig.getEnableTrtOverlap(),
+            "The initial attention-linear hybrid runtime does not support TRT overlap.");
+        auto const cacheTransceiverConfig = executorConfig.getCacheTransceiverConfig();
+        TLLM_CHECK_WITH_INFO(
+            !cacheTransceiverConfig.has_value() || !cacheTransceiverConfig->getBackendType().has_value(),
+            "The initial attention-linear hybrid runtime does not support disaggregated serving.");
+        auto const maxAttentionWindowVec = getMaxAttentionWindowVec();
+        TLLM_CHECK_WITH_INFO(std::all_of(maxAttentionWindowVec.cbegin(), maxAttentionWindowVec.cend(),
+                                 [this](SizeType32 const windowSize) { return windowSize == getMaxSequenceLen(); }),
+            "The initial attention-linear hybrid runtime requires full attention windows equal to maxSequenceLen.");
+    }
 
     if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
@@ -595,6 +663,12 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(
             newBlocksPerWindow[windowSize] = std::make_tuple(numPrimaryBlocks, numSecondaryBlocks);
         }
     }
+    auto constexpr recurrentStatesWindow = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+    if (blocksPerWindow.count(recurrentStatesWindow) > 0)
+    {
+        newBlocksPerWindow[recurrentStatesWindow] = blocksPerWindow.at(recurrentStatesWindow);
+    }
+
     if (newMaxAttentionWindowVec == getMaxAttentionWindowVec())
     {
         return {blocksPerWindow, newMaxAttentionWindowVec};
@@ -643,23 +717,113 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    // init KV cache block manager
+    // Initialize KV cache block manager.
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
     auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
 
     auto maxAttentionWindowVec = getMaxAttentionWindowVec();
+    auto managerWindowVec = maxAttentionWindowVec;
+    std::optional<kv_cache_manager::LinearAttentionMetadata> linearAttentionMetadata;
+    std::vector<kv_cache_manager::PoolConfiguration> poolConfigurations;
+    auto const isAttentionLinearHybrid = kvCacheType == KvCacheType::kSELF && mModelConfig.isAttentionLinearHybrid();
+
     if (kvCacheType != KvCacheType::kSELF) // TODO(nhaber): more foolproof way of initing cross-kvcache-manager
     {
         maxAttentionWindowVec = std::vector<SizeType32>{mModelConfig.getMaxEncoderLen()};
+        managerWindowVec = maxAttentionWindowVec;
+    }
+
+    auto const firstLocalLayer = mModelConfig.getFirstLocalLayer(
+        mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    auto const numLocalDecoderLayers
+        = mModelConfig.getNbLayers(mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    auto const& layerTypes = mModelConfig.getLayerTypes();
+
+    auto makeManagerWindowVec = [&](std::vector<SizeType32> const& attentionWindowVec)
+    {
+        std::vector<SizeType32> result;
+        result.reserve(numLocalDecoderLayers);
+        auto attentionLayerIdx = mModelConfig.countLowerRankLayers(ModelConfig::LayerType::kATTENTION,
+            mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+        for (SizeType32 localLayerIdx = 0; localLayerIdx < numLocalDecoderLayers; ++localLayerIdx)
+        {
+            auto const layerType = layerTypes.at(firstLocalLayer + localLayerIdx);
+            if (layerType == ModelConfig::LayerType::kATTENTION)
+            {
+                result.push_back(attentionWindowVec.at(attentionLayerIdx % attentionWindowVec.size()));
+                ++attentionLayerIdx;
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(layerType == ModelConfig::LayerType::kLINEAR,
+                    "Attention-linear hybrid cache manager only supports ATTENTION and LINEAR layers.");
+                result.push_back(kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+            }
+        }
+        return result;
+    };
+
+    if (isAttentionLinearHybrid)
+    {
+        auto const linearConfig = mModelConfig.getLinearAttentionConfig().value();
+        auto const compressedAttentionHeads = numKvHeadsPerLayer;
+        numKvHeadsPerLayer.clear();
+        numKvHeadsPerLayer.reserve(numLocalDecoderLayers);
+
+        kv_cache_manager::LinearAttentionMetadata metadata{};
+        metadata.cacheType = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+        metadata.allRecurrentStatesBytes = linearConfig.getStateSlotBytes();
+        metadata.statesSnapshotInterval = 0;
+        metadata.saveLastSnapshot = false;
+
+        SizeType32 localAttentionIdx = 0;
+        for (SizeType32 localLayerIdx = 0; localLayerIdx < numLocalDecoderLayers; ++localLayerIdx)
+        {
+            auto const layerType = layerTypes.at(firstLocalLayer + localLayerIdx);
+            if (layerType == ModelConfig::LayerType::kATTENTION)
+            {
+                numKvHeadsPerLayer.push_back(compressedAttentionHeads.at(localAttentionIdx));
+                ++localAttentionIdx;
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(layerType == ModelConfig::LayerType::kLINEAR,
+                    "Attention-linear hybrid cache manager only supports ATTENTION and LINEAR layers.");
+                numKvHeadsPerLayer.push_back(0);
+                metadata.linearLayerIndices.push_back(localLayerIdx);
+            }
+        }
+        TLLM_CHECK(localAttentionIdx == static_cast<SizeType32>(compressedAttentionHeads.size()));
+        managerWindowVec = makeManagerWindowVec(maxAttentionWindowVec);
+        linearAttentionMetadata = std::move(metadata);
     }
 
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
-    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
     auto const sizePerHead = mModelConfig.getSizePerHead();
+
+    auto makePoolConfigurations = [&](std::vector<SizeType32> const& windowVec)
+    {
+        std::vector<kv_cache_manager::PoolConfiguration> result;
+        for (auto const windowSize : windowVec)
+        {
+            auto const alreadyConfigured = std::any_of(result.cbegin(), result.cend(),
+                [windowSize](auto const& config) { return config.windowSize == windowSize; });
+            if (!alreadyConfigured)
+            {
+                auto const isStatePool = kv_cache_manager::LinearAttentionMetadata::hasRecurrentStatesCache(windowSize);
+                result.push_back(
+                    {windowSize, isStatePool ? 1 : sizePerHead, isStatePool ? nvinfer1::DataType::kUINT8 : kvDtype});
+            }
+        }
+        return result;
+    };
+
+    poolConfigurations = makePoolConfigurations(managerWindowVec);
+    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(managerWindowVec, numLayers);
     auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, kvDtype, numKvHeadsPerLayer,
         sizePerHead, tokensPerBlock, mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes,
-        extraCostMemory, 2, getMaxBatchSize());
+        extraCostMemory, 2, getMaxBatchSize(), linearAttentionMetadata, poolConfigurations);
 
     // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
     // this can happen if e.g. maxSeqLen is deduced from the model and is too large
@@ -668,6 +832,11 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     {
         std::tie(blocksPerWindow, maxAttentionWindowVec)
             = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
+    }
+    if (isAttentionLinearHybrid)
+    {
+        managerWindowVec = makeManagerWindowVec(maxAttentionWindowVec);
+        poolConfigurations = makePoolConfigurations(managerWindowVec);
     }
 
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.getEnableBlockReuse())
@@ -678,23 +847,38 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     }
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.getEnableBlockReuse() : false;
 
+    if (isAttentionLinearHybrid)
+    {
+        auto const [statePrimaryBlocks, stateSecondaryBlocks]
+            = blocksPerWindow.at(kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+        TLLM_CHECK_WITH_INFO(statePrimaryBlocks == getMaxNumSequences(),
+            "Linear attention state pool must allocate one primary slot per sequence, got %d and expected %d.",
+            statePrimaryBlocks, getMaxNumSequences());
+        TLLM_CHECK_WITH_INFO(
+            stateSecondaryBlocks == 0, "Linear attention state pool does not support secondary blocks.");
+    }
+
+    constexpr SizeType32 kDefaultIndexerQuantBlockSize = 128;
+
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, kvDtype, getSinkTokenLen(),
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), managerWindowVec, kvDtype, getSinkTokenLen(),
         mRuntime->getStreamPtr(),
         kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(),
         getMaxNumTokens().value(), enableBlockReuse, kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
-        kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
+        kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse(), nullptr,
+        /*enableIndexerKCache=*/false, kDefaultIndexerQuantBlockSize, /*indexerKCacheIndexHeadDim=*/0,
+        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
 
-    reshapeKvTensors(kvCacheManager->getOffsetTableDimensions());
+    reshapeKvTensors(kvCacheManager->getAttentionOffsetTableDimensions());
 
     kvCacheManager->allocatePools(kvCacheConfig.getUseUvm());
 
     TensorMap inputBuffers;
-    TensorPtr poolPointers = kvCacheManager->getBlockPoolPointers();
-    TensorPtr poolMapping = kvCacheManager->getLayerToPoolMapping();
+    TensorPtr poolPointers = kvCacheManager->getAttentionBlockPoolPointers();
+    TensorPtr poolMapping = kvCacheManager->getAttentionLayerToPoolMapping();
 
     if (kvCacheType == KvCacheType::kSELF)
     {
@@ -706,6 +890,10 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         inputBuffers.insert_or_assign("host_cross_kv_cache_pool_pointers", std::move(poolPointers));
         inputBuffers.insert_or_assign("host_cross_kv_cache_pool_mapping", std::move(poolMapping));
     }
+    if (isAttentionLinearHybrid)
+    {
+        bindLinearAttentionStateTensors(*kvCacheManager, inputBuffers);
+    }
     mRuntime->setStaticInputTensors(inputBuffers);
 
     // Emit the `created` event
@@ -713,6 +901,55 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return kvCacheManager;
+}
+
+void TrtGptModelInflightBatching::bindLinearAttentionStateTensors(
+    KVCacheManager const& kvCacheManager, TensorMap& inputBuffers)
+{
+    auto const linearConfig = mModelConfig.getLinearAttentionConfig().value();
+    auto const firstLocalLayer = mModelConfig.getFirstLocalLayer(
+        mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    auto const numLocalLayers
+        = mModelConfig.getNbLayers(mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    auto const& layerTypes = mModelConfig.getLayerTypes();
+
+    mLinearAttentionLayerStateViews.clear();
+    mLinearAttentionRecurrentStatePointers.clear();
+    mLinearAttentionConvStatePointers.clear();
+    auto const numLocalLinearLayers
+        = mModelConfig.getNbLinearLayers(mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    mLinearAttentionLayerStateViews.reserve(numLocalLinearLayers);
+    mLinearAttentionRecurrentStatePointers.reserve(numLocalLinearLayers);
+    mLinearAttentionConvStatePointers.reserve(numLocalLinearLayers);
+
+    for (SizeType32 localLayerIdx = 0; localLayerIdx < numLocalLayers; ++localLayerIdx)
+    {
+        auto const globalLayerIdx = firstLocalLayer + localLayerIdx;
+        if (layerTypes.at(globalLayerIdx) != ModelConfig::LayerType::kLINEAR)
+        {
+            continue;
+        }
+
+        TLLM_CHECK_WITH_INFO(
+            kvCacheManager.isPoolLayerFirst(localLayerIdx), "Linear attention state pool must use layer-first layout.");
+        auto const statePool = kvCacheManager.getPrimaryPool(localLayerIdx);
+        auto const poolLayerIdx = kvCacheManager.getPoolLayerIdx(localLayerIdx);
+        auto layerStateView = ITensor::slice(statePool, poolLayerIdx, 1);
+
+        auto recurrentStatePointer = BufferManager::cpu(ITensor::makeShape({1}), TRTDataType<void*>::value);
+        auto convStatePointer = BufferManager::cpu(ITensor::makeShape({1}), TRTDataType<void*>::value);
+        bufferCast<void*>(*recurrentStatePointer)[0] = layerStateView->data();
+        auto* layerStateBytes = static_cast<std::byte*>(layerStateView->data());
+        bufferCast<void*>(*convStatePointer)[0] = layerStateBytes + linearConfig.getGatedDeltaStateBytes();
+
+        mLinearAttentionLayerStateViews.push_back(std::move(layerStateView));
+        mLinearAttentionRecurrentStatePointers.push_back(std::move(recurrentStatePointer));
+        mLinearAttentionConvStatePointers.push_back(std::move(convStatePointer));
+        inputBuffers.insert_or_assign(
+            "recurrent_state_ptr_" + std::to_string(globalLayerIdx), mLinearAttentionRecurrentStatePointers.back());
+        inputBuffers.insert_or_assign(
+            "conv_state_ptr_" + std::to_string(globalLayerIdx), mLinearAttentionConvStatePointers.back());
+    }
 }
 
 void TrtGptModelInflightBatching::createRnnStateManager()
@@ -2655,7 +2892,7 @@ void TrtGptModelInflightBatching::rewindKVCacheBlocks(SizeType32 numSequences)
     auto const elemSize = BufferDataType(mModelConfig.getKvDataType()).getSize();
     auto const sizeInBytesPerKVHead = mModelConfig.getSizePerHead() * elemSize;
 
-    auto const poolPointers = mKvCacheManager->getBlockPoolPointers();
+    auto const poolPointers = mKvCacheManager->getAttentionBlockPoolPointers();
     auto* const* pointerArrayPtr = bufferCast<void*>(*poolPointers);
     auto const* offsetArrayPtr
         = bufferCast<tk::KVCacheIndex>(*runtimeBuffers.transformerBuffers->kvCacheBlockOffsetsDevice);
@@ -2714,12 +2951,12 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
 
     if (static_cast<bool>(mKvCacheManager))
     {
-        auto const dims = mKvCacheManager->getOffsetTableDimensions();
+        auto const dims = mKvCacheManager->getAttentionOffsetTableDimensions();
         reshapeKvTensors(dims);
     }
     if (static_cast<bool>(mCrossKvCacheManager))
     {
-        auto const dims = mCrossKvCacheManager->getOffsetTableDimensions();
+        auto const dims = mCrossKvCacheManager->getAttentionOffsetTableDimensions();
         reshapeKvTensors(dims);
     }
 

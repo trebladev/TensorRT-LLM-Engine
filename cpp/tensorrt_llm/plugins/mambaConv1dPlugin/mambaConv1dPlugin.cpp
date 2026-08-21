@@ -105,7 +105,7 @@ bool MambaConv1dPlugin::supportsFormatCombination(
 {
     if (mUseInitialStateMask && pos == getHostHasInitialStateIdx())
     {
-        return inOut[pos].type == nvinfer1::DataType::kINT8;
+        return inOut[pos].type == nvinfer1::DataType::kINT8 || inOut[pos].type == nvinfer1::DataType::kINT32;
     }
     if (pos == getHostRequestTypesIdx() || pos == getLastTokenIdsIdx()
         || (mRemovePadding && pos == getHostContextLengthIdx()) || (mPagedState && pos == getSlotMappingIdx()))
@@ -181,7 +181,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     //     5.  last_token_ids [batch_size] int32
     //     6.  host_context_lengths [batch_size] int32, optional for remove_input_padding
     //     7.  state_slot_mapping [batch_size] int32, optional
-    //     8.  host_has_initial_state [batch_size] int8, optional host input
+    //     8.  host_has_initial_state [batch_size] int8 or int32, optional host input
     // outputs
     //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
     //     1. conv_state [batch_size, dconv - 1, dim]
@@ -211,19 +211,32 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     int8_t const* hasInitialState{};
     if (mUseInitialStateMask)
     {
-        auto const* hostHasInitialState = static_cast<int8_t const*>(inputs[getHostHasInitialStateIdx()]);
+        auto const maskIdx = getHostHasInitialStateIdx();
+        auto const maskType = inputDesc[maskIdx].type;
+        auto const* hostHasInitialState = inputs[maskIdx];
         if (reqTypes[0] == RequestType::kCONTEXT)
         {
-            TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                workspace, hostHasInitialState, batchSize * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
+            if (maskType == DataType::kINT32)
+            {
+                TLLM_CUDA_CHECK(cudaMemcpy2DAsync(workspace, sizeof(int8_t), hostHasInitialState, sizeof(int32_t),
+                    sizeof(int8_t), batchSize, cudaMemcpyHostToDevice, stream));
+            }
+            else
+            {
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                    workspace, hostHasInitialState, batchSize * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
+            }
             hasInitialState = static_cast<int8_t const*>(workspace);
         }
         else if (reqTypes[0] == RequestType::kGENERATION)
         {
             for (int requestIdx = 0; requestIdx < batchSize; ++requestIdx)
             {
-                TLLM_CHECK_WITH_INFO(hostHasInitialState[requestIdx] == 1,
-                    "MambaConv1d generation request %d does not have an initial state", requestIdx);
+                auto const hasState = maskType == DataType::kINT32
+                    ? static_cast<int32_t const*>(hostHasInitialState)[requestIdx]
+                    : static_cast<int8_t const*>(hostHasInitialState)[requestIdx];
+                TLLM_CHECK_WITH_INFO(
+                    hasState == 1, "MambaConv1d generation request %d does not have an initial state", requestIdx);
             }
         }
     }

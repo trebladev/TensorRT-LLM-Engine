@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,11 +58,42 @@ public:
         SizeType32 rnnConvDimSize = 0;
     };
 
+    struct LinearAttentionConfig
+    {
+        SizeType32 convKernel = 0;
+        SizeType32 numKeyHeads = 0;
+        SizeType32 numValueHeads = 0;
+        SizeType32 keyHeadDim = 0;
+        SizeType32 valueHeadDim = 0;
+        nvinfer1::DataType stateDtype = nvinfer1::DataType::kFLOAT;
+        nvinfer1::DataType convDtype = nvinfer1::DataType::kBF16;
+
+        [[nodiscard]] SizeType32 getGatedDeltaStateBytes() const noexcept
+        {
+            constexpr SizeType32 kFloatBytes = 4;
+            return numValueHeads * valueHeadDim * keyHeadDim * kFloatBytes;
+        }
+
+        [[nodiscard]] SizeType32 getConvStateBytes() const noexcept
+        {
+            constexpr SizeType32 kBfloat16Bytes = 2;
+            auto const convDim = 2 * numKeyHeads * keyHeadDim + numValueHeads * valueHeadDim;
+            auto const convHistory = std::max(convKernel - 1, 0);
+            return convHistory * convDim * kBfloat16Bytes;
+        }
+
+        [[nodiscard]] SizeType32 getStateSlotBytes() const noexcept
+        {
+            return getGatedDeltaStateBytes() + getConvStateBytes();
+        }
+    };
+
     enum class LayerType : std::int32_t
     {
         kATTENTION,
         kRECURRENT,
-        // NOTE: Linear and noop are attention alternatives introduced in Nemotron-NAS. They do not use the KV cache.
+        // Linear and noop are attention alternatives introduced in Nemotron-NAS. Linear layers may use a
+        // linear-attention state cache, while noop layers do not use a cache.
         kLINEAR,
         kNOOP,
     };
@@ -226,6 +257,16 @@ public:
             return mNbRnnLayers / pipelineParallelism;
         }
         return countLocalLayers(LayerType::kRECURRENT, pipelineParallelism, pipelineParallelismRank);
+    }
+
+    [[nodiscard]] SizeType32 getNbLinearLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        if (mLayerTypes.empty())
+        {
+            return 0;
+        }
+        return countLocalLayers(LayerType::kLINEAR, pipelineParallelism, pipelineParallelismRank);
     }
 
     // Get the first LoRA layer index for a given PP rank.
@@ -780,9 +821,64 @@ public:
         mRnnConfig = rnnConfig;
     }
 
+    [[nodiscard]] bool hasLinearAttentionConfig() const noexcept
+    {
+        return mLinearAttentionConfig.has_value();
+    }
+
+    [[nodiscard]] std::optional<LinearAttentionConfig> getLinearAttentionConfig() const noexcept
+    {
+        return mLinearAttentionConfig;
+    }
+
+    void setLinearAttentionConfig(LinearAttentionConfig const& config)
+    {
+        TLLM_CHECK_WITH_INFO(config.convKernel > 1, "Linear attention convolution kernel must be greater than 1.");
+        TLLM_CHECK_WITH_INFO(
+            config.numKeyHeads > 0 && config.numValueHeads > 0 && config.keyHeadDim > 0 && config.valueHeadDim > 0,
+            "Linear attention head counts and dimensions must be greater than 0.");
+        TLLM_CHECK_WITH_INFO(
+            config.stateDtype == nvinfer1::DataType::kFLOAT, "Linear attention gated-delta state must use FP32.");
+        TLLM_CHECK_WITH_INFO(
+            config.convDtype == nvinfer1::DataType::kBF16, "Linear attention convolution state must use BF16.");
+        TLLM_CHECK_WITH_INFO(config.getStateSlotBytes() % 4 == 0,
+            "Linear attention state slot size must be aligned to 4 bytes, got %d.", config.getStateSlotBytes());
+        mLinearAttentionConfig = config;
+    }
+
     [[nodiscard]] bool constexpr isRnnBased() const noexcept
     {
         return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+    }
+
+    [[nodiscard]] bool hasAttentionLayers() const noexcept
+    {
+        if (mLayerTypes.empty())
+        {
+            return mNbAttentionLayers > 0;
+        }
+        return std::find(mLayerTypes.cbegin(), mLayerTypes.cend(), LayerType::kATTENTION) != mLayerTypes.cend();
+    }
+
+    [[nodiscard]] bool hasLinearAttentionLayers() const noexcept
+    {
+        return std::find(mLayerTypes.cbegin(), mLayerTypes.cend(), LayerType::kLINEAR) != mLayerTypes.cend();
+    }
+
+    [[nodiscard]] bool isAttentionLinearHybrid() const noexcept
+    {
+        return !isRnnBased() && hasAttentionLayers() && hasLinearAttentionLayers();
+    }
+
+    [[nodiscard]] bool isFullAttentionModel() const noexcept
+    {
+        if (mLayerTypes.empty())
+        {
+            return !isRnnBased() && mNbLayers > 0 && mNbAttentionLayers == mNbLayers;
+        }
+        return !isRnnBased()
+            && std::all_of(mLayerTypes.cbegin(), mLayerTypes.cend(),
+                [](LayerType const layerType) { return layerType == LayerType::kATTENTION; });
     }
 
     [[nodiscard]] std::vector<LayerType> const& getLayerTypes() const noexcept
@@ -984,6 +1080,7 @@ private:
 
     // Whether kv_cache is enabled. In kv_cache is disabled, it is only intended for context phase only now.
     KVCacheType mKVCacheType = KVCacheType::kCONTINUOUS;
+    std::optional<LinearAttentionConfig> mLinearAttentionConfig;
 
     // Configs related to encoder / enc-dec models
     SizeType32 mMaxEncoderLen{};

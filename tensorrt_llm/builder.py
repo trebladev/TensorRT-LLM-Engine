@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -559,9 +559,37 @@ class BuildConfig(StrictBaseModel):
         description=
         "Whether to use Multi-RoPE (Rotary Position Embedding) optimization.")
 
+    def update_use_mrope(
+            self, position_embedding_type: PositionEmbeddingType) -> None:
+        self.use_mrope = (self.use_mrope or position_embedding_type
+                          == PositionEmbeddingType.mrope)
+
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
-    def update_kv_cache_type(self, model_architecture: str):
+    def update_kv_cache_type(self,
+                             model_architecture: str,
+                             layer_types: Optional[list[str]] = None) -> None:
+        is_attention_linear_hybrid = (layer_types is not None
+                                      and 'attention' in layer_types
+                                      and 'linear' in layer_types)
+        if is_attention_linear_hybrid:
+            assert self.plugin_config is not None
+
+            def override_attr(attr_name: str, value: bool) -> None:
+                current_value = getattr(self.plugin_config, attr_name)
+                if current_value is not None and current_value != value:
+                    logger.warning(f'Overriding {attr_name} to {value}')
+                setattr(self.plugin_config, attr_name, value)
+
+            if self.kv_cache_type is not None and self.kv_cache_type != KVCacheType.PAGED:
+                logger.warning(
+                    'Overriding kv_cache_type to paged for attention-linear hybrid model'
+                )
+            self.kv_cache_type = KVCacheType.PAGED
+            override_attr('paged_kv_cache', True)
+            override_attr('paged_state', True)
+            return
+
         paged_kv_cache_attr = 'paged_state' if model_architecture in [
             'MambaForCausalLM', 'RecurrentGemmaForCausalLM'
         ] else 'paged_kv_cache'
@@ -982,7 +1010,9 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     # avoid changing the input config
     build_config = build_config.model_copy(deep=True)
     build_config.plugin_config.dtype = model.config.dtype
-    build_config.update_kv_cache_type(model.config.architecture)
+    build_config.update_kv_cache_type(
+        model.config.architecture, getattr(model.config, 'layer_types', None))
+    build_config.update_use_mrope(model.config.position_embedding_type)
 
     _init_max_seq_len(model.config, build_config)
 

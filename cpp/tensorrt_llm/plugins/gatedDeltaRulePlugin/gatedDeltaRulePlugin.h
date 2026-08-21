@@ -40,7 +40,7 @@ class GatedDeltaRulePrefillRunner;
 //   6. host_request_types: [N], int32 on the host. 0 is context and 1 is generation.
 //   7. cu_seqlens: [N + 1], int32.
 //   8. state_slot_mapping: [N], int32.
-//   9. host_has_initial_state: [N], int8 on the host.
+//   9. host_has_initial_state: [N], int8 or int32 on the host.
 // Outputs:
 //   0. output: same shape and type as value.
 //   1. final_state: [N, Hv, V, K], float32. In paged mode it is valid for context requests and ignored for

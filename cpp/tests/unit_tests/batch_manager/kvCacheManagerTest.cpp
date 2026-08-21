@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/linearAttentionBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -8269,6 +8270,137 @@ TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
             numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
             allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize, linearAttentionMetadata);
     EXPECT_NE(std::get<0>(dynamicBlocksPerWindow.at(linearWindowSizeCode)), maxBatchSize);
+}
+
+TEST_F(KVCacheManagerTest, LinearAttentionBuffersUsePhysicalStateSlots)
+{
+    auto constexpr numLayers = 3;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 8;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxAttentionWindow = 16;
+    auto constexpr stateSlotBytes = 64;
+    auto constexpr beamWidth = 1;
+    auto constexpr maxNewTokens = 4;
+    auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0, 2},
+        .cacheType = linearWindowSize,
+        .allRecurrentStatesBytes = stateSlotBytes,
+        .statesSnapshotInterval = 0,
+        .saveLastSnapshot = false,
+        .numPlaceholderBlocks = 16,
+    };
+    BlocksPerWindow const blocksPerWindow{
+        {maxAttentionWindow, {16, 0}},
+        {linearWindowSize, {maxNumSequences, 0}},
+    };
+    std::vector<SizeType32> const numKvHeadsPerLayer{0, numKvHeads, 0};
+    std::vector<SizeType32> const layerWindows{linearWindowSize, maxAttentionWindow, linearWindowSize};
+    std::vector<PoolConfiguration> const poolConfigurations{
+        {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kBF16},
+        {linearWindowSize, 1, nvinfer1::DataType::kUINT8},
+    };
+
+    KVCacheManager kvCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, layerWindows, nvinfer1::DataType::kBF16, /*sinkTokenLength=*/0, stream, maxAttentionWindow,
+        /*chunkSize=*/0, /*enableBlockReuse=*/false, CacheType::kSELF, std::nullopt, nullptr,
+        /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+        linearAttentionMetadata, poolConfigurations);
+    kvCacheManager.allocatePools(false);
+
+    auto const attentionDims = kvCacheManager.getAttentionOffsetTableDimensions();
+    EXPECT_EQ(attentionDims.numPools, 1);
+    EXPECT_EQ(attentionDims.maxBlocksPerSeq, maxAttentionWindow / tokensPerBlock);
+    auto const attentionPoolPointers = kvCacheManager.getAttentionBlockPoolPointers();
+    EXPECT_EQ(attentionPoolPointers->getShape().d[0], 1);
+    EXPECT_EQ(attentionPoolPointers->getShape().d[1], 2);
+    auto const attentionPoolMapping = kvCacheManager.getAttentionLayerToPoolMapping();
+    EXPECT_EQ(attentionPoolMapping->getShape().d[0], 1);
+    EXPECT_EQ(attentionPoolMapping->getShape().d[1], 2);
+    auto const* attentionMapping = tr::bufferCast<SizeType32>(*attentionPoolMapping);
+    EXPECT_EQ(attentionMapping[0], 0);
+    EXPECT_EQ(attentionMapping[1], 0);
+
+    auto makeRequest = [beamWidth, maxNewTokens](LlmRequest::RequestIdType requestId, SizeType32 inputLength)
+    {
+        auto inputTokens = std::make_shared<VecTokens>();
+        for (SizeType32 token = 0; token < inputLength; ++token)
+        {
+            inputTokens->push_back(token);
+        }
+        return std::make_shared<LlmRequest>(
+            requestId, maxNewTokens, inputTokens, tr::SamplingConfig{beamWidth}, /*isStreaming=*/false);
+    };
+
+    auto request0 = makeRequest(/*requestId=*/10, /*inputLength=*/7);
+    auto request1 = makeRequest(/*requestId=*/11, /*inputLength=*/5);
+    kvCacheManager.addSequenceBatch({{{request0->mRequestId, request0->mPromptLen, beamWidth},
+                                        {request1->mRequestId, request1->mPromptLen, beamWidth}}},
+        {std::ref(*request0), std::ref(*request1)});
+
+    auto const attentionBlockOffsets = tr::BufferManager::cpu(
+        tr::ITensor::makeShape({attentionDims.numPools, maxNumSequences, 2, attentionDims.maxBlocksPerSeq}),
+        tr::TRTDataType<tk::KVCacheIndex>::value);
+    auto const maxAttentionBlockCount
+        = kvCacheManager.copyAttentionBlockOffsets(*attentionBlockOffsets, 0, request0->mRequestId);
+    EXPECT_EQ(maxAttentionBlockCount, 2);
+    auto const& attentionBlockIds = kvCacheManager.getCacheBlockIds(request0->mRequestId, maxAttentionWindow).at(0);
+    ASSERT_FALSE(attentionBlockIds.empty());
+    auto const attentionBlock
+        = kvCacheManager.getBlockManager().getBlockById(attentionBlockIds.front(), maxAttentionWindow);
+    ASSERT_NE(attentionBlock, nullptr);
+    auto const* attentionOffsets = tr::bufferCast<tk::KVCacheIndex>(*attentionBlockOffsets);
+    auto const copiedOffset = attentionOffsets[tc::flat_index(attentionBlockOffsets->getShape().d, 0, 0, 0, 0)].get();
+    EXPECT_EQ(copiedOffset, attentionBlock->getMemoryPoolBlockIndex());
+
+    request0->setContextChunkSize(3);
+    request1->setContextChunkSize(2);
+    request1->setContextCurrentPosition(2);
+
+    auto const& stateBlockIds = kvCacheManager.getCacheBlockIds(request0->mRequestId, linearWindowSize).at(0);
+    ASSERT_EQ(stateBlockIds.size(), 2);
+    EXPECT_LT(stateBlockIds.front(), 0);
+    EXPECT_GE(stateBlockIds.back(), 0);
+    auto const stateBlock = kvCacheManager.getBlockManager().getBlockById(stateBlockIds.back(), linearWindowSize);
+    ASSERT_NE(stateBlock, nullptr);
+    EXPECT_EQ(kvCacheManager.getRecurrentStateSlot(request0->mRequestId), stateBlock->getMemoryPoolBlockIndex());
+
+    auto const statePool = kvCacheManager.getPrimaryPool(/*layerIdx=*/0);
+    ASSERT_TRUE(kvCacheManager.isPoolLayerFirst(/*layerIdx=*/0));
+    auto const statePoolShape = statePool->getShape();
+    EXPECT_EQ(statePoolShape.d[0], 2);
+    EXPECT_EQ(statePoolShape.d[1], maxNumSequences);
+    EXPECT_EQ(statePoolShape.d[2], 1);
+    EXPECT_EQ(statePoolShape.d[3], stateSlotBytes);
+
+    tr::BufferManager bufferManager{stream};
+    LinearAttentionBuffers buffers{/*maxBatchSize=*/2, bufferManager};
+    buffers.reshape(/*numSequences=*/2);
+    buffers.fill(RequestVector{request0, request1}, {}, kvCacheManager);
+
+    auto const* contextSlots = tr::bufferCast<SizeType32>(*buffers.stateSlotMappingHost);
+    auto const* contextCuSeqlens = tr::bufferCast<SizeType32>(*buffers.cuSeqlensHost);
+    auto const* contextHasInitialState = tr::bufferCast<SizeType32>(*buffers.hostHasInitialState);
+    EXPECT_EQ(contextSlots[0], kvCacheManager.getRecurrentStateSlot(request0->mRequestId));
+    EXPECT_EQ(contextSlots[1], kvCacheManager.getRecurrentStateSlot(request1->mRequestId));
+    EXPECT_THAT(std::vector<SizeType32>(contextCuSeqlens, contextCuSeqlens + 3), testing::ElementsAre(0, 3, 5));
+    EXPECT_THAT(
+        std::vector<SizeType32>(contextHasInitialState, contextHasInitialState + 2), testing::ElementsAre(0, 1));
+
+    request0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    request1->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    buffers.fill({}, RequestVector{request0, request1}, kvCacheManager);
+
+    auto const* generationCuSeqlens = tr::bufferCast<SizeType32>(*buffers.cuSeqlensHost);
+    auto const* generationHasInitialState = tr::bufferCast<SizeType32>(*buffers.hostHasInitialState);
+    EXPECT_THAT(std::vector<SizeType32>(generationCuSeqlens, generationCuSeqlens + 3), testing::ElementsAre(0, 1, 2));
+    EXPECT_THAT(
+        std::vector<SizeType32>(generationHasInitialState, generationHasInitialState + 2), testing::ElementsAre(1, 1));
 }
 
 ///////////////////////////////////////////////////////////////////////////////

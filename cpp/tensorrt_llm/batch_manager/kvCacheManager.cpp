@@ -3273,6 +3273,23 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
 {
 }
 
+OffsetTableDimensions KVCacheManager::getAttentionOffsetTableDimensions() const
+{
+    OffsetTableDimensions dims;
+    dims.maxBlocksPerSeq = mBlockManager.getWindowSizeMetadata(mMaxAttentionWindow).maxBlocksPerSeq;
+    dims.numPools = 0;
+    dims.cacheType = mBlockManager.getCacheType();
+
+    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        if (!LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            dims.numPools += metadata.numPools;
+        }
+    }
+    return dims;
+}
+
 void KVCacheManager::allocatePools(bool useUvm)
 {
     mBlockManager.allocatePools(useUvm);
@@ -3354,6 +3371,66 @@ void KVCacheManager::allocatePools(bool useUvm)
         auto const layerIdxInCachePool = mBlockManager.getPoolLayerIdx(layerIdx);
         poolMappingRange[layerIdx * 2] = indexOfPool;
         poolMappingRange[layerIdx * 2 + 1] = layerIdxInCachePool;
+    }
+
+    if (mBlockManager.getLinearAttentionMetadata().has_value())
+    {
+        std::vector<SizeType32> fullToAttentionPool(numKVPools, -1);
+        SizeType32 numAttentionPools = 0;
+        SizeType32 numAttentionLayers = 0;
+
+        for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+        {
+            auto const fullPoolIdx = poolMappingRange[layerIdx * 2];
+            auto const windowSize = mBlockManager.getPoolWindowSize(fullPoolIdx);
+            if (LinearAttentionMetadata::hasLinearCache(windowSize))
+            {
+                continue;
+            }
+            if (fullToAttentionPool.at(fullPoolIdx) < 0)
+            {
+                fullToAttentionPool.at(fullPoolIdx) = numAttentionPools;
+                ++numAttentionPools;
+            }
+            ++numAttentionLayers;
+        }
+
+        TLLM_CHECK(numAttentionPools > 0);
+        mAttentionBlockPoolPointers
+            = BufferManager::cpu(ITensor::makeShape({numAttentionPools, 2}), TRTDataType<void*>::value);
+        mAttentionLayerToPoolMapping
+            = BufferManager::cpu(ITensor::makeShape({numAttentionLayers, 2}), TRTDataType<SizeType32>::value);
+
+        auto const* sourcePointers = bufferCast<void*>(*mBlockPoolPointers);
+        auto* destinationPointers = bufferCast<void*>(*mAttentionBlockPoolPointers);
+        for (SizeType32 fullPoolIdx = 0; fullPoolIdx < numKVPools; ++fullPoolIdx)
+        {
+            auto const attentionPoolIdx = fullToAttentionPool.at(fullPoolIdx);
+            if (attentionPoolIdx < 0)
+            {
+                continue;
+            }
+            destinationPointers[attentionPoolIdx * 2] = sourcePointers[fullPoolIdx * 2];
+            destinationPointers[attentionPoolIdx * 2 + 1] = sourcePointers[fullPoolIdx * 2 + 1];
+        }
+
+        auto* destinationMapping = bufferCast<SizeType32>(*mAttentionLayerToPoolMapping);
+        SizeType32 attentionLayerIdx = 0;
+        for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+        {
+            auto const fullPoolIdx = poolMappingRange[layerIdx * 2];
+            auto const windowSize = mBlockManager.getPoolWindowSize(fullPoolIdx);
+            if (LinearAttentionMetadata::hasLinearCache(windowSize))
+            {
+                continue;
+            }
+            auto const attentionPoolIdx = fullToAttentionPool.at(fullPoolIdx);
+            TLLM_CHECK(attentionPoolIdx >= 0);
+            destinationMapping[attentionLayerIdx * 2] = attentionPoolIdx;
+            destinationMapping[attentionLayerIdx * 2 + 1] = poolMappingRange[layerIdx * 2 + 1];
+            ++attentionLayerIdx;
+        }
+        TLLM_CHECK(attentionLayerIdx == numAttentionLayers);
     }
 }
 
@@ -3983,6 +4060,50 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
     return maxBlockCount;
 }
 
+SizeType32 KVCacheManager::copyAttentionBlockOffsets(
+    ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
+{
+    auto const& sequence = getSequence(requestId);
+    auto const beamWidth = sequence.getBeamWidth();
+    auto* dstPtr = bufferCast<tk::KVCacheIndex>(output);
+    auto const& dstShape = output.getShape();
+
+    SizeType32 constexpr kIdx = 0;
+    SizeType32 constexpr vIdx = 1;
+
+    SizeType32 maxBlockCount{0};
+    SizeType32 attentionPoolIdx = 0;
+
+    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            continue;
+        }
+        auto const& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
+        auto const* srcPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
+        auto const& srcShape = cacheBlocksTensor.getShape();
+        auto const& cacheBlockIds = sequence.getCacheBlockIds(windowSize);
+        for (SizeType32 poolIdx = 0; poolIdx < metadata.numPools; ++poolIdx, ++attentionPoolIdx)
+        {
+            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            {
+                auto const beamBlockCount = cacheBlockIds[beamIdx].size();
+                auto const copyChunkSize = beamBlockCount * sizeof(tk::KVCacheIndex);
+                for (auto xIdx : {kIdx, vIdx})
+                {
+                    auto const srcIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, 0);
+                    auto const dstIndex
+                        = tc::flat_index(dstShape.d, attentionPoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
+                    std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
+                }
+                maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(beamBlockCount));
+            }
+        }
+    }
+    return maxBlockCount;
+}
+
 void KVCacheManager::getBlockOffsetsOfBatch(
     ITensor& output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize, SizeType32 beamWidth) const
 {
@@ -4435,6 +4556,29 @@ std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     RequestIdType requestId, SizeType32 windowSize) const
 {
     return getSequence(requestId).getCacheBlockIds(windowSize);
+}
+
+SizeType32 KVCacheManager::getRecurrentStateSlot(RequestIdType requestId, SizeType32 beamIdx) const
+{
+    auto const& blockIds
+        = getCacheBlockIds(requestId, LinearAttentionMetadata::LinearCacheType::kRecurrentStates).at(beamIdx);
+    for (auto blockIt = blockIds.crbegin(); blockIt != blockIds.crend(); ++blockIt)
+    {
+        auto const block
+            = mBlockManager.getBlockById(*blockIt, LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+        TLLM_CHECK_WITH_INFO(block != nullptr, "Unknown recurrent state block id %d for request %lu.", *blockIt,
+            static_cast<unsigned long>(requestId));
+        if (block->isPlaceholder())
+        {
+            continue;
+        }
+        TLLM_CHECK_WITH_INFO(block->isPrimary(),
+            "Recurrent state block for request %lu beam %d must be in the primary pool.",
+            static_cast<unsigned long>(requestId), beamIdx);
+        return block->getMemoryPoolBlockIndex();
+    }
+    TLLM_THROW(
+        "No recurrent state block found for request %lu beam %d.", static_cast<unsigned long>(requestId), beamIdx);
 }
 
 std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(

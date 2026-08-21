@@ -227,8 +227,17 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     CUdeviceptr globalScratch{};
     CUdeviceptr profileScratch{};
 
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(hasInitialState), params.hostHasInitialState,
-        workspaceSizes[10], cudaMemcpyHostToDevice, stream));
+    if (params.hostHasInitialStateIsInt32)
+    {
+        TLLM_CUDA_CHECK(
+            cudaMemcpy2DAsync(reinterpret_cast<void*>(hasInitialState), sizeof(int8_t), params.hostHasInitialState,
+                sizeof(int32_t), sizeof(int8_t), params.numRequests, cudaMemcpyHostToDevice, stream));
+    }
+    else
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(hasInitialState), params.hostHasInitialState,
+            workspaceSizes[10], cudaMemcpyHostToDevice, stream));
+    }
     TLLM_CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(chunkCounter), 0, workspaceSizes[9], stream));
     TLLM_CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(a), 0, workspaceSizes[3], stream));
 

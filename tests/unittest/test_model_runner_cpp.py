@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import typing as tp
 from pathlib import Path
 
@@ -80,3 +83,16 @@ def test_logits_post_processor(model_files, model_path):
     # check that all output tokens are 42
     assert tokens[0][0][output_begin:output_end].tolist() == [42
                                                               ] * max_new_tokens
+
+
+def test_prepare_default_mrope_executor():
+    runner = object.__new__(ModelRunnerCpp)
+    rotary_cos_sin = torch.arange(8, dtype=torch.float32).reshape(1, -1)
+    runner._default_mrope_rotary_cos_sin = rotary_cos_sin
+
+    configs = runner._prepare_mrope_executor([[1, 2], [3]], mrope=None)
+
+    assert len(configs) == 2
+    for config in configs:
+        torch.testing.assert_close(config.mrope_rotary_cos_sin,
+                                   rotary_cos_sin[0])

@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/encoderBuffers.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/linearAttentionBuffers.h"
 #include "tensorrt_llm/batch_manager/loraBuffers.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
@@ -87,6 +88,11 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         transformerBuffers = std::make_unique<TransformerBuffers>(maxBatchSize, maxBeamWidth, maxAttentionWindowVec,
             maxAttentionWindow, sinkTokenLen, runtime, modelConfig, worldConfig);
     }
+    if (modelConfig.isAttentionLinearHybrid())
+    {
+        linearAttentionBuffers = std::make_unique<LinearAttentionBuffers>(maxBatchSize, runtime.getBufferManager());
+    }
+
     if (modelConfig.isRnnBased())
     {
         rnnStateBuffers = std::make_unique<RnnStateBuffers>(maxBatchSize, runtime);
@@ -336,6 +342,10 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     if (transformerBuffers)
     {
         transformerBuffers->reshape(numSequences, numContextTokens + numGenTokens);
+    }
+    if (linearAttentionBuffers)
+    {
+        linearAttentionBuffers->reshape(numSequences);
     }
 
     if (rnnStateBuffers)
@@ -766,6 +776,13 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         positionIdsHost.insert(positionIdsHost.end(), positionIdsHostRow2.begin(), positionIdsHostRow2.end());
     }
 
+    if (linearAttentionBuffers)
+    {
+        TLLM_CHECK_WITH_INFO(kvCacheManagerPtr != nullptr, "Linear attention requires a KV cache manager.");
+        auto const* concreteKvCacheManager = static_cast<kv_cache_manager::KVCacheManager const*>(kvCacheManagerPtr);
+        linearAttentionBuffers->fill(contextRequests, genRequests, *concreteKvCacheManager);
+    }
+
     if (modelConfig.useCrossAttention())
     {
         encoderBuffers->fill(contextRequests, genRequests, manager);
@@ -824,6 +841,10 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (rnnStateBuffers)
         {
             rnnStateBuffers->copySlotMappingH2D(runtime);
+        }
+        if (linearAttentionBuffers)
+        {
+            linearAttentionBuffers->copyToDevice(manager);
         }
         if (modelConfig.useLanguageAdapter())
         {
@@ -945,6 +966,10 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
     if (rnnStateBuffers)
     {
         rnnStateBuffers->getBuffers(inputMap);
+    }
+    if (linearAttentionBuffers)
+    {
+        linearAttentionBuffers->getBuffers(inputMap);
     }
 
     if (worldConfig.isLastPipelineParallelRank())

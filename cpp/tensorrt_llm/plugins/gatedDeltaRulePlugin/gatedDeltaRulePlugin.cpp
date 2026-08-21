@@ -251,7 +251,7 @@ bool GatedDeltaRulePlugin::supportsFormatCombination(
     }
     if (pos == static_cast<int32_t>(InputIdx::kHostHasInitialState))
     {
-        return type == DataType::kINT8 && isLinear;
+        return (type == DataType::kINT8 || type == DataType::kINT32) && isLinear;
     }
     if (pos == nbInputs + 1)
     {
@@ -421,7 +421,8 @@ int32_t GatedDeltaRulePlugin::enqueuePrefill(PluginTensorDesc const* inputDesc, 
         GatedDeltaRulePrefillParams params{inputs[queryIdx], inputs[keyIdx], inputs[valueIdx], inputs[logDecayIdx],
             inputs[betaIdx], outputs[0], state, getStateSlotStrideElements(), outputs[1],
             static_cast<int32_t const*>(inputs[stateSlotMappingIdx]), static_cast<int32_t const*>(inputs[cuSeqLensIdx]),
-            static_cast<int8_t const*>(inputs[hasInitialStateIdx]), workspace, totalTokens, numRequests, mPagedState};
+            inputs[hasInitialStateIdx], inputDesc[hasInitialStateIdx].type == DataType::kINT32, workspace, totalTokens,
+            numRequests, mPagedState};
         mPrefillRunner->run(params, stream);
         return 0;
     }
@@ -444,10 +445,12 @@ int32_t GatedDeltaRulePlugin::enqueueDecode(PluginTensorDesc const* inputDesc, P
         auto const requestTypesIdx = static_cast<int32_t>(InputIdx::kHostRequestTypes);
         int32_t const numRequests = static_cast<int32_t>(inputDesc[requestTypesIdx].dims.d[0]);
         auto const hasInitialStateIdx = static_cast<int32_t>(InputIdx::kHostHasInitialState);
-        auto const* hasInitialState = static_cast<int8_t const*>(inputs[hasInitialStateIdx]);
         for (int32_t requestIdx = 0; requestIdx < numRequests; ++requestIdx)
         {
-            TLLM_CHECK_WITH_INFO(hasInitialState[requestIdx] == 1,
+            auto const hasInitialState = inputDesc[hasInitialStateIdx].type == DataType::kINT32
+                ? static_cast<int32_t const*>(inputs[hasInitialStateIdx])[requestIdx]
+                : static_cast<int8_t const*>(inputs[hasInitialStateIdx])[requestIdx];
+            TLLM_CHECK_WITH_INFO(hasInitialState == 1,
                 "GatedDeltaRulePlugin decode request %d does not have an initial state", requestIdx);
         }
 

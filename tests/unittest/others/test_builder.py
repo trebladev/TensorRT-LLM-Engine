@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,8 @@ import unittest
 # isort: off
 import tensorrt_llm
 import tensorrt as trt
+from tensorrt_llm.builder import BuildConfig, KVCacheType
+from tensorrt_llm.functional import PositionEmbeddingType
 # isort: on
 
 
@@ -31,6 +33,32 @@ class MyAddModule(tensorrt_llm.Module):
 
 
 class TestBuilder(unittest.TestCase):
+
+    def test_mrope_position_embedding_enables_mrope_runtime_buffers(self):
+        build_config = BuildConfig()
+
+        build_config.update_use_mrope(PositionEmbeddingType.mrope)
+
+        self.assertTrue(build_config.use_mrope)
+
+    def test_attention_linear_hybrid_uses_paged_kv_and_state(self):
+        build_config = BuildConfig()
+
+        build_config.update_kv_cache_type('Qwen35ForCausalLM',
+                                          ['linear', 'linear', 'attention'])
+
+        self.assertEqual(build_config.kv_cache_type, KVCacheType.PAGED)
+        self.assertTrue(build_config.plugin_config.paged_kv_cache)
+        self.assertTrue(build_config.plugin_config.paged_state)
+
+    def test_update_kv_cache_type_without_layer_types(self):
+        build_config = BuildConfig()
+
+        build_config.update_kv_cache_type('LlamaForCausalLM')
+
+        self.assertEqual(build_config.kv_cache_type, KVCacheType.PAGED)
+        self.assertTrue(build_config.plugin_config.paged_kv_cache)
+        self.assertFalse(build_config.plugin_config.paged_state)
 
     def test_basic_builder_flow(self):
         tensorrt_llm.logger.set_level('verbose')

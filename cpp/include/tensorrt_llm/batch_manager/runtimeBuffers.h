@@ -53,6 +53,7 @@ class BaseKVCacheManager;
 class LlmRequest;
 
 class EncoderBuffers;
+class LinearAttentionBuffers;
 class LoraBuffers;
 class MedusaBuffers;
 class PromptTuningBuffers;
@@ -169,6 +170,7 @@ private:
 public:
     //! Additional buffers depending on model type
     std::unique_ptr<TransformerBuffers> transformerBuffers;
+    std::unique_ptr<LinearAttentionBuffers> linearAttentionBuffers;
     std::unique_ptr<RnnStateBuffers> rnnStateBuffers;
 
     //! Encoder-Decoder

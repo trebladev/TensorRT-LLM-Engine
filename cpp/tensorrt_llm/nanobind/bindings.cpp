@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -196,7 +196,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     nb::enum_<tr::ModelConfig::LayerType>(m, "LayerType")
         .value("ATTENTION", tr::ModelConfig::LayerType::kATTENTION)
-        .value("RECURRENT", tr::ModelConfig::LayerType::kRECURRENT);
+        .value("RECURRENT", tr::ModelConfig::LayerType::kRECURRENT)
+        .value("LINEAR", tr::ModelConfig::LayerType::kLINEAR)
+        .value("NOOP", tr::ModelConfig::LayerType::kNOOP);
 
     nb::enum_<tr::LoraModule::ModuleType>(m, "LoraModuleType")
         .value("INVALID", tr::LoraModule::ModuleType::kINVALID)
@@ -307,6 +309,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("num_rnn_layers", &tr::ModelConfig::getNbRnnLayers, nb::arg("pipeline_parallelism") = 1,
             nb::arg("pipeline_parallelism_rank") = 0)
         .def("num_kv_heads", &tr::ModelConfig::getNbKvHeads, nb::arg("layer_idx"))
+        .def("num_linear_layers", &tr::ModelConfig::getNbLinearLayers, nb::arg("pipeline_parallelism") = 1,
+            nb::arg("pipeline_parallelism_rank") = 0)
+        .def_prop_ro("is_attention_linear_hybrid", &tr::ModelConfig::isAttentionLinearHybrid)
+        .def_prop_ro("is_full_attention_model", &tr::ModelConfig::isFullAttentionModel)
         .def("set_num_kv_heads", &tr::ModelConfig::setNbKvHeads, nb::arg("num_kv_heads"))
         .def_prop_ro("num_heads", &tr::ModelConfig::getNbHeads)
         .def_prop_ro("hidden_size", &tr::ModelConfig::getHiddenSize)

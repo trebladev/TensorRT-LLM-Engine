@@ -204,15 +204,17 @@ class Qwen35LinearAttention(Module):
         )
         conv_history = config.linear_conv_kernel_dim - 1
         conv_state_bytes = conv_history * self.conv_dim * _BF16_ELEMENT_BYTES
-        state_slot_stride_bytes = gated_delta_state_bytes + conv_state_bytes
+        self.state_slot_stride_bytes = gated_delta_state_bytes + conv_state_bytes
+        self.conv_state_channel_stride_bytes = conv_history * _BF16_ELEMENT_BYTES
+        self.conv_state_history_stride_bytes = _BF16_ELEMENT_BYTES
         self.conv1d = MambaConv1d(
             self.conv_dim,
             config.linear_conv_kernel_dim,
             dtype=config.dtype,
             apply_silu=True,
-            state_slot_stride_bytes=state_slot_stride_bytes,
-            state_channel_stride_bytes=conv_history * _BF16_ELEMENT_BYTES,
-            state_history_stride_bytes=_BF16_ELEMENT_BYTES,
+            state_slot_stride_bytes=self.state_slot_stride_bytes,
+            state_channel_stride_bytes=self.conv_state_channel_stride_bytes,
+            state_history_stride_bytes=self.conv_state_history_stride_bytes,
         )
         self.dt_bias = Parameter(shape=(self.num_v_heads,), dtype="float32")
         self.A_log = Parameter(shape=(self.num_v_heads,), dtype="float32")
@@ -224,7 +226,7 @@ class Qwen35LinearAttention(Module):
             chunk_size=config.gated_delta_chunk_size,
             dtype=config.dtype,
             state_dtype=config.state_dtype,
-            state_slot_stride_bytes=state_slot_stride_bytes,
+            state_slot_stride_bytes=self.state_slot_stride_bytes,
             remove_input_padding=True,
             use_qk_l2norm=True,
         )
@@ -250,6 +252,18 @@ class Qwen35LinearAttention(Module):
         state_slot_mapping: Tensor,
         host_has_initial_state: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        paged_state = default_net().plugin_config.paged_state
+        self.conv1d.state_slot_stride_bytes = self.state_slot_stride_bytes if paged_state else 0
+        self.conv1d.state_channel_stride_bytes = (
+            self.conv_state_channel_stride_bytes if paged_state else 0
+        )
+        self.conv1d.state_history_stride_bytes = (
+            self.conv_state_history_stride_bytes if paged_state else 0
+        )
+        self.gated_delta_rule.state_slot_stride_bytes = (
+            self.state_slot_stride_bytes if paged_state else 0
+        )
+
         mixed_qkv = self.in_proj_qkv(hidden_states)
         mixed_qkv, present_conv_state = self.conv1d(
             mixed_qkv,
@@ -619,7 +633,7 @@ class Qwen35ForCausalLM(PretrainedModel):
             ),
             "host_has_initial_state": Tensor(
                 name="host_has_initial_state",
-                dtype=trt.int8,
+                dtype=trt.int32,
                 shape=[-1],
                 dim_range=batch_dim_range,
                 location=trt.TensorLocation.HOST,

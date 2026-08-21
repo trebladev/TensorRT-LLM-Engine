@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -496,8 +496,9 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
                 "Static batching type is deprecated. Please use in-flight batching with "
                 "CapacitySchedulerPolicy::kSTATIC_BATCH instead.");
         case BatchingType::kINFLIGHT:
-            return modelConfig.isRnnBased() ? batch_manager::TrtGptModelType::InflightBatching
-                                            : batch_manager::TrtGptModelType::InflightFusedBatching;
+            return modelConfig.isRnnBased() || modelConfig.isAttentionLinearHybrid()
+                ? batch_manager::TrtGptModelType::InflightBatching
+                : batch_manager::TrtGptModelType::InflightFusedBatching;
         default: TLLM_THROW("Invalid batching strategy");
         }
     }();
