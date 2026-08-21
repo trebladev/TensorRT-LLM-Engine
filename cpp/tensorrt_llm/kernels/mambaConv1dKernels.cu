@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -769,6 +769,9 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
     }
 }
 
+template <typename input_t, int DCONV>
+__global__ void mamba_conv1d_strided_context_kernel(MambaConv1dParamsBase params);
+
 template <typename input_t>
 void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream)
 {
@@ -780,6 +783,17 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     int S_post = params.post_stride;
     int DS = D + S_pre + S_post;
     bool aligned = DS * sizeof(input_t) % 16 == 0;
+
+    TLLM_CHECK_WITH_INFO(K == 4, "Only dconv == 4 is supported.");
+    bool const compactState = params.state_slot_stride == static_cast<int64_t>(K - 1) * D
+        && params.state_channel_stride == 1 && params.state_history_stride == D;
+    if (!compactState || params.has_initial_state_ptr != nullptr)
+    {
+        int constexpr threads = 256;
+        dim3 const blocks((D + threads - 1) / threads, B);
+        mamba_conv1d_strided_context_kernel<input_t, 4><<<blocks, threads, 0, stream>>>(params);
+        return;
+    }
 
     int tileL = 32;
     int tileD = 128;
@@ -1168,7 +1182,6 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     int shmem = warpL * (32 / laneD) * (pipe + 1) * tileD * 4;
 
     TLLM_CHECK_WITH_INFO(D % 32 == 0, "Channels should be multiple of 32.");
-    TLLM_CHECK_WITH_INFO(K == 4, "Only dconv == 4 is supported.");
 
     input_t* ya = (input_t*) params.out_ptr;
     input_t* ys = (input_t*) params.state_out_ptr;
@@ -1187,6 +1200,145 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
 
     f<<<blks, thds, shmem, stream>>>(B, L, D, S_pre, S_post, ya, ys, xa, xs, w, b, rmpd, silu, ltip, ssmp);
+}
+
+template <typename input_t, int DCONV = 4>
+__global__ void mamba_conv1d_strided_context_kernel(MambaConv1dParamsBase params)
+{
+    int const channel = blockIdx.x * blockDim.x + threadIdx.x;
+    int const sample = blockIdx.y;
+    if (channel >= params.dim || sample >= params.batch)
+    {
+        return;
+    }
+
+    auto const* input = reinterpret_cast<input_t const*>(params.in_ptr);
+    auto const* stateIn = reinterpret_cast<input_t const*>(params.state_in_ptr);
+    auto* stateOut = reinterpret_cast<input_t*>(params.state_out_ptr);
+    auto const* weight = reinterpret_cast<input_t const*>(params.weight_ptr);
+    auto const* bias = reinterpret_cast<input_t const*>(params.bias_ptr);
+    auto* output = reinterpret_cast<input_t*>(params.out_ptr);
+
+    int const inputChannels = params.dim + params.pre_stride + params.post_stride;
+    int tokenOffset{};
+    int sequenceLength{};
+    if (params.remove_padding)
+    {
+        tokenOffset = sample == 0 ? 0 : params.last_token_ids_ptr[sample - 1];
+        sequenceLength = params.last_token_ids_ptr[sample] - tokenOffset;
+    }
+    else
+    {
+        tokenOffset = sample * params.max_seqlen;
+        sequenceLength = params.last_token_ids_ptr[sample];
+    }
+
+    int const slot = params.state_slot_mapping_ptr == nullptr ? sample : params.state_slot_mapping_ptr[sample];
+    int64_t const stateBase = static_cast<int64_t>(slot) * params.state_slot_stride
+        + static_cast<int64_t>(channel) * params.state_channel_stride;
+    bool const hasInitialState = params.has_initial_state_ptr != nullptr && params.has_initial_state_ptr[sample] != 0;
+
+    float history[DCONV - 1];
+#pragma unroll
+    for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
+    {
+        history[historyIdx] = hasInitialState ? tensorrt_llm::common::cuda_cast<float, input_t>(
+                                  stateIn[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride])
+                                              : 0.0F;
+    }
+
+    float const channelBias = tensorrt_llm::common::cuda_cast<float, input_t>(bias[channel]);
+    for (int tokenIdx = 0; tokenIdx < sequenceLength; ++tokenIdx)
+    {
+        float const current = tensorrt_llm::common::cuda_cast<float, input_t>(
+            input[static_cast<int64_t>(tokenOffset + tokenIdx) * inputChannels + params.pre_stride + channel]);
+        float result = channelBias;
+#pragma unroll
+        for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
+        {
+            result += history[historyIdx]
+                * tensorrt_llm::common::cuda_cast<float, input_t>(weight[historyIdx * params.dim + channel]);
+        }
+        result += current * tensorrt_llm::common::cuda_cast<float, input_t>(weight[(DCONV - 1) * params.dim + channel]);
+        if (params.apply_silu)
+        {
+            float const sigmoid = result < -20.0F ? 0.0F : 1.0F / (1.0F + __expf(-result));
+            result *= sigmoid;
+        }
+        output[static_cast<int64_t>(tokenOffset + tokenIdx) * params.dim + channel]
+            = tensorrt_llm::common::cuda_cast<input_t, float>(result);
+
+#pragma unroll
+        for (int historyIdx = 0; historyIdx < DCONV - 2; ++historyIdx)
+        {
+            history[historyIdx] = history[historyIdx + 1];
+        }
+        history[DCONV - 2] = current;
+    }
+
+#pragma unroll
+    for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
+    {
+        stateOut[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]
+            = tensorrt_llm::common::cuda_cast<input_t, float>(history[historyIdx]);
+    }
+}
+
+template <typename input_t, int DCONV = 4>
+__global__ void mamba_conv1d_strided_generation_kernel(MambaConv1dParamsBase params)
+{
+    int const channel = blockIdx.x * blockDim.x + threadIdx.x;
+    int const sample = blockIdx.y;
+    if (channel >= params.dim || sample >= params.batch)
+    {
+        return;
+    }
+
+    auto const* input = reinterpret_cast<input_t const*>(params.in_ptr);
+    auto const* stateIn = reinterpret_cast<input_t const*>(params.state_in_ptr);
+    auto* stateOut = reinterpret_cast<input_t*>(params.state_out_ptr);
+    auto const* weight = reinterpret_cast<input_t const*>(params.weight_ptr);
+    auto const* bias = reinterpret_cast<input_t const*>(params.bias_ptr);
+    auto* output = reinterpret_cast<input_t*>(params.out_ptr);
+
+    int const inputChannels = params.dim + params.pre_stride + params.post_stride;
+    int const slot = params.state_slot_mapping_ptr == nullptr ? sample : params.state_slot_mapping_ptr[sample];
+    int64_t const stateBase = static_cast<int64_t>(slot) * params.state_slot_stride
+        + static_cast<int64_t>(channel) * params.state_channel_stride;
+
+    float history[DCONV - 1];
+#pragma unroll
+    for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
+    {
+        history[historyIdx] = tensorrt_llm::common::cuda_cast<float, input_t>(
+            stateIn[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]);
+    }
+    float const current = tensorrt_llm::common::cuda_cast<float, input_t>(
+        input[static_cast<int64_t>(sample) * inputChannels + params.pre_stride + channel]);
+    float result = tensorrt_llm::common::cuda_cast<float, input_t>(bias[channel]);
+#pragma unroll
+    for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
+    {
+        result += history[historyIdx]
+            * tensorrt_llm::common::cuda_cast<float, input_t>(weight[historyIdx * params.dim + channel]);
+    }
+    result += current * tensorrt_llm::common::cuda_cast<float, input_t>(weight[(DCONV - 1) * params.dim + channel]);
+    if (params.apply_silu)
+    {
+        float const sigmoid = result < -20.0F ? 0.0F : 1.0F / (1.0F + __expf(-result));
+        result *= sigmoid;
+    }
+    output[static_cast<int64_t>(sample) * params.dim + channel]
+        = tensorrt_llm::common::cuda_cast<input_t, float>(result);
+
+#pragma unroll
+    for (int historyIdx = 0; historyIdx < DCONV - 2; ++historyIdx)
+    {
+        stateOut[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]
+            = tensorrt_llm::common::cuda_cast<input_t, float>(history[historyIdx + 1]);
+    }
+    stateOut[stateBase + static_cast<int64_t>(DCONV - 2) * params.state_history_stride]
+        = tensorrt_llm::common::cuda_cast<input_t, float>(current);
 }
 
 template <typename input_t, int DCONV = 4, int CHANNELS_PER_THREAD = 4>
@@ -1297,8 +1449,17 @@ void invokeMambaConv1dGeneration(MambaConv1dParamsBase& params, cudaStream_t str
     int const channelsPerThread = 4;
     int const dConv = 4;
     int const channelsPerBlock = threadsPerBlock * channelsPerThread;
-    TLLM_CHECK_WITH_INFO(channels % channelsPerThread == 0, "channels should be multiple of channelsPerThread");
     TLLM_CHECK_WITH_INFO(params.dconv == dConv, "only dconv == 4 is supported now.");
+    bool const compactState = params.state_slot_stride == static_cast<int64_t>(dConv - 1) * channels
+        && params.state_channel_stride == 1 && params.state_history_stride == channels;
+    if (!compactState)
+    {
+        int constexpr stridedThreads = 256;
+        dim3 const stridedGrid((channels + stridedThreads - 1) / stridedThreads, samples);
+        mamba_conv1d_strided_generation_kernel<input_t><<<stridedGrid, stridedThreads, 0, stream>>>(params);
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(channels % channelsPerThread == 0, "channels should be multiple of channelsPerThread");
     int blockx = (channels + channelsPerBlock - 1) / channelsPerBlock;
     int blocky = (samples + microBatchSize - 1) / microBatchSize;
     dim3 grid(blockx, blocky, 1);

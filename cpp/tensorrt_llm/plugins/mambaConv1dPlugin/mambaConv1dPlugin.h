@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,13 +30,16 @@ namespace tensorrt_llm::plugins
 
 // inputs
 //     0.  input_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-//     1.  conv_state [batch_size, dconv - 1, dim] or host [1] containing only pointer for paged_state
+//     1.  conv_state [batch_size, dconv - 1, dim] or host [1] containing only pointer for paged_state. The paged
+//         pointer addresses the Conv1d subsection of slot 0; state_slot_stride_bytes is the byte distance between
+//         adjacent slots.
 //     2.  weight [1, dconv, dim]
 //     3.  bias [dim]
 //     4.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
 //     5.  last_token_ids [batch_size] int32
 //     6.  host_context_lengths [batch_size] int32, optional for remove_input_padding
 //     7.  state_slot_mapping [batch_size] int32, optional
+//     8.  host_has_initial_state [batch_size] int8, optional host input
 // outputs
 //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     1. conv_state [batch_size, dconv - 1, dim]
@@ -45,7 +48,8 @@ class MambaConv1dPlugin : public BasePlugin
 {
 public:
     MambaConv1dPlugin(int dim, int dconv, int preStride, int postStride, nvinfer1::DataType type, bool removePadding,
-        bool pagedState, bool applySilu);
+        bool pagedState, bool applySilu, int64_t stateSlotStrideBytes, int64_t stateChannelStrideBytes,
+        int64_t stateHistoryStrideBytes, bool useInitialStateMask);
 
     MambaConv1dPlugin(void const* data, size_t length);
 
@@ -131,13 +135,20 @@ private:
         return mRemovePadding ? 7 : 6;
     };
 
+    IndexType getHostHasInitialStateIdx() const
+    {
+        return getSlotMappingIdx() + (mPagedState ? 1 : 0);
+    };
+
     void setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dParamsBase& params,
         // sizes
         const size_t batch, const size_t dim, const size_t maxSeqLen, const size_t dconv, const size_t preStride,
         const size_t postStride,
         // device pointers
         void const* inPtr, void const* stateInPtr, void* stateOutPtr, void const* convWeight, void const* convBias,
-        void* outPtr, int const* lastTokenIds, int const* stateSlotMapping, bool removePadding, bool applySilu);
+        void* outPtr, int const* lastTokenIds, int const* stateSlotMapping, int8_t const* hasInitialState,
+        int64_t stateSlotStride, int64_t stateChannelStride, int64_t stateHistoryStride, bool removePadding,
+        bool applySilu);
 
 private:
     int mDim;
@@ -148,6 +159,10 @@ private:
     bool mRemovePadding = false;
     bool mPagedState = false;
     bool mApplySilu = true;
+    int64_t mStateSlotStrideBytes = 0;
+    int64_t mStateChannelStrideBytes = 0;
+    int64_t mStateHistoryStrideBytes = 0;
+    bool mUseInitialStateMask = false;
 };
 
 class MambaConv1dPluginCreator : public BaseCreator

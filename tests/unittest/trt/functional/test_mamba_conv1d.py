@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@ from itertools import product
 
 import numpy as np
 import pytest
+import tensorrt as trt
 import torch
 from parameterized import parameterized
 from utils.torch_ref import mamba_conv1d_ref
@@ -246,3 +247,273 @@ class TestFunctional(unittest.TestCase):
             present_conv_state_ref.to(torch.float32).cpu().numpy(),
             present_conv_state_trt.to(torch.float32).cpu().numpy(),
             atol=dtype_atol[dtype])
+
+
+def _build_paged_mamba_conv1d_session(
+    input_shapes: dict[str, tuple[int, ...]],
+    dim: int,
+    dconv: int,
+    state_slot_stride_bytes: int,
+) -> tensorrt_llm.runtime.Session:
+    builder = tensorrt_llm.Builder()
+    network = builder.create_network()
+    network.plugin_config.remove_input_padding = True
+    network.plugin_config.paged_state = True
+    with tensorrt_llm.net_guard(network):
+        input_tensor = Tensor("input", trt.bfloat16, input_shapes["input"])
+        state_tensor = Tensor(
+            "state",
+            trt.int64,
+            input_shapes["state"],
+            location=trt.TensorLocation.HOST,
+        )
+        weight_tensor = Tensor("weight", trt.bfloat16, input_shapes["weight"])
+        bias_tensor = Tensor("bias", trt.bfloat16, input_shapes["bias"])
+        host_request_types_tensor = Tensor(
+            "host_request_types",
+            trt.int32,
+            input_shapes["host_request_types"],
+            location=trt.TensorLocation.HOST,
+        )
+        last_token_ids_tensor = Tensor("last_token_ids", trt.int32,
+                                       input_shapes["last_token_ids"])
+        host_context_lengths_tensor = Tensor(
+            "host_context_lengths",
+            trt.int32,
+            input_shapes["host_context_lengths"],
+            location=trt.TensorLocation.HOST,
+        )
+        state_slot_mapping_tensor = Tensor("state_slot_mapping", trt.int32,
+                                           input_shapes["state_slot_mapping"])
+        host_has_initial_state_tensor = Tensor(
+            "host_has_initial_state",
+            trt.int8,
+            input_shapes["host_has_initial_state"],
+            location=trt.TensorLocation.HOST,
+        )
+        output_tensor, _ = tensorrt_llm.functional.mamba_conv1d(
+            input_tensor,
+            state_tensor,
+            weight_tensor,
+            bias_tensor,
+            host_request_types_tensor,
+            last_token_ids_tensor,
+            dim,
+            dconv,
+            "bfloat16",
+            host_context_lengths=host_context_lengths_tensor,
+            slot_mapping=state_slot_mapping_tensor,
+            host_has_initial_state=host_has_initial_state_tensor,
+            state_slot_stride_bytes=state_slot_stride_bytes,
+            state_channel_stride_bytes=(dconv - 1) * torch.bfloat16.itemsize,
+            state_history_stride_bytes=torch.bfloat16.itemsize,
+        )
+        output_tensor.mark_output("output")
+
+    engine = builder.build_engine(
+        network, builder.create_builder_config(precision="bfloat16"))
+    assert engine is not None
+    return tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+
+
+def _run_paged_mamba_conv1d_session(
+    session: tensorrt_llm.runtime.Session,
+    inputs: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    session.set_shapes(inputs)
+    output = torch.empty_like(inputs["input"])
+    stream = torch.cuda.current_stream()
+    ok = session.run(
+        inputs=inputs,
+        outputs={"output": output},
+        stream=stream.cuda_stream,
+    )
+    assert ok
+    stream.synchronize()
+    return output
+
+
+def _mamba_conv1d_paged_reference(
+    input_tensor: torch.Tensor,
+    sequence_lengths: tuple[int, ...],
+    state_pool: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    state_slot_mapping: torch.Tensor,
+    host_has_initial_state: torch.Tensor,
+    apply_silu: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = torch.empty_like(input_tensor)
+    expected_state_pool = state_pool.clone()
+    input_offset = 0
+    for request_idx, sequence_length in enumerate(sequence_lengths):
+        slot = state_slot_mapping[request_idx].item()
+        initial_state = (state_pool[slot:slot + 1]
+                         if host_has_initial_state[request_idx].item() else
+                         torch.zeros_like(state_pool[slot:slot + 1]))
+        request_input = input_tensor[input_offset:input_offset +
+                                     sequence_length].transpose(0, 1)[None]
+        request_output, request_state = mamba_conv1d_ref(
+            request_input,
+            initial_state,
+            weight,
+            bias,
+            apply_silu,
+        )
+        output[input_offset:input_offset +
+               sequence_length] = request_output[0].transpose(0, 1)
+        expected_state_pool[slot] = request_state[0]
+        input_offset += sequence_length
+    return output, expected_state_pool
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="MambaConv1d plugin test requires CUDA")
+def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
+    torch.manual_seed(2468)
+    device = "cuda"
+    dim = 256
+    dconv = 4
+    num_slots = 8
+    sequence_lengths = (5, 9, 17)
+    num_requests = len(sequence_lengths)
+    state_slot_mapping = torch.tensor([6, 2, 5],
+                                      device=device,
+                                      dtype=torch.int32)
+    host_has_initial_state = torch.tensor([1, 0, 1], dtype=torch.int8)
+
+    ssm_state_bytes = 4096
+    conv_state_bytes = dim * (dconv - 1) * torch.bfloat16.itemsize
+    state_slot_stride_bytes = ssm_state_bytes + conv_state_bytes
+    record_pool = torch.full(
+        (num_slots, state_slot_stride_bytes),
+        0xA5,
+        dtype=torch.uint8,
+        device=device,
+    )
+    conv_state_pool = torch.as_strided(
+        record_pool.view(torch.bfloat16),
+        size=(num_slots, dim, dconv - 1),
+        stride=(state_slot_stride_bytes // torch.bfloat16.itemsize, dconv - 1,
+                1),
+        storage_offset=ssm_state_bytes // torch.bfloat16.itemsize,
+    )
+    conv_state_pool.copy_(0.1 * torch.randn_like(conv_state_pool))
+    initial_record_pool = record_pool.clone()
+    initial_state_pool = conv_state_pool.clone()
+    ssm_prefix = record_pool[:, :ssm_state_bytes].clone()
+    state_pointer = torch.tensor([conv_state_pool.data_ptr()],
+                                 dtype=torch.int64)
+
+    weight = torch.randn(dim, 1, dconv, device=device, dtype=torch.bfloat16)
+    bias = torch.randn(dim, device=device, dtype=torch.bfloat16)
+    plugin_weight = weight.permute(1, 2, 0).contiguous()
+    total_tokens = sum(sequence_lengths)
+    input_tensor = torch.randn(total_tokens,
+                               dim,
+                               device=device,
+                               dtype=torch.bfloat16)
+    last_token_ids = torch.tensor(np.cumsum(sequence_lengths),
+                                  device=device,
+                                  dtype=torch.int32)
+    host_context_lengths = torch.tensor(sequence_lengths, dtype=torch.int32)
+    prefill_inputs = {
+        "input": input_tensor,
+        "state": state_pointer,
+        "weight": plugin_weight,
+        "bias": bias,
+        "host_request_types": torch.zeros(num_requests, dtype=torch.int32),
+        "last_token_ids": last_token_ids,
+        "host_context_lengths": host_context_lengths,
+        "state_slot_mapping": state_slot_mapping,
+        "host_has_initial_state": host_has_initial_state,
+    }
+    prefill_session = _build_paged_mamba_conv1d_session(
+        {
+            name: tuple(tensor.shape)
+            for name, tensor in prefill_inputs.items()
+        },
+        dim,
+        dconv,
+        state_slot_stride_bytes,
+    )
+    output = _run_paged_mamba_conv1d_session(prefill_session, prefill_inputs)
+    output_ref, expected_state_pool = _mamba_conv1d_paged_reference(
+        input_tensor,
+        sequence_lengths,
+        initial_state_pool,
+        weight,
+        bias,
+        state_slot_mapping,
+        host_has_initial_state,
+    )
+
+    torch.testing.assert_close(output.float(),
+                               output_ref.float(),
+                               atol=1e-1,
+                               rtol=2e-2)
+    torch.testing.assert_close(conv_state_pool.float(),
+                               expected_state_pool.float(),
+                               atol=1e-2,
+                               rtol=1e-2)
+    assert torch.equal(record_pool[:, :ssm_state_bytes], ssm_prefix)
+    unused_slots = torch.tensor([0, 1, 3, 4, 7],
+                                device=device,
+                                dtype=torch.long)
+    assert torch.equal(
+        record_pool.index_select(0, unused_slots),
+        initial_record_pool.index_select(0, unused_slots),
+    )
+
+    state_before_decode = conv_state_pool.clone()
+    record_before_decode = record_pool.clone()
+    decode_input = torch.randn(num_requests,
+                               dim,
+                               device=device,
+                               dtype=torch.bfloat16)
+    decode_inputs = {
+        "input": decode_input,
+        "state": state_pointer,
+        "weight": plugin_weight,
+        "bias": bias,
+        "host_request_types": torch.ones(num_requests, dtype=torch.int32),
+        "last_token_ids": torch.ones(num_requests,
+                                     device=device,
+                                     dtype=torch.int32),
+        "host_context_lengths": torch.ones(num_requests, dtype=torch.int32),
+        "state_slot_mapping": state_slot_mapping,
+        "host_has_initial_state": torch.ones(num_requests, dtype=torch.int8),
+    }
+    decode_session = _build_paged_mamba_conv1d_session(
+        {
+            name: tuple(tensor.shape)
+            for name, tensor in decode_inputs.items()
+        },
+        dim,
+        dconv,
+        state_slot_stride_bytes,
+    )
+    output = _run_paged_mamba_conv1d_session(decode_session, decode_inputs)
+    output_ref, expected_state_pool = _mamba_conv1d_paged_reference(
+        decode_input,
+        (1, ) * num_requests,
+        state_before_decode,
+        weight,
+        bias,
+        state_slot_mapping,
+        torch.ones(num_requests, dtype=torch.int8),
+    )
+
+    torch.testing.assert_close(output.float(),
+                               output_ref.float(),
+                               atol=1e-1,
+                               rtol=2e-2)
+    torch.testing.assert_close(conv_state_pool.float(),
+                               expected_state_pool.float(),
+                               atol=1e-2,
+                               rtol=1e-2)
+    assert torch.equal(record_pool[:, :ssm_state_bytes], ssm_prefix)
+    assert torch.equal(
+        record_pool.index_select(0, unused_slots),
+        record_before_decode.index_select(0, unused_slots),
+    )

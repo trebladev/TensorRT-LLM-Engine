@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,14 +25,15 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::MambaConv1dPluginCreator;
 using tensorrt_llm::plugins::MambaConv1dPlugin;
 
-static char const* MAMBA_CONV1D_PLUGIN_VERSION{"1"};
+static char const* MAMBA_CONV1D_PLUGIN_VERSION{"2"};
 static char const* MAMBA_CONV1D_PLUGIN_NAME{"MambaConv1d"};
 
 PluginFieldCollection MambaConv1dPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> MambaConv1dPluginCreator::mPluginAttributes;
 
 MambaConv1dPlugin::MambaConv1dPlugin(int dim, int dconv, int preStride, int postStride, nvinfer1::DataType type,
-    bool removePadding, bool pagedState, bool applySilu)
+    bool removePadding, bool pagedState, bool applySilu, int64_t stateSlotStrideBytes, int64_t stateChannelStrideBytes,
+    int64_t stateHistoryStrideBytes, bool useInitialStateMask)
     : mDim(dim)
     , mDConv(dconv)
     , mPreStride(preStride)
@@ -41,9 +42,15 @@ MambaConv1dPlugin::MambaConv1dPlugin(int dim, int dconv, int preStride, int post
     , mRemovePadding(removePadding)
     , mPagedState(pagedState)
     , mApplySilu(applySilu)
+    , mStateSlotStrideBytes(stateSlotStrideBytes)
+    , mStateChannelStrideBytes(stateChannelStrideBytes)
+    , mStateHistoryStrideBytes(stateHistoryStrideBytes)
+    , mUseInitialStateMask(useInitialStateMask)
 {
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
+    TLLM_CHECK_WITH_INFO(mStateSlotStrideBytes >= 0 && mStateChannelStrideBytes >= 0 && mStateHistoryStrideBytes >= 0,
+        "State strides must be non-negative.");
 }
 
 // Parameterized constructor
@@ -58,16 +65,22 @@ MambaConv1dPlugin::MambaConv1dPlugin(void const* data, size_t length)
     read(d, mRemovePadding);
     read(d, mPagedState);
     read(d, mApplySilu);
+    read(d, mStateSlotStrideBytes);
+    read(d, mStateChannelStrideBytes);
+    read(d, mStateHistoryStrideBytes);
+    read(d, mUseInitialStateMask);
     TLLM_CHECK(d == a + length);
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
+    TLLM_CHECK_WITH_INFO(mStateSlotStrideBytes >= 0 && mStateChannelStrideBytes >= 0 && mStateHistoryStrideBytes >= 0,
+        "State strides must be non-negative.");
 }
 
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* MambaConv1dPlugin::clone() const noexcept
 {
-    auto* plugin
-        = new MambaConv1dPlugin(mDim, mDConv, mPreStride, mPostStride, mType, mRemovePadding, mPagedState, mApplySilu);
+    auto* plugin = new MambaConv1dPlugin(mDim, mDConv, mPreStride, mPostStride, mType, mRemovePadding, mPagedState,
+        mApplySilu, mStateSlotStrideBytes, mStateChannelStrideBytes, mStateHistoryStrideBytes, mUseInitialStateMask);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -90,6 +103,10 @@ nvinfer1::DimsExprs MambaConv1dPlugin::getOutputDimensions(
 bool MambaConv1dPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
+    if (mUseInitialStateMask && pos == getHostHasInitialStateIdx())
+    {
+        return inOut[pos].type == nvinfer1::DataType::kINT8;
+    }
     if (pos == getHostRequestTypesIdx() || pos == getLastTokenIdsIdx()
         || (mRemovePadding && pos == getHostContextLengthIdx()) || (mPagedState && pos == getSlotMappingIdx()))
     {
@@ -113,13 +130,14 @@ void MambaConv1dPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const*
 size_t MambaConv1dPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
     nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
-    return 0;
+    return mUseInitialStateMask ? static_cast<size_t>(inputs[getHostRequestTypesIdx()].dims.d[0]) * sizeof(int8_t) : 0;
 }
 
 void MambaConv1dPlugin::setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dParamsBase& params, const size_t batch,
     const size_t dim, const size_t maxSeqLen, const size_t dconv, const size_t preStride, const size_t postStride,
     void const* inPtr, void const* stateInPtr, void* stateOutPtr, void const* convWeight, void const* convBias,
-    void* outPtr, int const* lastTokenIds, int const* stateSlotMapping, bool removePadding, bool applySilu)
+    void* outPtr, int const* lastTokenIds, int const* stateSlotMapping, int8_t const* hasInitialState,
+    int64_t stateSlotStride, int64_t stateChannelStride, int64_t stateHistoryStride, bool removePadding, bool applySilu)
 {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -130,6 +148,9 @@ void MambaConv1dPlugin::setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dP
     params.dconv = dconv;
     params.pre_stride = preStride;
     params.post_stride = postStride;
+    params.state_slot_stride = stateSlotStride;
+    params.state_channel_stride = stateChannelStride;
+    params.state_history_stride = stateHistoryStride;
 
     params.remove_padding = removePadding;
     params.apply_silu = applySilu;
@@ -143,6 +164,7 @@ void MambaConv1dPlugin::setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dP
     params.out_ptr = outPtr;
     params.last_token_ids_ptr = lastTokenIds;
     params.state_slot_mapping_ptr = stateSlotMapping;
+    params.has_initial_state_ptr = hasInitialState;
 }
 
 template <typename T>
@@ -159,6 +181,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     //     5.  last_token_ids [batch_size] int32
     //     6.  host_context_lengths [batch_size] int32, optional for remove_input_padding
     //     7.  state_slot_mapping [batch_size] int32, optional
+    //     8.  host_has_initial_state [batch_size] int8, optional host input
     // outputs
     //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
     //     1. conv_state [batch_size, dconv - 1, dim]
@@ -185,9 +208,45 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     void* stateOutPtr
         = mPagedState ? *reinterpret_cast<void**>(const_cast<void*>(inputs[getConvStateIdx()])) : outputs[1];
 
+    int8_t const* hasInitialState{};
+    if (mUseInitialStateMask)
+    {
+        auto const* hostHasInitialState = static_cast<int8_t const*>(inputs[getHostHasInitialStateIdx()]);
+        if (reqTypes[0] == RequestType::kCONTEXT)
+        {
+            TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                workspace, hostHasInitialState, batchSize * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
+            hasInitialState = static_cast<int8_t const*>(workspace);
+        }
+        else if (reqTypes[0] == RequestType::kGENERATION)
+        {
+            for (int requestIdx = 0; requestIdx < batchSize; ++requestIdx)
+            {
+                TLLM_CHECK_WITH_INFO(hostHasInitialState[requestIdx] == 1,
+                    "MambaConv1d generation request %d does not have an initial state", requestIdx);
+            }
+        }
+    }
+
+    auto const strideElements = [](int64_t strideBytes, int64_t defaultElements, char const* strideName)
+    {
+        TLLM_CHECK_WITH_INFO(
+            strideBytes % sizeof(T) == 0, "%s must be divisible by the state element size", strideName);
+        return strideBytes == 0 ? defaultElements : strideBytes / static_cast<int64_t>(sizeof(T));
+    };
+    int64_t const stateSlotStride
+        = strideElements(mStateSlotStrideBytes, static_cast<int64_t>(mDConv - 1) * mDim, "state_slot_stride_bytes");
+    int64_t const stateChannelStride = strideElements(mStateChannelStrideBytes, 1, "state_channel_stride_bytes");
+    int64_t const stateHistoryStride = strideElements(mStateHistoryStrideBytes, mDim, "state_history_stride_bytes");
+    int64_t const stateSpan = static_cast<int64_t>(mDim - 1) * stateChannelStride
+        + static_cast<int64_t>(mDConv - 2) * stateHistoryStride + 1;
+    TLLM_CHECK_WITH_INFO(
+        stateSlotStride >= stateSpan, "state_slot_stride_bytes is too small for the configured Conv state layout");
+
     setMambaConv1dParams(mambaConv1dParams, batchSize, mDim, maxSeqLen, mDConv, mPreStride, mPostStride,
         inputs[getInputTensorIdx()], stateInPtr, stateOutPtr, inputs[getWeightIdx()], inputs[getBiasIdx()], outputs[0],
-        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, mRemovePadding, mApplySilu);
+        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, hasInitialState, stateSlotStride,
+        stateChannelStride, stateHistoryStride, mRemovePadding, mApplySilu);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {
@@ -260,7 +319,8 @@ void MambaConv1dPlugin::terminate() noexcept {}
 size_t MambaConv1dPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mDim) + sizeof(mDConv) + sizeof(mPreStride) + sizeof(mPostStride) + sizeof(mType)
-        + sizeof(mRemovePadding) + sizeof(mPagedState) + sizeof(mApplySilu);
+        + sizeof(mRemovePadding) + sizeof(mPagedState) + sizeof(mApplySilu) + sizeof(mStateSlotStrideBytes)
+        + sizeof(mStateChannelStrideBytes) + sizeof(mStateHistoryStrideBytes) + sizeof(mUseInitialStateMask);
 }
 
 void MambaConv1dPlugin::serialize(void* buffer) const noexcept
@@ -274,6 +334,10 @@ void MambaConv1dPlugin::serialize(void* buffer) const noexcept
     write(d, mRemovePadding);
     write(d, mPagedState);
     write(d, mApplySilu);
+    write(d, mStateSlotStrideBytes);
+    write(d, mStateChannelStrideBytes);
+    write(d, mStateHistoryStrideBytes);
+    write(d, mUseInitialStateMask);
     TLLM_CHECK(d == a + getSerializationSize());
 }
 
@@ -296,6 +360,10 @@ MambaConv1dPluginCreator::MambaConv1dPluginCreator()
     mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8));
     mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8));
     mPluginAttributes.emplace_back(PluginField("apply_silu", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("state_slot_stride_bytes", nullptr, PluginFieldType::kINT64));
+    mPluginAttributes.emplace_back(PluginField("state_channel_stride_bytes", nullptr, PluginFieldType::kINT64));
+    mPluginAttributes.emplace_back(PluginField("state_history_stride_bytes", nullptr, PluginFieldType::kINT64));
+    mPluginAttributes.emplace_back(PluginField("use_initial_state_mask", nullptr, PluginFieldType::kINT8));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -325,6 +393,10 @@ IPluginV2* MambaConv1dPluginCreator::createPlugin(char const* name, PluginFieldC
     bool removePadding{};
     bool pagedState{};
     bool applySilu{};
+    int64_t stateSlotStrideBytes{};
+    int64_t stateChannelStrideBytes{};
+    int64_t stateHistoryStrideBytes{};
+    bool useInitialStateMask{};
     nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -370,11 +442,31 @@ IPluginV2* MambaConv1dPluginCreator::createPlugin(char const* name, PluginFieldC
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             applySilu = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "state_slot_stride_bytes"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT64);
+            stateSlotStrideBytes = *(static_cast<int64_t const*>(fields[i].data));
+        }
+        else if (!strcmp(attrName, "state_channel_stride_bytes"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT64);
+            stateChannelStrideBytes = *(static_cast<int64_t const*>(fields[i].data));
+        }
+        else if (!strcmp(attrName, "state_history_stride_bytes"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT64);
+            stateHistoryStrideBytes = *(static_cast<int64_t const*>(fields[i].data));
+        }
+        else if (!strcmp(attrName, "use_initial_state_mask"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            useInitialStateMask = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
     }
     try
     {
-        auto* obj
-            = new MambaConv1dPlugin(dim, dconv, pre_stride, post_stride, type, removePadding, pagedState, applySilu);
+        auto* obj = new MambaConv1dPlugin(dim, dconv, pre_stride, post_stride, type, removePadding, pagedState,
+            applySilu, stateSlotStrideBytes, stateChannelStrideBytes, stateHistoryStrideBytes, useInitialStateMask);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

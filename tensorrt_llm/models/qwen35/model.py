@@ -199,14 +199,21 @@ class Qwen35LinearAttention(Module):
         self.in_proj_z = ColumnLinear(config.hidden_size, self.value_dim, **linear_kwargs)
         self.in_proj_b = ColumnLinear(config.hidden_size, self.num_v_heads, **linear_kwargs)
         self.in_proj_a = ColumnLinear(config.hidden_size, self.num_v_heads, **linear_kwargs)
-        self.conv1d = MambaConv1d(
-            self.conv_dim, config.linear_conv_kernel_dim, dtype=config.dtype, apply_silu=True
-        )
         gated_delta_state_bytes = (
             self.num_v_heads * self.head_v_dim * self.head_k_dim * _FP32_ELEMENT_BYTES
         )
-        conv_state_bytes = (config.linear_conv_kernel_dim - 1) * self.conv_dim * _BF16_ELEMENT_BYTES
+        conv_history = config.linear_conv_kernel_dim - 1
+        conv_state_bytes = conv_history * self.conv_dim * _BF16_ELEMENT_BYTES
         state_slot_stride_bytes = gated_delta_state_bytes + conv_state_bytes
+        self.conv1d = MambaConv1d(
+            self.conv_dim,
+            config.linear_conv_kernel_dim,
+            dtype=config.dtype,
+            apply_silu=True,
+            state_slot_stride_bytes=state_slot_stride_bytes,
+            state_channel_stride_bytes=conv_history * _BF16_ELEMENT_BYTES,
+            state_history_stride_bytes=_BF16_ELEMENT_BYTES,
+        )
         self.dt_bias = Parameter(shape=(self.num_v_heads,), dtype="float32")
         self.A_log = Parameter(shape=(self.num_v_heads,), dtype="float32")
         self.gated_delta_rule = GatedDeltaRule(
@@ -251,6 +258,7 @@ class Qwen35LinearAttention(Module):
             last_token_ids,
             host_context_lengths=host_context_lengths,
             slot_mapping=state_slot_mapping,
+            host_has_initial_state=host_has_initial_state,
         )
         query, key, value = split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         num_tokens = shape(hidden_states, 0)

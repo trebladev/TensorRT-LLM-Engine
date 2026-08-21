@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,7 +33,10 @@ class MambaConv1d(Module):
                  pre_stride=0,
                  post_stride=0,
                  dtype=None,
-                 apply_silu=True):
+                 apply_silu=True,
+                 state_slot_stride_bytes=0,
+                 state_channel_stride_bytes=0,
+                 state_history_stride_bytes=0):
         super().__init__()
         self.d_inner = d_inner
         self.d_conv = d_conv
@@ -44,6 +47,9 @@ class MambaConv1d(Module):
                                 dtype=dtype)
         self.bias = Parameter(shape=(self.d_inner, ), dtype=dtype)
         self.apply_silu = apply_silu
+        self.state_slot_stride_bytes = state_slot_stride_bytes
+        self.state_channel_stride_bytes = state_channel_stride_bytes
+        self.state_history_stride_bytes = state_history_stride_bytes
 
     def forward(self,
                 x: Tensor,
@@ -52,7 +58,8 @@ class MambaConv1d(Module):
                 last_token_ids: Tensor,
                 host_context_lengths: Optional[Tensor] = None,
                 slot_mapping: Optional[Tensor] = None,
-                conv_indices: Optional[Tensor] = None):
+                conv_indices: Optional[Tensor] = None,
+                host_has_initial_state: Optional[Tensor] = None):
         '''
         Parameters:
             x: [B, L, D] or [T, D]
@@ -71,7 +78,10 @@ class MambaConv1d(Module):
                 x, conv_state, transposed_weight, self.bias.value,
                 host_request_types, last_token_ids, self.d_inner, self.d_conv,
                 self.dtype, self.pre_stride, self.post_stride,
-                host_context_lengths, slot_mapping, self.apply_silu)
+                host_context_lengths, slot_mapping, self.apply_silu,
+                host_has_initial_state, self.state_slot_stride_bytes,
+                self.state_channel_stride_bytes,
+                self.state_history_stride_bytes)
         else:
             assert not default_net().plugin_config.paged_state
             assert len(

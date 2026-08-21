@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ namespace kernels
 struct MambaConv1dParamsBase
 {
     int batch, dim, max_seqlen, dconv, pre_stride, post_stride;
+    int64_t state_slot_stride, state_channel_stride, state_history_stride;
     bool remove_padding;
     bool apply_silu;
     void* __restrict__ in_ptr;
@@ -38,6 +39,7 @@ struct MambaConv1dParamsBase
     void* __restrict__ out_ptr;
     int const* __restrict__ last_token_ids_ptr;
     int const* __restrict__ state_slot_mapping_ptr;
+    int8_t const* __restrict__ has_initial_state_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -6898,7 +6898,11 @@ def mamba_conv1d(input: Tensor,
                  post_stride: int = 0,
                  host_context_lengths: Optional[Tensor] = None,
                  slot_mapping: Optional[Tensor] = None,
-                 apply_silu: bool = True):
+                 apply_silu: bool = True,
+                 host_has_initial_state: Optional[Tensor] = None,
+                 state_slot_stride_bytes: int = 0,
+                 state_channel_stride_bytes: int = 0,
+                 state_history_stride_bytes: int = 0):
     '''
     Parameters:
         input : Tensor (On GPU)
@@ -6944,15 +6948,36 @@ def mamba_conv1d(input: Tensor,
             A host tensor that contains the lengths of the different inputs,
 
         slot_mapping: Tensor (On GPU) (Optional)
-            Real page index in state. Its shape is [dim], used for paged state, each page shape is [dconv, dim]
+            Real page index in state. Its shape is [batch_size], used for paged state.
 
         apply_silu: bool
             Is there a SiLU operation after the conv1d? When True apply
             SiLU activation function after the conv1d.
+
+        host_has_initial_state: Tensor (On CPU) (Optional)
+            Per-request mask indicating whether context requests should load an
+            existing Conv state from the selected slot.
+
+        state_slot_stride_bytes: int
+            Byte distance between adjacent state slots. Zero selects the compact layout.
+
+        state_channel_stride_bytes: int
+            Byte distance between adjacent channels within a slot. Zero selects the compact layout.
+
+        state_history_stride_bytes: int
+            Byte distance between adjacent history elements for one channel. Zero selects the compact layout.
     '''
     assert host_request_types is not None
+    for stride_name, stride_bytes in (
+        ('state_slot_stride_bytes', state_slot_stride_bytes),
+        ('state_channel_stride_bytes', state_channel_stride_bytes),
+        ('state_history_stride_bytes', state_history_stride_bytes),
+    ):
+        if stride_bytes < 0:
+            raise ValueError(f'{stride_name} must be non-negative')
+    use_initial_state_mask = host_has_initial_state is not None
     mamba_conv1d_plg_creator = trt.get_plugin_registry().get_plugin_creator(
-        'MambaConv1d', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        'MambaConv1d', '2', TRT_LLM_PLUGIN_NAMESPACE)
     assert mamba_conv1d_plg_creator is not None
 
     dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
@@ -6980,9 +7005,21 @@ def mamba_conv1d(input: Tensor,
                                  np.array(np.int8(apply_silu), dtype=np.int8),
                                  trt.PluginFieldType.INT8)
 
+    def int64_field(name: str, value: int) -> trt.PluginField:
+        return trt.PluginField(name, np.array([int(value)], dtype=np.int64),
+                               trt.PluginFieldType.INT64)
+
+    use_initial_state_mask_field = trt.PluginField(
+        "use_initial_state_mask",
+        np.array(np.int8(use_initial_state_mask), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     pfc = trt.PluginFieldCollection([
         dim, dconv, pre_stride, post_stride, pf_type, remove_input_padding,
-        paged_state, apply_silu
+        paged_state, apply_silu,
+        int64_field("state_slot_stride_bytes", state_slot_stride_bytes),
+        int64_field("state_channel_stride_bytes", state_channel_stride_bytes),
+        int64_field("state_history_stride_bytes",
+                    state_history_stride_bytes), use_initial_state_mask_field
     ])
     mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
         "mamba_conv1d", pfc)
@@ -6994,6 +7031,8 @@ def mamba_conv1d(input: Tensor,
         plug_inputs += [host_context_lengths]
     if default_net().plugin_config.paged_state:
         plug_inputs += [slot_mapping]
+    if use_initial_state_mask:
+        plug_inputs += [host_has_initial_state]
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, mamba_conv1d_plug)
