@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..._utils import pad_vocab_size
 from ..convert_utils import iterate_shard_files, load_state_dict
 from .config import Qwen35Config
 
@@ -48,6 +49,59 @@ def _convert_zero_centered_norm(param: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _split_tp(param: torch.Tensor, config: Qwen35Config, dim: int = 0) -> torch.Tensor:
+    tp_size = config.mapping.tp_size
+    if tp_size == 1:
+        return param.contiguous()
+    if param.shape[dim] % tp_size != 0:
+        raise ValueError(
+            f"Cannot split tensor shape {tuple(param.shape)} along dim {dim} across TP={tp_size}"
+        )
+    shard_size = param.shape[dim] // tp_size
+    return param.narrow(dim, config.mapping.tp_rank * shard_size, shard_size).contiguous()
+
+
+def _split_head_rows(
+    param: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    config: Qwen35Config,
+) -> torch.Tensor:
+    expected_rows = num_heads * head_dim
+    if param.shape[0] != expected_rows:
+        raise ValueError(
+            f"Unexpected head tensor rows: expected {expected_rows}, got {param.shape[0]}"
+        )
+    reshaped = param.reshape(num_heads, head_dim, *param.shape[1:])
+    local = _split_tp(reshaped, config, dim=0)
+    return local.reshape(-1, *param.shape[1:]).contiguous()
+
+
+def _split_gdn_qkv_rows(param: torch.Tensor, config: Qwen35Config) -> torch.Tensor:
+    key_rows = config.linear_num_key_heads * config.linear_key_head_dim
+    value_rows = config.linear_num_value_heads * config.linear_value_head_dim
+    expected_rows = key_rows * 2 + value_rows
+    if param.shape[0] != expected_rows:
+        raise ValueError(f"Unexpected GDN QKV rows: expected {expected_rows}, got {param.shape[0]}")
+    query, key, value = torch.split(param, [key_rows, key_rows, value_rows], dim=0)
+    query = _split_head_rows(query, config.linear_num_key_heads, config.linear_key_head_dim, config)
+    key = _split_head_rows(key, config.linear_num_key_heads, config.linear_key_head_dim, config)
+    value = _split_head_rows(
+        value, config.linear_num_value_heads, config.linear_value_head_dim, config
+    )
+    return torch.cat([query, key, value], dim=0).contiguous()
+
+
+def _convert_lm_head(param: torch.Tensor, config: Qwen35Config) -> torch.Tensor:
+    weight = _to_bfloat16(param)
+    if weight.shape[0] == config.vocab_size:
+        padded_vocab_size = pad_vocab_size(config.vocab_size, config.mapping.tp_size)
+        if padded_vocab_size != config.vocab_size:
+            padding = weight.new_zeros((padded_vocab_size - config.vocab_size, weight.shape[1]))
+            weight = torch.cat([weight, padding], dim=0)
+    return _split_tp(weight, config, dim=0)
+
+
 def _split_query_and_gate(
     weight: torch.Tensor, config: Qwen35Config
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,6 +109,7 @@ def _split_query_and_gate(
     if weight.shape[0] != expected_rows:
         raise ValueError(f"Unexpected q_proj rows: expected {expected_rows}, got {weight.shape[0]}")
     weight = weight.reshape(config.num_attention_heads, 2, config.head_size, weight.shape[1])
+    weight = _split_tp(weight, config, dim=0)
     query = weight[:, 0].reshape(-1, weight.shape[-1])
     gate = weight[:, 1].reshape(-1, weight.shape[-1])
     return _to_bfloat16(query), _to_bfloat16(gate)
@@ -72,7 +127,7 @@ def _convert_parameter(
     if name == "model.norm.weight":
         return {"transformer.ln_f.weight": _convert_zero_centered_norm(param)}
     if name == "lm_head.weight":
-        return {"lm_head.weight": _to_bfloat16(param)}
+        return {"lm_head.weight": _convert_lm_head(param, config)}
 
     parts = name.split(".")
     if len(parts) < 5 or parts[:2] != ["model", "layers"]:
@@ -92,7 +147,12 @@ def _convert_parameter(
         target = target_prefix + common_names[suffix]
         if suffix.endswith("layernorm.weight"):
             return {target: _convert_zero_centered_norm(param)}
-        return {target: _to_bfloat16(param)}
+        weight = _to_bfloat16(param)
+        if suffix in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):
+            weight = _split_tp(weight, config, dim=0)
+        elif suffix == "mlp.down_proj.weight":
+            weight = _split_tp(weight, config, dim=1)
+        return {target: weight}
 
     if suffix == "self_attn.q_proj.weight":
         query, gate = _split_query_and_gate(param, config)
@@ -107,7 +167,17 @@ def _convert_parameter(
         "self_attn.o_proj.weight": "attention.dense.proj.weight",
     }
     if suffix in full_attention_names:
-        return {target_prefix + full_attention_names[suffix]: _to_bfloat16(param)}
+        weight = _to_bfloat16(param)
+        if suffix in ("self_attn.k_proj.weight", "self_attn.v_proj.weight"):
+            weight = _split_head_rows(
+                weight,
+                config.num_key_value_heads,
+                config.head_size,
+                config,
+            )
+        else:
+            weight = _split_tp(weight, config, dim=1)
+        return {target_prefix + full_attention_names[suffix]: weight}
     if suffix == "self_attn.q_norm.weight":
         return {
             target_prefix + "attention.qkv.query_norm.weight": _convert_zero_centered_norm(param)
@@ -124,23 +194,37 @@ def _convert_parameter(
         "linear_attn.norm.weight": "linear_attn.norm.weight",
     }
     if suffix in linear_attention_names:
-        return {target_prefix + linear_attention_names[suffix]: _to_bfloat16(param)}
+        weight = _to_bfloat16(param)
+        if suffix == "linear_attn.in_proj_qkv.weight":
+            weight = _split_gdn_qkv_rows(weight, config)
+        elif suffix == "linear_attn.in_proj_z.weight":
+            weight = _split_head_rows(
+                weight,
+                config.linear_num_value_heads,
+                config.linear_value_head_dim,
+                config,
+            )
+        elif suffix in ("linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight"):
+            weight = _split_head_rows(weight, config.linear_num_value_heads, 1, config)
+        elif suffix == "linear_attn.out_proj.weight":
+            weight = _split_tp(weight, config, dim=1)
+        return {target_prefix + linear_attention_names[suffix]: weight}
     if suffix == "linear_attn.conv1d.weight":
-        weight = _to_bfloat16(param).unsqueeze(-1)
-        bias = torch.zeros(param.shape[0], dtype=torch.bfloat16)
+        weight = _to_bfloat16(_split_gdn_qkv_rows(param, config)).unsqueeze(-1)
+        bias = torch.zeros(weight.shape[0], dtype=torch.bfloat16)
         return {
             target_prefix + "linear_attn.conv1d.weight": weight,
             target_prefix + "linear_attn.conv1d.bias": bias,
         }
     if suffix == "linear_attn.A_log":
         return {
-            target_prefix + "linear_attn.A_log": param.detach()
+            target_prefix + "linear_attn.A_log": _split_tp(param, config)
             .to(device="cpu", dtype=torch.float32)
             .contiguous()
         }
     if suffix == "linear_attn.dt_bias":
         return {
-            target_prefix + "linear_attn.dt_bias": param.detach()
+            target_prefix + "linear_attn.dt_bias": _split_tp(param, config)
             .to(device="cpu", dtype=torch.float32)
             .contiguous()
         }
@@ -161,7 +245,9 @@ def convert_hf_qwen35(
     for name, param in state_dict.items():
         weights.update(_convert_parameter(name, param, config))
     if "lm_head.weight" not in weights and config.tie_word_embeddings:
-        weights["lm_head.weight"] = weights["transformer.vocab_embedding.weight"].clone()
+        weights["lm_head.weight"] = _convert_lm_head(
+            weights["transformer.vocab_embedding.weight"].clone(), config
+        )
     return weights
 
 
@@ -176,5 +262,7 @@ def load_weights_from_hf_checkpoint(
             weights.update(_convert_parameter(name, param, config))
         del state_dict
     if "lm_head.weight" not in weights and config.tie_word_embeddings:
-        weights["lm_head.weight"] = weights["transformer.vocab_embedding.weight"].clone()
+        weights["lm_head.weight"] = _convert_lm_head(
+            weights["transformer.vocab_embedding.weight"].clone(), config
+        )
     return weights

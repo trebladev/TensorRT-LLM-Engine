@@ -21,6 +21,7 @@ import torch
 from safetensors import safe_open
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.qwen35.config import Qwen35Config
 from tensorrt_llm.models.qwen35.convert import convert_hf_qwen35
 
@@ -33,6 +34,10 @@ _REQUIRED_KEYS = (
     "model.language_model.layers.0.input_layernorm.weight",
     "model.language_model.layers.0.post_attention_layernorm.weight",
     "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+    "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+    "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+    "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+    "model.language_model.layers.0.linear_attn.out_proj.weight",
     "model.language_model.layers.0.mlp.gate_proj.weight",
     "model.language_model.layers.0.mlp.up_proj.weight",
     "model.language_model.layers.0.mlp.down_proj.weight",
@@ -166,6 +171,10 @@ def test_convert_real_qwen35_checkpoint_dtypes_and_values(
         "transformer.layers.0.mlp.gate.weight",
         "transformer.layers.0.mlp.proj.weight",
         "transformer.layers.0.linear_attn.in_proj_qkv.weight",
+        "transformer.layers.0.linear_attn.in_proj_z.weight",
+        "transformer.layers.0.linear_attn.in_proj_a.weight",
+        "transformer.layers.0.linear_attn.in_proj_b.weight",
+        "transformer.layers.0.linear_attn.out_proj.weight",
         "transformer.layers.0.linear_attn.conv1d.weight",
         "transformer.layers.0.linear_attn.conv1d.bias",
         "transformer.layers.0.linear_attn.norm.weight",
@@ -259,6 +268,18 @@ def test_convert_real_qwen35_checkpoint_dtypes_and_values(
         "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": (
             "transformer.layers.0.linear_attn.in_proj_qkv.weight"
         ),
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight": (
+            "transformer.layers.0.linear_attn.in_proj_z.weight"
+        ),
+        "model.language_model.layers.0.linear_attn.in_proj_a.weight": (
+            "transformer.layers.0.linear_attn.in_proj_a.weight"
+        ),
+        "model.language_model.layers.0.linear_attn.in_proj_b.weight": (
+            "transformer.layers.0.linear_attn.in_proj_b.weight"
+        ),
+        "model.language_model.layers.0.linear_attn.out_proj.weight": (
+            "transformer.layers.0.linear_attn.out_proj.weight"
+        ),
         "model.language_model.layers.3.self_attn.k_proj.weight": (
             "transformer.layers.3.attention.qkv.key.weight"
         ),
@@ -280,3 +301,93 @@ def test_convert_real_qwen35_checkpoint_dtypes_and_values(
         != converted["transformer.vocab_embedding.weight"].data_ptr()
     )
     assert _VISION_KEY not in converted
+
+
+def _merge_gdn_qkv_shards(
+    shards: tuple[torch.Tensor, torch.Tensor], config: Qwen35Config
+) -> torch.Tensor:
+    local_key_rows = (
+        config.linear_num_key_heads // config.mapping.tp_size * config.linear_key_head_dim
+    )
+    local_value_rows = (
+        config.linear_num_value_heads // config.mapping.tp_size * config.linear_value_head_dim
+    )
+    sections = [
+        torch.split(shard, [local_key_rows, local_key_rows, local_value_rows], dim=0)
+        for shard in shards
+    ]
+    return torch.cat(
+        [
+            torch.cat([rank_sections[section_idx] for rank_sections in sections], dim=0)
+            for section_idx in range(3)
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def test_convert_real_qwen35_checkpoint_tp2_shards_reconstruct_tp1(
+    qwen35_checkpoint_dir: Path,
+    real_qwen35_conversion: tuple[Qwen35Config, dict[str, torch.Tensor], dict[str, torch.Tensor]],
+) -> None:
+    _, source, full_weights = real_qwen35_conversion
+    tp_configs = tuple(
+        Qwen35Config.from_hugging_face(
+            qwen35_checkpoint_dir,
+            mapping=Mapping(world_size=2, rank=rank, tp_size=2),
+        )
+        for rank in range(2)
+    )
+    rank_weights = tuple(convert_hf_qwen35(source, config) for config in tp_configs)
+
+    for weights in rank_weights:
+        assert set(weights) == set(full_weights)
+        for name, tensor in weights.items():
+            expected_dtype = (
+                torch.float32 if name.endswith(("A_log", "dt_bias")) else torch.bfloat16
+            )
+            assert tensor.dtype == expected_dtype
+            assert tensor.device.type == "cpu"
+            assert tensor.is_contiguous()
+
+    column_parallel_keys = {
+        "lm_head.weight",
+        "transformer.layers.0.mlp.fc.weight",
+        "transformer.layers.0.mlp.gate.weight",
+        "transformer.layers.0.linear_attn.in_proj_z.weight",
+        "transformer.layers.0.linear_attn.in_proj_a.weight",
+        "transformer.layers.0.linear_attn.in_proj_b.weight",
+        "transformer.layers.0.linear_attn.A_log",
+        "transformer.layers.0.linear_attn.dt_bias",
+        "transformer.layers.3.attention.qkv.query.weight",
+        "transformer.layers.3.attention.qkv.gate.weight",
+        "transformer.layers.3.attention.qkv.key.weight",
+        "transformer.layers.3.attention.qkv.value.weight",
+    }
+    for key in column_parallel_keys:
+        reconstructed = torch.cat([weights[key] for weights in rank_weights], dim=0)
+        _assert_exact(reconstructed, full_weights[key])
+
+    row_parallel_keys = {
+        "transformer.layers.0.mlp.proj.weight",
+        "transformer.layers.0.linear_attn.out_proj.weight",
+        "transformer.layers.3.attention.dense.proj.weight",
+    }
+    for key in row_parallel_keys:
+        reconstructed = torch.cat([weights[key] for weights in rank_weights], dim=1)
+        _assert_exact(reconstructed, full_weights[key])
+
+    gdn_semantic_keys = {
+        "transformer.layers.0.linear_attn.in_proj_qkv.weight",
+        "transformer.layers.0.linear_attn.conv1d.weight",
+        "transformer.layers.0.linear_attn.conv1d.bias",
+    }
+    for key in gdn_semantic_keys:
+        reconstructed = _merge_gdn_qkv_shards(
+            (rank_weights[0][key], rank_weights[1][key]), tp_configs[0]
+        )
+        _assert_exact(reconstructed, full_weights[key])
+
+    sharded_keys = column_parallel_keys | row_parallel_keys | gdn_semantic_keys
+    for key in set(full_weights) - sharded_keys:
+        _assert_exact(rank_weights[0][key], full_weights[key])
+        _assert_exact(rank_weights[1][key], full_weights[key])

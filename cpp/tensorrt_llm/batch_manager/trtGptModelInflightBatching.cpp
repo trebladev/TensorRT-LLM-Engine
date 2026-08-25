@@ -255,9 +255,14 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             "The initial attention-linear hybrid runtime only supports BF16 engines.");
         TLLM_CHECK_WITH_INFO(mModelConfig.getQuantMode().value() == 0,
             "The initial attention-linear hybrid runtime does not support quantization.");
-        TLLM_CHECK_WITH_INFO(mWorldConfig.getTensorParallelism() == 1 && mWorldConfig.getPipelineParallelism() == 1
-                && mWorldConfig.getContextParallelism() == 1,
-            "The initial attention-linear hybrid runtime only supports TP=1, PP=1, and CP=1.");
+        constexpr SizeType32 kSingleRankParallelism = 1;
+        constexpr SizeType32 kMaxSupportedTensorParallelism = 2;
+        auto const tensorParallelism = mWorldConfig.getTensorParallelism();
+        TLLM_CHECK_WITH_INFO(tensorParallelism >= kSingleRankParallelism
+                && tensorParallelism <= kMaxSupportedTensorParallelism
+                && mWorldConfig.getPipelineParallelism() == kSingleRankParallelism
+                && mWorldConfig.getContextParallelism() == kSingleRankParallelism,
+            "The initial attention-linear hybrid runtime only supports TP=1 or TP=2, PP=1, and CP=1.");
         TLLM_CHECK_WITH_INFO(
             getMaxBeamWidth() == 1, "The initial attention-linear hybrid runtime only supports beam width 1.");
         TLLM_CHECK_WITH_INFO(

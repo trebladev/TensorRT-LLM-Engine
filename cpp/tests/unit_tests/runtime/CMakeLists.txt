@@ -19,6 +19,7 @@ add_gtest(decodingLayerWorkspaceTest decodingLayerWorkspaceTest.cpp)
 add_gtest(gdrcopyTest gdrcopyTest.cpp)
 add_gtest(gptDecoderBatchedTest gptDecoderBatchedTest.cpp)
 add_gtest(gptDecoderTest gptDecoderTest.cpp)
+add_gtest(gptJsonConfigTest gptJsonConfigTest.cpp)
 add_gtest(hostAccessibleDeviceAllocatorTest
           hostAccessibleDeviceAllocatorTest.cu)
 add_gtest(iBufferTest iBufferTest.cpp)

@@ -40,7 +40,7 @@ def parse_arguments() -> argparse.Namespace:
         "--tp_size",
         type=int,
         default=1,
-        help="N-way tensor parallelism size. The initial implementation only supports 1.",
+        help="N-way tensor parallelism size. Qwen3.5 supports 1 or 2.",
     )
     parser.add_argument(
         "--pp_size",
@@ -74,30 +74,32 @@ def parse_arguments() -> argparse.Namespace:
 def _validate_arguments(args: argparse.Namespace) -> None:
     if not args.model_dir.is_dir():
         raise ValueError(f"The model directory does not exist: {args.model_dir}")
-    if args.tp_size != 1 or args.pp_size != 1 or args.cp_size != 1:
+    if args.tp_size not in (1, 2) or args.pp_size != 1 or args.cp_size != 1:
         raise ValueError(
-            "The initial Qwen3.5 implementation only supports TP=1, PP=1, and CP=1, "
+            "Qwen3.5 checkpoint conversion only supports TP=1 or TP=2, PP=1, and CP=1, "
             f"got TP={args.tp_size}, PP={args.pp_size}, and CP={args.cp_size}."
         )
 
 
 def convert_and_save_hf(args: argparse.Namespace) -> None:
-    mapping = Mapping(
-        world_size=1,
-        rank=0,
-        tp_size=args.tp_size,
-        pp_size=args.pp_size,
-        cp_size=args.cp_size,
-    )
-    model = Qwen35ForCausalLM.from_hugging_face(
-        args.model_dir,
-        dtype=args.dtype,
-        mapping=mapping,
-        quant_config=QuantConfig(),
-    )
-    model.save_checkpoint(args.output_dir, save_config=True)
-    del model
-    release_gc()
+    world_size = args.tp_size
+    for rank in range(world_size):
+        mapping = Mapping(
+            world_size=world_size,
+            rank=rank,
+            tp_size=args.tp_size,
+            pp_size=args.pp_size,
+            cp_size=args.cp_size,
+        )
+        model = Qwen35ForCausalLM.from_hugging_face(
+            args.model_dir,
+            dtype=args.dtype,
+            mapping=mapping,
+            quant_config=QuantConfig(),
+        )
+        model.save_checkpoint(args.output_dir, save_config=(rank == 0))
+        del model
+        release_gc()
 
 
 def main() -> None:

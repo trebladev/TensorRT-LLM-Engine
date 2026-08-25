@@ -28,6 +28,7 @@ from utils.util import run_session
 
 from tensorrt_llm import Builder
 from tensorrt_llm.functional import RopeEmbeddingUtils
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import MODEL_MAP, Qwen35ForCausalLM
 from tensorrt_llm.models.qwen35.config import Qwen35Config
 from tensorrt_llm.models.qwen35.convert import load_weights_from_hf_checkpoint
@@ -442,6 +443,100 @@ def _generation_inputs(
 
 def test_qwen35_is_registered() -> None:
     assert MODEL_MAP["Qwen35ForCausalLM"] is Qwen35ForCausalLM
+
+
+def test_qwen35_tp2_model_uses_local_attention_and_gdn_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Qwen35Config(
+        architecture="Qwen35ForCausalLM",
+        dtype="bfloat16",
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_size=64,
+        vocab_size=32_000,
+        max_position_embeddings=1024,
+        rotary_embedding_dim=64,
+        mrope_section=[16, 16],
+        decoder_layer_types=["linear_attention", "full_attention"],
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        mapping=Mapping(world_size=2, rank=0, tp_size=2),
+    )
+    model = Qwen35ForCausalLM(config)
+
+    linear_attention = model.transformer.layers[0].linear_attn
+    full_attention = model.transformer.layers[1].attention
+
+    assert full_attention.qkv.num_attention_heads == 2
+    assert full_attention.qkv.num_key_value_heads == 1
+    assert full_attention.qkv.query.out_features == 128
+    assert full_attention.qkv.gate.out_features == 128
+    assert full_attention.qkv.key.out_features == 64
+    assert full_attention.qkv.value.out_features == 64
+    assert full_attention.dense.proj.in_features == 128
+
+    assert linear_attention.global_num_q_heads == 4
+    assert linear_attention.global_num_v_heads == 4
+    assert linear_attention.num_q_heads == 2
+    assert linear_attention.num_v_heads == 2
+    assert linear_attention.global_key_dim == 128
+    assert linear_attention.global_value_dim == 128
+    assert linear_attention.global_conv_dim == 384
+    assert linear_attention.key_dim == 64
+    assert linear_attention.value_dim == 64
+    assert linear_attention.conv_dim == 192
+    assert linear_attention.in_proj_qkv.out_features == 192
+    assert linear_attention.in_proj_z.out_features == 64
+    assert linear_attention.in_proj_a.out_features == 2
+    assert linear_attention.in_proj_b.out_features == 2
+    assert linear_attention.conv1d.d_inner == 192
+    assert linear_attention.conv1d.weight.shape == (192, 1, 4, 1)
+    assert linear_attention.dt_bias.shape == (2,)
+    assert linear_attention.A_log.shape == (2,)
+    assert linear_attention.gated_delta_rule.num_q_heads == 2
+    assert linear_attention.gated_delta_rule.num_v_heads == 2
+    assert linear_attention.out_proj.in_features == 64
+
+    recurrent_state_bytes = 2 * 32 * 32 * 4
+    conv_state_bytes = 3 * 192 * 2
+    assert linear_attention.state_slot_stride_bytes == (recurrent_state_bytes + conv_state_bytes)
+
+    class _FakePluginConfig:
+        paged_state = False
+
+    class _FakeNetwork:
+        plugin_config = _FakePluginConfig()
+
+    class _FakeTensor:
+        def __init__(self, **kwargs) -> None:
+            self.name = kwargs["name"]
+            self.shape = kwargs["shape"]
+            self.dim_range = kwargs["dim_range"]
+
+    monkeypatch.setattr("tensorrt_llm.models.qwen35.model.default_net", _FakeNetwork)
+    monkeypatch.setattr("tensorrt_llm.models.qwen35.model.Tensor", _FakeTensor)
+    recurrent_inputs = model._prepare_recurrent_inputs(
+        num_profiles=1,
+        batch_range=[[1, 2, 4]],
+    )
+
+    conv_state = recurrent_inputs["conv_states"][0]
+    assert conv_state.shape == [-1, 3, -1]
+    assert conv_state.dim_range["batch_size"] == [[1, 2, 4]]
+    assert conv_state.dim_range["kernel_size"] == [3]
+    assert conv_state.dim_range["conv_dim"] == [192]
+    recurrent_state = recurrent_inputs["recurrent_states"][0]
+    assert recurrent_state.shape == [-1, -1, -1, -1]
+    assert recurrent_state.dim_range["state_slots"] == [[1, 2, 4]]
+    assert recurrent_state.dim_range["value_heads"] == [2]
+    assert recurrent_state.dim_range["value_head_dim"] == [32]
+    assert recurrent_state.dim_range["key_head_dim"] == [32]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3.5 engine test requires CUDA")

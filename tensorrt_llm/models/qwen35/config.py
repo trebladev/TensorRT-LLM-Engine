@@ -87,10 +87,27 @@ class Qwen35Config(PretrainedConfig):
             raise ValueError("The initial Qwen3.5 implementation only supports bias-free attention")
         if self.state_dtype != "float32":
             raise ValueError(f"Qwen3.5 recurrent state must use float32, got {self.state_dtype}")
-        if self.mapping.tp_size != 1 or self.mapping.pp_size != 1 or self.mapping.cp_size != 1:
+        if (
+            self.mapping.tp_size not in (1, 2)
+            or self.mapping.pp_size != 1
+            or self.mapping.cp_size != 1
+        ):
             raise ValueError(
-                "The initial Qwen3.5 implementation only supports TP=1, PP=1, and CP=1"
+                "The initial Qwen3.5 implementation only supports TP=1 or TP=2, PP=1, and CP=1"
             )
+        tp_partitioned_dimensions = {
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "intermediate_size": self.intermediate_size,
+            "linear_num_key_heads": self.linear_num_key_heads,
+            "linear_num_value_heads": self.linear_num_value_heads,
+        }
+        for name, dimension in tp_partitioned_dimensions.items():
+            if dimension % self.mapping.tp_size != 0:
+                raise ValueError(
+                    f"{name} must be divisible by TP size, got {dimension} and "
+                    f"TP={self.mapping.tp_size}"
+                )
         if (
             self.quantization.quant_algo is not None
             or self.quantization.kv_cache_quant_algo is not None

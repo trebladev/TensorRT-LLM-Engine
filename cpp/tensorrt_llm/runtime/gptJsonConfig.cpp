@@ -698,10 +698,19 @@ GptJsonConfig parseJson(InputType&& input)
     if (!engineVersionNone && modelConfig.isAttentionLinearHybrid())
     {
         auto const& pretrainedConfig = json.at("pretrained_config");
+        auto const globalNumKeyHeads = pretrainedConfig.at("linear_num_key_heads").template get<SizeType32>();
+        auto const globalNumValueHeads = pretrainedConfig.at("linear_num_value_heads").template get<SizeType32>();
+        TLLM_CHECK_WITH_INFO(globalNumKeyHeads % tensorParallelism == 0,
+            "Linear attention key head count (%d) must be divisible by tensor parallelism (%d).", globalNumKeyHeads,
+            tensorParallelism);
+        TLLM_CHECK_WITH_INFO(globalNumValueHeads % tensorParallelism == 0,
+            "Linear attention value head count (%d) must be divisible by tensor parallelism (%d).", globalNumValueHeads,
+            tensorParallelism);
+
         ModelConfig::LinearAttentionConfig linearAttentionConfig{};
         linearAttentionConfig.convKernel = pretrainedConfig.at("linear_conv_kernel_dim").template get<SizeType32>();
-        linearAttentionConfig.numKeyHeads = pretrainedConfig.at("linear_num_key_heads").template get<SizeType32>();
-        linearAttentionConfig.numValueHeads = pretrainedConfig.at("linear_num_value_heads").template get<SizeType32>();
+        linearAttentionConfig.numKeyHeads = globalNumKeyHeads / tensorParallelism;
+        linearAttentionConfig.numValueHeads = globalNumValueHeads / tensorParallelism;
         linearAttentionConfig.keyHeadDim = pretrainedConfig.at("linear_key_head_dim").template get<SizeType32>();
         linearAttentionConfig.valueHeadDim = pretrainedConfig.at("linear_value_head_dim").template get<SizeType32>();
         linearAttentionConfig.stateDtype

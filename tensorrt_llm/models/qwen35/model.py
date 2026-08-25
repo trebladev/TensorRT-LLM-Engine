@@ -71,6 +71,7 @@ class _AttentionGate:
 class _Qwen35QkvProjection(Module):
     def __init__(self, config: Qwen35Config, gate: _AttentionGate) -> None:
         super().__init__()
+        tp_size = config.mapping.tp_size
         attention_size = config.num_attention_heads * config.head_size
         kv_size = config.num_key_value_heads * config.head_size
         linear_kwargs = {
@@ -86,8 +87,8 @@ class _Qwen35QkvProjection(Module):
         self.value = ColumnLinear(config.hidden_size, kv_size, **linear_kwargs)
         self.query_norm = RmsNorm(config.head_size, eps=config.norm_epsilon, dtype=config.dtype)
         self.key_norm = RmsNorm(config.head_size, eps=config.norm_epsilon, dtype=config.dtype)
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        self.num_attention_heads = config.num_attention_heads // tp_size
+        self.num_key_value_heads = config.num_key_value_heads // tp_size
         self.head_size = config.head_size
         self._gate = gate
 
@@ -180,10 +181,16 @@ class Qwen35LinearAttention(Module):
 
     def __init__(self, config: Qwen35Config) -> None:
         super().__init__()
-        self.num_q_heads = config.linear_num_key_heads
-        self.num_v_heads = config.linear_num_value_heads
+        tp_size = config.mapping.tp_size
+        self.global_num_q_heads = config.linear_num_key_heads
+        self.global_num_v_heads = config.linear_num_value_heads
+        self.num_q_heads = self.global_num_q_heads // tp_size
+        self.num_v_heads = self.global_num_v_heads // tp_size
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
+        self.global_key_dim = self.global_num_q_heads * self.head_k_dim
+        self.global_value_dim = self.global_num_v_heads * self.head_v_dim
+        self.global_conv_dim = self.global_key_dim * 2 + self.global_value_dim
         self.key_dim = self.num_q_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -195,10 +202,10 @@ class Qwen35LinearAttention(Module):
             "tp_size": config.mapping.tp_size,
             "gather_output": False,
         }
-        self.in_proj_qkv = ColumnLinear(config.hidden_size, self.conv_dim, **linear_kwargs)
-        self.in_proj_z = ColumnLinear(config.hidden_size, self.value_dim, **linear_kwargs)
-        self.in_proj_b = ColumnLinear(config.hidden_size, self.num_v_heads, **linear_kwargs)
-        self.in_proj_a = ColumnLinear(config.hidden_size, self.num_v_heads, **linear_kwargs)
+        self.in_proj_qkv = ColumnLinear(config.hidden_size, self.global_conv_dim, **linear_kwargs)
+        self.in_proj_z = ColumnLinear(config.hidden_size, self.global_value_dim, **linear_kwargs)
+        self.in_proj_b = ColumnLinear(config.hidden_size, self.global_num_v_heads, **linear_kwargs)
+        self.in_proj_a = ColumnLinear(config.hidden_size, self.global_num_v_heads, **linear_kwargs)
         gated_delta_state_bytes = (
             self.num_v_heads * self.head_v_dim * self.head_k_dim * _FP32_ELEMENT_BYTES
         )
@@ -232,7 +239,7 @@ class Qwen35LinearAttention(Module):
         )
         self.norm = RmsNormGate(self.head_v_dim, eps=config.norm_epsilon, dtype=config.dtype)
         self.out_proj = RowLinear(
-            self.value_dim,
+            self.global_value_dim,
             config.hidden_size,
             bias=False,
             dtype=config.dtype,
@@ -560,6 +567,13 @@ class Qwen35ForCausalLM(PretrainedModel):
         self, num_profiles: int, batch_range: list[list[int]]
     ) -> dict[str, object]:
         paged_state = default_net().plugin_config.paged_state
+        tp_size = self.config.mapping.tp_size
+        local_num_key_heads = self.config.linear_num_key_heads // tp_size
+        local_num_value_heads = self.config.linear_num_value_heads // tp_size
+        local_conv_dim = (
+            2 * local_num_key_heads * self.config.linear_key_head_dim
+            + local_num_value_heads * self.config.linear_value_head_dim
+        )
         one_dim_range = OrderedDict([("buffer_count", [1] * num_profiles)])
         conv_dim_range = OrderedDict(
             [
@@ -567,18 +581,14 @@ class Qwen35ForCausalLM(PretrainedModel):
                 ("kernel_size", [self.config.linear_conv_kernel_dim - 1] * num_profiles),
                 (
                     "conv_dim",
-                    [
-                        2 * self.config.linear_num_key_heads * self.config.linear_key_head_dim
-                        + self.config.linear_num_value_heads * self.config.linear_value_head_dim
-                    ]
-                    * num_profiles,
+                    [local_conv_dim] * num_profiles,
                 ),
             ]
         )
         recurrent_dim_range = OrderedDict(
             [
                 ("state_slots", batch_range),
-                ("value_heads", [self.config.linear_num_value_heads] * num_profiles),
+                ("value_heads", [local_num_value_heads] * num_profiles),
                 ("value_head_dim", [self.config.linear_value_head_dim] * num_profiles),
                 ("key_head_dim", [self.config.linear_key_head_dim] * num_profiles),
             ]
