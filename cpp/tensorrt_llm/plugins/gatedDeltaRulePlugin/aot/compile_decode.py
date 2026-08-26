@@ -27,8 +27,7 @@ import triton
 import triton.backends
 import triton.language as tl
 
-NUM_Q_HEADS = 16
-NUM_V_HEADS = (16, 32, 48)
+HEAD_CONFIGS = ((8, 8), (16, 16), (16, 32), (16, 48))
 HEAD_K_DIM = 128
 HEAD_V_DIM = 128
 BLOCK_K = 128
@@ -70,7 +69,9 @@ def _load_pytorch_kernel(repo_root: Path) -> triton.runtime.JITFunction:
     return getattr(module, KERNEL_NAME).fn
 
 
-def _make_source(kernel: triton.runtime.JITFunction, num_v_heads: int) -> triton.compiler.ASTSource:
+def _make_source(
+    kernel: triton.runtime.JITFunction, num_q_heads: int, num_v_heads: int
+) -> triton.compiler.ASTSource:
     argument_types = (
         "*bf16:16",
         "*bf16:16",
@@ -87,7 +88,7 @@ def _make_source(kernel: triton.runtime.JITFunction, num_v_heads: int) -> triton
         "i32",
         "i32",
         "1",
-        str(NUM_Q_HEADS),
+        str(num_q_heads),
         str(num_v_heads),
         str(HEAD_K_DIM),
         str(HEAD_V_DIM),
@@ -151,13 +152,17 @@ def _archive_cubin(cubin_path: Path) -> Path:
 
 
 def _compile_variant(
-    kernel: triton.runtime.JITFunction, arch: int, num_v_heads: int, output_dir: Path
+    kernel: triton.runtime.JITFunction,
+    arch: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    output_dir: Path,
 ) -> Path:
     target = triton.backends.compiler.GPUTarget("cuda", arch, 32)
     backend = triton.compiler.make_backend(target)
     options = backend.parse_options({"num_warps": NUM_WARPS, "num_stages": NUM_STAGES})
     compiled = triton.compile(
-        _make_source(kernel, num_v_heads),
+        _make_source(kernel, num_q_heads, num_v_heads),
         target=target,
         options=options.__dict__,
     )
@@ -172,7 +177,7 @@ def _compile_variant(
         )
 
     stem = (
-        f"gated_delta_rule_decode_bf16_h{NUM_Q_HEADS}_hv{num_v_heads}"
+        f"gated_delta_rule_decode_bf16_h{num_q_heads}_hv{num_v_heads}"
         f"_k{HEAD_K_DIM}_v{HEAD_V_DIM}_sm{arch}"
     )
     cubin_path = output_dir / f"{stem}.cubin"
@@ -196,8 +201,14 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[5]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     kernel = _load_pytorch_kernel(repo_root)
-    for num_v_heads in NUM_V_HEADS:
-        _compile_variant(kernel, args.arch, num_v_heads, args.output_dir.resolve())
+    for num_q_heads, num_v_heads in HEAD_CONFIGS:
+        _compile_variant(
+            kernel,
+            args.arch,
+            num_q_heads,
+            num_v_heads,
+            args.output_dir.resolve(),
+        )
 
 
 if __name__ == "__main__":

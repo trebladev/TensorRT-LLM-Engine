@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > The `convert_checkpoint.py` and `trtllm-build` workflow is part of the legacy
 > TensorRT engine backend. This initial Qwen3.5 implementation is intentionally
-> limited to dense text-only BF16 inference on one GPU.
+> limited to dense text-only BF16 inference with TP=1 or TP=2.
 
 This directory contains the checkpoint conversion entry point for the dedicated
 Qwen3.5 TensorRT graph in
@@ -22,7 +22,7 @@ full-attention layers with gated-delta linear-attention layers.
 | --- | --- |
 | Dense, text-only Qwen3.5 | Supported |
 | Data type | BF16 weights and activations |
-| Parallelism | TP=1, PP=1, CP=1 |
+| Parallelism | TP=1 or TP=2, PP=1, CP=1 |
 | Position embedding | MRoPE |
 | Full attention | Supported |
 | Gated-delta linear attention | Supported with paged recurrent state |
@@ -63,7 +63,17 @@ The converter applies the following Qwen3.5-specific transformations:
   LLM gated-MLP `fc`, `gate`, and `proj` weights, respectively.
 - It ignores the vision tower and converts only `model.language_model`.
 
-The script rejects parallel configurations other than TP=1, PP=1, and CP=1.
+The script rejects parallel configurations other than TP=1 or TP=2, PP=1, and
+CP=1.
+
+For TP=2, the example provides a helper script with TP2-specific default output
+directories:
+
+```bash
+examples/models/core/qwen3_5/convert_tp2.sh \
+    /path/to/Qwen3.5-2B \
+    /path/to/qwen3_5_bf16_tp2
+```
 
 ## Engine build
 
@@ -83,6 +93,15 @@ trtllm-build \
     --gpt_attention_plugin bfloat16 \
     --gemm_plugin bfloat16 \
     --mamba_conv1d_plugin bfloat16
+```
+
+Build a TP=2 checkpoint with the matching helper script. The checkpoint
+configuration determines that two engine ranks are generated:
+
+```bash
+examples/models/core/qwen3_5/build_tp2.sh \
+    /path/to/qwen3_5_bf16_tp2 \
+    /path/to/qwen3_5_engine_bf16_tp2
 ```
 
 An 8K profile has a substantial TensorRT execution-context memory requirement.

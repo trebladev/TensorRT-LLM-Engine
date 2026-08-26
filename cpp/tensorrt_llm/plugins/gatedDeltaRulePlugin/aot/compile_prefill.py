@@ -29,8 +29,7 @@ import triton
 import triton.backends
 import triton.language as tl
 
-NUM_Q_HEADS = 16
-NUM_V_HEADS = (16, 32, 48)
+HEAD_CONFIGS = ((8, 8), (16, 16), (16, 32), (16, 48))
 HEAD_K_DIM = 128
 HEAD_V_DIM = 128
 CHUNK_SIZE = 64
@@ -49,6 +48,7 @@ class KernelSpec:
     num_warps: int
     num_stages: int
     num_v_heads: int = 0
+    num_q_heads: int = 16
 
 
 def _load_module(module_name: str, path: Path) -> types.ModuleType:
@@ -190,7 +190,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
         ),
     ]
 
-    for num_v_heads in NUM_V_HEADS:
+    for num_q_heads, num_v_heads in HEAD_CONFIGS:
         specs.extend(
             [
                 KernelSpec(
@@ -210,6 +210,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     4,
                     1,
                     num_v_heads,
+                    num_q_heads,
                 ),
                 KernelSpec(
                     "gather_state",
@@ -228,6 +229,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     4,
                     1,
                     num_v_heads,
+                    num_q_heads,
                 ),
                 KernelSpec(
                     "cumsum",
@@ -250,6 +252,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     8,
                     3,
                     num_v_heads,
+                    num_q_heads,
                 ),
                 KernelSpec(
                     "kkt_solve",
@@ -263,7 +266,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                         "*i32:16",
                         "i32",
                         str(num_v_heads),
-                        "16",
+                        str(num_q_heads),
                         "128",
                         "64",
                         "16",
@@ -274,6 +277,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     4,
                     2,
                     num_v_heads,
+                    num_q_heads,
                 ),
                 KernelSpec(
                     "recompute",
@@ -290,7 +294,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                         "*i32:16",
                         "i32",
                         str(num_v_heads),
-                        "16",
+                        str(num_q_heads),
                         "128",
                         "128",
                         "64",
@@ -301,6 +305,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     4,
                     3,
                     num_v_heads,
+                    num_q_heads,
                 ),
                 KernelSpec(
                     "state",
@@ -320,7 +325,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                         "i32",
                         "i64",
                         str(num_v_heads),
-                        "16",
+                        str(num_q_heads),
                         "128",
                         "128",
                         "64",
@@ -335,6 +340,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     4,
                     3,
                     num_v_heads,
+                    num_q_heads,
                 ),
                 KernelSpec(
                     "output",
@@ -351,7 +357,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                         "fp32",
                         "i32",
                         str(num_v_heads),
-                        "16",
+                        str(num_q_heads),
                         "128",
                         "128",
                         "64",
@@ -363,6 +369,7 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                     4,
                     3,
                     num_v_heads,
+                    num_q_heads,
                 ),
             ]
         )
@@ -395,7 +402,10 @@ def _compile_spec(spec: KernelSpec, arch: int, output_dir: Path) -> Path:
     options = backend.parse_options({"num_warps": spec.num_warps, "num_stages": spec.num_stages})
     compiled = triton.compile(_make_source(spec), target=target, options=options.__dict__)
     hv_suffix = f"_hv{spec.num_v_heads}" if spec.num_v_heads else ""
-    stem = f"gated_delta_rule_prefill_{spec.name}_bf16_h16{hv_suffix}_k128_v128_sm{arch}"
+    stem = (
+        f"gated_delta_rule_prefill_{spec.name}_bf16_h{spec.num_q_heads}"
+        f"{hv_suffix}_k128_v128_sm{arch}"
+    )
     cubin_path = output_dir / f"{stem}.cubin"
     cubin_path.write_bytes(compiled.asm[backend.binary_ext])
     archive_path = _archive_cubin(cubin_path)

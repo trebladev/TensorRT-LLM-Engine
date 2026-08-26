@@ -24,8 +24,8 @@ ahead-of-time (AOT) kernels for Qwen3.5 decode and packed-ragged prefill.
 - Linux and CUDA SM89
 - BF16 query, key, value, and output
 - FP32 recurrent state
-- 16 query/key heads
-- 16, 32, or 48 value heads
+- 8 query/key and 8 value heads for Qwen3.5 TP2
+- 16 query/key heads with 16, 32, or 48 value heads
 - Key and value head dimensions of 128
 - Chunk size 64
 - Q/K L2 normalization enabled
@@ -57,7 +57,7 @@ that convolution tails and unused slots remain bitwise unchanged.
 Dynamic-shape coverage builds two TensorRT optimization profiles. The context
 profile accepts packed inputs shaped `[1, T, ...]` through `T=8193`, and the
 generation profile accepts decode inputs shaped `[B, 1, ...]` through `B=8`.
-The complete standalone functional test file currently passes all 27 cases.
+The standalone functional test covers all supported head configurations.
 
 A complete SM89 wheel build has been verified with the plugin and all
 checked-in decode and prefill cubin archives included. The repository
@@ -95,7 +95,7 @@ python3 cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/aot/compile_prefill.py --a
 
 The scripts write deterministic `.cubin.tar.zst` archives to
 `cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/cubin/`. A complete SM89 set
-contains three decode archives and 24 prefill archives.
+contains four decode archives and 31 prefill archives.
 
 The Triton 3.6 AOT ABI appends `global_scratch` and `profile_scratch` launch
 arguments. If the Triton version or a kernel signature changes, verify the

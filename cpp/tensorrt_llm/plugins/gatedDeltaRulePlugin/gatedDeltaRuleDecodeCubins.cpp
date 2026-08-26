@@ -24,6 +24,8 @@ namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
 {
 
 #if !defined(_WIN32) && !defined(EXCLUDE_SM_89)
+extern unsigned char const gated_delta_rule_decode_bf16_h8_hv8_k128_v128_sm89_cubin[];
+extern unsigned int const gated_delta_rule_decode_bf16_h8_hv8_k128_v128_sm89_cubin_len;
 extern unsigned char const gated_delta_rule_decode_bf16_h16_hv16_k128_v128_sm89_cubin[];
 extern unsigned int const gated_delta_rule_decode_bf16_h16_hv16_k128_v128_sm89_cubin_len;
 extern unsigned char const gated_delta_rule_decode_bf16_h16_hv32_k128_v128_sm89_cubin[];
@@ -43,21 +45,24 @@ auto const& getCubins()
 {
 #if !defined(_WIN32) && !defined(EXCLUDE_SM_89)
     constexpr int32_t kSm = 89;
-    constexpr int32_t kNumQHeads = 16;
     constexpr int32_t kHeadKDim = 128;
     constexpr int32_t kHeadVDim = 128;
     constexpr int32_t kSharedMemoryBytes = 256;
     constexpr char const* kKernelName = "fused_recurrent_gated_delta_rule_update_fwd_kernel";
-    static std::array<GatedDeltaRuleDecodeCubin, 3> const cubins{{
-        {kSm, kNumQHeads, 16, kHeadKDim, kHeadVDim,
+    static std::array<GatedDeltaRuleDecodeCubin, 4> const cubins{{
+        {kSm, 8, 8, kHeadKDim, kHeadVDim,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h8_hv8_k128_v128_sm89_cubin,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h8_hv8_k128_v128_sm89_cubin_len,
+            kKernelName, kSharedMemoryBytes},
+        {kSm, 16, 16, kHeadKDim, kHeadVDim,
             tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h16_hv16_k128_v128_sm89_cubin,
             tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h16_hv16_k128_v128_sm89_cubin_len,
             kKernelName, kSharedMemoryBytes},
-        {kSm, kNumQHeads, 32, kHeadKDim, kHeadVDim,
+        {kSm, 16, 32, kHeadKDim, kHeadVDim,
             tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h16_hv32_k128_v128_sm89_cubin,
             tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h16_hv32_k128_v128_sm89_cubin_len,
             kKernelName, kSharedMemoryBytes},
-        {kSm, kNumQHeads, 48, kHeadKDim, kHeadVDim,
+        {kSm, 16, 48, kHeadKDim, kHeadVDim,
             tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h16_hv48_k128_v128_sm89_cubin,
             tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_decode_bf16_h16_hv48_k128_v128_sm89_cubin_len,
             kKernelName, kSharedMemoryBytes},

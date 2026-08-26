@@ -85,6 +85,13 @@ size_t ceilDiv(size_t numerator, size_t denominator)
     return numerator / denominator + static_cast<size_t>(numerator % denominator != 0);
 }
 
+bool isSupportedConfiguration(int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim)
+{
+    auto const supportedHeads = (numQHeads == 8 && numVHeads == 8)
+        || (numQHeads == 16 && (numVHeads == 16 || numVHeads == 32 || numVHeads == 48));
+    return supportedHeads && headKDim == 128 && headVDim == 128;
+}
+
 } // namespace
 
 GatedDeltaRulePrefillRunner::GatedDeltaRulePrefillRunner(
@@ -98,9 +105,9 @@ GatedDeltaRulePrefillRunner::GatedDeltaRulePrefillRunner(
 #if defined(_WIN32)
     TLLM_THROW("GatedDeltaRule Triton prefill runner is not supported on Windows");
 #else
-    TLLM_CHECK_WITH_INFO(numQHeads == 16 && (numVHeads == 16 || numVHeads == 32 || numVHeads == 48) && headKDim == 128
-            && headVDim == 128,
-        "GatedDeltaRule Triton prefill supports H=16, HV in {16, 32, 48}, K=128, and V=128");
+    TLLM_CHECK_WITH_INFO(isSupportedConfiguration(numQHeads, numVHeads, headKDim, headVDim),
+        "GatedDeltaRule Triton prefill supports (H, HV) in {(8, 8), (16, 16), (16, 32), (16, 48)}, K=128, "
+        "and V=128");
     mL2Norm = load(GatedDeltaRulePrefillKernel::kL2Norm, 0);
     mInitChunks = load(GatedDeltaRulePrefillKernel::kInitChunks, 0);
     mPrepareChunks = load(GatedDeltaRulePrefillKernel::kPrepareChunks, 0);
@@ -129,9 +136,9 @@ size_t GatedDeltaRulePrefillRunner::getWorkspaceSize(
 {
     TLLM_CHECK_WITH_INFO(totalTokens > 0, "GatedDeltaRule prefill total token count must be positive");
     TLLM_CHECK_WITH_INFO(numRequests > 0, "GatedDeltaRule prefill request count must be positive");
-    TLLM_CHECK_WITH_INFO(numQHeads == 16 && (numVHeads == 16 || numVHeads == 32 || numVHeads == 48) && headKDim == 128
-            && headVDim == 128,
-        "GatedDeltaRule Triton prefill supports H=16, HV in {16, 32, 48}, K=128, and V=128");
+    TLLM_CHECK_WITH_INFO(isSupportedConfiguration(numQHeads, numVHeads, headKDim, headVDim),
+        "GatedDeltaRule Triton prefill supports (H, HV) in {(8, 8), (16, 16), (16, 32), (16, 48)}, K=128, "
+        "and V=128");
     TLLM_CHECK_WITH_INFO(totalTokens <= std::numeric_limits<int32_t>::max() / numQHeads,
         "GatedDeltaRule prefill normalization row count exceeds INT32_MAX");
 

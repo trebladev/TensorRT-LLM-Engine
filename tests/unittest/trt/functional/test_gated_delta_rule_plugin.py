@@ -36,6 +36,7 @@ HEAD_V_DIM = 128
 CHUNK_SIZE = 64
 BATCH_SIZES = (1, 2, 4, 8)
 QWEN3_5_CONFIGS = (
+    pytest.param(8, 8, id="qwen3.5-2b-tp2"),
     pytest.param(16, 16, id="qwen3.5-2b"),
     pytest.param(16, 32, id="qwen3.5-4b"),
     pytest.param(16, 32, id="qwen3.5-9b"),
@@ -451,6 +452,7 @@ def _gated_delta_rule_prefill_chunk_reference(
 @pytest.mark.parametrize(
     "num_q_heads,num_v_heads,sequence_lengths,use_chunk_reference",
     (
+        pytest.param(8, 8, SHORT_PREFILL_SEQUENCE_LENGTHS, False, id="qwen3.5-2b-tp2-short"),
         pytest.param(16, 16, SHORT_PREFILL_SEQUENCE_LENGTHS, False, id="qwen3.5-2b-short"),
         pytest.param(16, 32, SHORT_PREFILL_SEQUENCE_LENGTHS, False, id="qwen3.5-9b-short"),
         pytest.param(16, 48, SHORT_PREFILL_SEQUENCE_LENGTHS, False, id="qwen3.5-27b-short"),
