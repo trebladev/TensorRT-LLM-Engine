@@ -40,7 +40,8 @@ struct GatedDeltaRulePrefillParams
     void* state;
     int64_t stateSlotStrideElements;
     void* finalState;
-    int32_t const* stateSlotMapping;
+    int32_t const* sourceStateSlotMapping;
+    int32_t const* targetStateSlotMapping;
     int32_t const* cuSeqLens;
     void const* hostHasInitialState;
     bool hostHasInitialStateIsInt32;

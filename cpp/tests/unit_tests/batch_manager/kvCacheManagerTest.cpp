@@ -6859,8 +6859,8 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-cached blocks do not reduce the capacity budget, but their tokens still avoid recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 2 * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -6993,8 +6993,8 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
     EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-cached blocks do not reduce the capacity budget, but their tokens still avoid recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), (promptLength - 1) / tokensPerBlock * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -7132,8 +7132,8 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-cached blocks do not reduce the capacity budget, but their tokens still avoid recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), sharedPrefixLength);
 
     // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction; blocks are free)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
@@ -8272,6 +8272,140 @@ TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
     EXPECT_NE(std::get<0>(dynamicBlocksPerWindow.at(linearWindowSizeCode)), maxBatchSize);
 }
 
+TEST_F(KVCacheManagerTest, LinearAttentionBlockCountIncludesFinalLiveState)
+{
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr snapshotInterval = 256;
+    auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata metadata{
+        .cacheType = linearWindowSize,
+        .allRecurrentStatesBytes = 1,
+        .statesSnapshotInterval = snapshotInterval,
+        .saveLastSnapshot = false,
+    };
+
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/700, tokensPerBlock, /*enableReuse=*/false), 1);
+
+    // The final prompt block is the only physical state block before the first interval boundary.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/1, tokensPerBlock, /*enableReuse=*/true), 1);
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/250, tokensPerBlock, /*enableReuse=*/true), 1);
+
+    // Snapshot at 256 plus a distinct final live block.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/260, tokensPerBlock, /*enableReuse=*/true), 2);
+
+    // Snapshots at 256 and 512 plus the final live block ending at token position 704.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/700, tokensPerBlock, /*enableReuse=*/true), 3);
+
+    // Block-aligned prompts reserve an additional writable live block for generation.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/288, tokensPerBlock, /*enableReuse=*/true), 3);
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/512, tokensPerBlock, /*enableReuse=*/true), 3);
+
+    metadata.statesSnapshotInterval = 0;
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/700, tokensPerBlock, /*enableReuse=*/true), 1);
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/512, tokensPerBlock, /*enableReuse=*/true), 2);
+}
+
+TEST_F(KVCacheManagerTest, LinearAttentionBlockCountIncludesOptionalLastFullSnapshot)
+{
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr snapshotInterval = 256;
+    auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata metadata{
+        .cacheType = linearWindowSize,
+        .allRecurrentStatesBytes = 1,
+        .statesSnapshotInterval = snapshotInterval,
+        .saveLastSnapshot = true,
+    };
+
+    // In addition to the interval snapshots and final live block, save the full block ending at 672.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/700, tokensPerBlock, /*enableReuse=*/true), 4);
+
+    // The last full block ends at 512 and is already an interval snapshot, so it is not counted twice.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/520, tokensPerBlock, /*enableReuse=*/true), 3);
+
+    // Before the first interval, save the full block ending at 32 and the final block ending at 64.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(/*promptLen=*/33, tokensPerBlock, /*enableReuse=*/true), 2);
+}
+
+TEST_F(KVCacheManagerTest, HybridPrefixReuseStopsAtLatestRecurrentStateSnapshot)
+{
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 8;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxAttentionWindow = 32;
+    auto constexpr stateSlotBytes = 64;
+    auto constexpr beamWidth = 1;
+    auto constexpr maxNewTokens = 1;
+    auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = linearWindowSize,
+        .allRecurrentStatesBytes = stateSlotBytes,
+        .statesSnapshotInterval = 8,
+        .saveLastSnapshot = false,
+        .numPlaceholderBlocks = 16,
+    };
+    BlocksPerWindow const blocksPerWindow{
+        {maxAttentionWindow, {16, 0}},
+        {linearWindowSize, {8, 0}},
+    };
+    std::vector<SizeType32> const numKvHeadsPerLayer{0, numKvHeads};
+    std::vector<SizeType32> const layerWindows{linearWindowSize, maxAttentionWindow};
+    std::vector<PoolConfiguration> const poolConfigurations{
+        {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kBF16},
+        {linearWindowSize, 1, nvinfer1::DataType::kUINT8},
+    };
+
+    KVCacheManager kvCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, layerWindows, nvinfer1::DataType::kBF16, /*sinkTokenLength=*/0, stream, maxAttentionWindow,
+        /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt, nullptr,
+        /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+        linearAttentionMetadata, poolConfigurations);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>();
+    for (SizeType32 token = 0; token < 13; ++token)
+    {
+        inputTokens->push_back(token);
+    }
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/20, maxNewTokens, inputTokens, tr::SamplingConfig{beamWidth}, /*isStreaming=*/false);
+    kvCacheManager.addSequenceBatch(
+        {{{cachedRequest->mRequestId, cachedRequest->mPromptLen, beamWidth}}}, {std::ref(*cachedRequest)});
+    kvCacheManager.storeContextBlocks(*cachedRequest);
+
+    auto probeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/21, maxNewTokens, inputTokens, tr::SamplingConfig{beamWidth}, /*isStreaming=*/false);
+    auto const& uniqueTokens = probeRequest->getUniqueTokens(/*beamIdx=*/0);
+    auto const fullAttentionSummary
+        = kvCacheManager.getBlockManager().getWindowBlockManager(maxAttentionWindow).analyzePrefixReuse(
+            uniqueTokens, *probeRequest);
+    auto const recurrentStateSummary
+        = kvCacheManager.getBlockManager().getWindowBlockManager(linearWindowSize).analyzePrefixReuse(
+            uniqueTokens, *probeRequest);
+    auto const hybridSummary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *probeRequest);
+
+    EXPECT_EQ(fullAttentionSummary.reusableTokens, 12);
+    EXPECT_EQ(recurrentStateSummary.reusableTokens, 8);
+    EXPECT_EQ(hybridSummary.reusableTokens, 8);
+    EXPECT_EQ(hybridSummary.reusableBlocksAllocated, 0);
+    EXPECT_EQ(hybridSummary.reusableBlocksAll, 0);
+    EXPECT_FALSE(hybridSummary.firstNewBlock.has_value());
+
+    static_cast<void>(kvCacheManager.getNeededBlocksOneStep(
+        *probeRequest, /*twoStepsLookAhead=*/false, linearWindowSize, hybridSummary));
+    EXPECT_EQ(probeRequest->getEstimatedReusableTokens(), 8);
+    static_cast<void>(kvCacheManager.getNeededBlocksOneStep(
+        *probeRequest, /*twoStepsLookAhead=*/false, maxAttentionWindow, hybridSummary));
+    EXPECT_EQ(probeRequest->getEstimatedReusableTokens(), 8);
+}
+
 TEST_F(KVCacheManagerTest, LinearAttentionBuffersUsePhysicalStateSlots)
 {
     auto constexpr numLayers = 3;
@@ -8383,11 +8517,14 @@ TEST_F(KVCacheManagerTest, LinearAttentionBuffersUsePhysicalStateSlots)
     buffers.reshape(/*numSequences=*/2);
     buffers.fill(RequestVector{request0, request1}, {}, kvCacheManager);
 
-    auto const* contextSlots = tr::bufferCast<SizeType32>(*buffers.stateSlotMappingHost);
+    auto const* contextSourceSlots = tr::bufferCast<SizeType32>(*buffers.sourceStateSlotMappingHost);
+    auto const* contextTargetSlots = tr::bufferCast<SizeType32>(*buffers.targetStateSlotMappingHost);
     auto const* contextCuSeqlens = tr::bufferCast<SizeType32>(*buffers.cuSeqlensHost);
     auto const* contextHasInitialState = tr::bufferCast<SizeType32>(*buffers.hostHasInitialState);
-    EXPECT_EQ(contextSlots[0], kvCacheManager.getRecurrentStateSlot(request0->mRequestId));
-    EXPECT_EQ(contextSlots[1], kvCacheManager.getRecurrentStateSlot(request1->mRequestId));
+    EXPECT_EQ(contextSourceSlots[0], kvCacheManager.getRecurrentStateSlot(request0->mRequestId));
+    EXPECT_EQ(contextSourceSlots[1], kvCacheManager.getRecurrentStateSlot(request1->mRequestId));
+    EXPECT_EQ(contextTargetSlots[0], kvCacheManager.getRecurrentStateSlot(request0->mRequestId));
+    EXPECT_EQ(contextTargetSlots[1], kvCacheManager.getRecurrentStateSlot(request1->mRequestId));
     EXPECT_THAT(std::vector<SizeType32>(contextCuSeqlens, contextCuSeqlens + 3), testing::ElementsAre(0, 3, 5));
     EXPECT_THAT(
         std::vector<SizeType32>(contextHasInitialState, contextHasInitialState + 2), testing::ElementsAre(0, 1));
@@ -8401,6 +8538,98 @@ TEST_F(KVCacheManagerTest, LinearAttentionBuffersUsePhysicalStateSlots)
     EXPECT_THAT(std::vector<SizeType32>(generationCuSeqlens, generationCuSeqlens + 3), testing::ElementsAre(0, 1, 2));
     EXPECT_THAT(
         std::vector<SizeType32>(generationHasInitialState, generationHasInitialState + 2), testing::ElementsAre(1, 1));
+}
+
+TEST_F(KVCacheManagerTest, LinearAttentionBuffersSelectStateSlotForCurrentToken)
+{
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 8;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxAttentionWindow = 32;
+    auto constexpr stateSlotBytes = 64;
+    auto constexpr beamWidth = 1;
+    auto constexpr maxNewTokens = 4;
+    auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = linearWindowSize,
+        .allRecurrentStatesBytes = stateSlotBytes,
+        .statesSnapshotInterval = 8,
+        .saveLastSnapshot = false,
+        .numPlaceholderBlocks = 16,
+    };
+    BlocksPerWindow const blocksPerWindow{
+        {maxAttentionWindow, {16, 0}},
+        {linearWindowSize, {maxNumSequences, 0}},
+    };
+    std::vector<SizeType32> const numKvHeadsPerLayer{0, numKvHeads};
+    std::vector<SizeType32> const layerWindows{linearWindowSize, maxAttentionWindow};
+    std::vector<PoolConfiguration> const poolConfigurations{
+        {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kBF16},
+        {linearWindowSize, 1, nvinfer1::DataType::kUINT8},
+    };
+
+    KVCacheManager kvCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, layerWindows, nvinfer1::DataType::kBF16, /*sinkTokenLength=*/0, stream, maxAttentionWindow,
+        /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt, nullptr,
+        /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+        linearAttentionMetadata, poolConfigurations);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>();
+    for (SizeType32 token = 0; token < 13; ++token)
+    {
+        inputTokens->push_back(token);
+    }
+    auto request = std::make_shared<LlmRequest>(
+        /*requestId=*/10, maxNewTokens, inputTokens, tr::SamplingConfig{beamWidth}, /*isStreaming=*/false);
+    kvCacheManager.addSequenceBatch({{{request->mRequestId, request->mPromptLen, beamWidth}}}, {std::ref(*request)});
+
+    auto const& stateBlockIds = kvCacheManager.getCacheBlockIds(request->mRequestId, linearWindowSize).at(0);
+    ASSERT_EQ(stateBlockIds.size(), 4);
+    EXPECT_LT(stateBlockIds.at(0), 0);
+    EXPECT_GE(stateBlockIds.at(1), 0);
+    EXPECT_LT(stateBlockIds.at(2), 0);
+    EXPECT_GE(stateBlockIds.at(3), 0);
+
+    auto const snapshotBlock = kvCacheManager.getBlockManager().getBlockById(stateBlockIds.at(1), linearWindowSize);
+    auto const finalBlock = kvCacheManager.getBlockManager().getBlockById(stateBlockIds.at(3), linearWindowSize);
+    ASSERT_NE(snapshotBlock, nullptr);
+    ASSERT_NE(finalBlock, nullptr);
+    auto const snapshotSlot = snapshotBlock->getMemoryPoolBlockIndex();
+    auto const finalSlot = finalBlock->getMemoryPoolBlockIndex();
+
+    EXPECT_EQ(kvCacheManager.getRecurrentStateSlotForToken(request->mRequestId, /*tokenIdx=*/7), snapshotSlot);
+    EXPECT_EQ(kvCacheManager.getRecurrentStateSlotForToken(request->mRequestId, /*tokenIdx=*/12), finalSlot);
+    EXPECT_THROW(
+        { static_cast<void>(kvCacheManager.getRecurrentStateSlotForToken(request->mRequestId, /*tokenIdx=*/0)); },
+        tensorrt_llm::common::TllmException);
+
+    tr::BufferManager bufferManager{stream};
+    LinearAttentionBuffers buffers{/*maxBatchSize=*/1, bufferManager};
+    buffers.reshape(/*numSequences=*/1);
+
+    request->setContextChunkSize(8);
+    buffers.fill(RequestVector{request}, {}, kvCacheManager);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.sourceStateSlotMappingHost)[0], snapshotSlot);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.targetStateSlotMappingHost)[0], snapshotSlot);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.hostHasInitialState)[0], 0);
+
+    request->setContextCurrentPosition(8);
+    request->setContextChunkSize(5);
+    buffers.fill(RequestVector{request}, {}, kvCacheManager);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.sourceStateSlotMappingHost)[0], snapshotSlot);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.targetStateSlotMappingHost)[0], finalSlot);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.hostHasInitialState)[0], 1);
+
+    request->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    buffers.fill({}, RequestVector{request}, kvCacheManager);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.sourceStateSlotMappingHost)[0], finalSlot);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.targetStateSlotMappingHost)[0], finalSlot);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

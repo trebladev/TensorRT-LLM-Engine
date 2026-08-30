@@ -38,8 +38,9 @@ namespace tensorrt_llm::plugins
 //     4.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
 //     5.  last_token_ids [batch_size] int32
 //     6.  host_context_lengths [batch_size] int32, optional for remove_input_padding
-//     7.  state_slot_mapping [batch_size] int32, optional
-//     8.  host_has_initial_state [batch_size] int8 or int32, optional host input
+//     7.  source_state_slot_mapping [batch_size] int32, optional
+//     8.  target_state_slot_mapping [batch_size] int32, optional when separate state-slot mapping is enabled
+//     8/9.  host_has_initial_state [batch_size] int8 or int32, optional host input
 // outputs
 //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     1. conv_state [batch_size, dconv - 1, dim]
@@ -49,7 +50,7 @@ class MambaConv1dPlugin : public BasePlugin
 public:
     MambaConv1dPlugin(int dim, int dconv, int preStride, int postStride, nvinfer1::DataType type, bool removePadding,
         bool pagedState, bool applySilu, int64_t stateSlotStrideBytes, int64_t stateChannelStrideBytes,
-        int64_t stateHistoryStrideBytes, bool useInitialStateMask);
+        int64_t stateHistoryStrideBytes, bool useInitialStateMask, bool useSeparateStateSlotMapping);
 
     MambaConv1dPlugin(void const* data, size_t length);
 
@@ -129,15 +130,20 @@ private:
         return 6;
     };
 
-    IndexType getSlotMappingIdx() const
+    IndexType getSourceSlotMappingIdx() const
     {
         // if not remove input padding, host_context_length is not used, so the index is 6
         return mRemovePadding ? 7 : 6;
     };
 
+    IndexType getTargetSlotMappingIdx() const
+    {
+        return getSourceSlotMappingIdx() + 1;
+    };
+
     IndexType getHostHasInitialStateIdx() const
     {
-        return getSlotMappingIdx() + (mPagedState ? 1 : 0);
+        return getSourceSlotMappingIdx() + (mPagedState ? 1 + (mUseSeparateStateSlotMapping ? 1 : 0) : 0);
     };
 
     void setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dParamsBase& params,
@@ -146,9 +152,9 @@ private:
         const size_t postStride,
         // device pointers
         void const* inPtr, void const* stateInPtr, void* stateOutPtr, void const* convWeight, void const* convBias,
-        void* outPtr, int const* lastTokenIds, int const* stateSlotMapping, int8_t const* hasInitialState,
-        int64_t stateSlotStride, int64_t stateChannelStride, int64_t stateHistoryStride, bool removePadding,
-        bool applySilu);
+        void* outPtr, int const* lastTokenIds, int const* sourceStateSlotMapping, int const* targetStateSlotMapping,
+        int8_t const* hasInitialState, int64_t stateSlotStride, int64_t stateChannelStride, int64_t stateHistoryStride,
+        bool removePadding, bool applySilu);
 
 private:
     int mDim;
@@ -163,6 +169,7 @@ private:
     int64_t mStateChannelStrideBytes = 0;
     int64_t mStateHistoryStrideBytes = 0;
     bool mUseInitialStateMask = false;
+    bool mUseSeparateStateSlotMapping = false;
 };
 
 class MambaConv1dPluginCreator : public BaseCreator

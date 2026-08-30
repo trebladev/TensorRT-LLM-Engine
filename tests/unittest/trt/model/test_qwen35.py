@@ -322,7 +322,8 @@ def _prefill_inputs(
         "mrope_rotary_cos_sin": mrope_cache.expand(batch_size, -1).contiguous(),
         "mrope_position_deltas": torch.zeros((batch_size, 1), dtype=torch.int32, device="cuda"),
         "gated_delta_cu_seqlens": cu_seqlens,
-        "state_slot_mapping": torch.arange(batch_size, dtype=torch.int32, device="cuda"),
+        "source_state_slot_mapping": torch.arange(batch_size, dtype=torch.int32, device="cuda"),
+        "target_state_slot_mapping": torch.arange(batch_size, dtype=torch.int32, device="cuda"),
         "host_has_initial_state": torch.zeros(batch_size, dtype=torch.int32),
     }
 
@@ -365,7 +366,12 @@ def _prefill_inputs(
     required_qwen35_inputs = {"mrope_rotary_cos_sin", "mrope_position_deltas"}
     if recurrent_layer_ids:
         required_qwen35_inputs.update(
-            {"gated_delta_cu_seqlens", "state_slot_mapping", "host_has_initial_state"}
+            {
+                "gated_delta_cu_seqlens",
+                "source_state_slot_mapping",
+                "target_state_slot_mapping",
+                "host_has_initial_state",
+            }
         )
     assert required_qwen35_inputs <= input_names
     missing_inputs = input_names - candidates.keys()
@@ -420,7 +426,8 @@ def _generation_inputs(
         "mrope_rotary_cos_sin": mrope_cache.expand(batch_size, -1).contiguous(),
         "mrope_position_deltas": torch.zeros((batch_size, 1), dtype=torch.int32, device="cuda"),
         "gated_delta_cu_seqlens": torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
-        "state_slot_mapping": torch.arange(batch_size, dtype=torch.int32, device="cuda"),
+        "source_state_slot_mapping": torch.arange(batch_size, dtype=torch.int32, device="cuda"),
+        "target_state_slot_mapping": torch.arange(batch_size, dtype=torch.int32, device="cuda"),
         "host_has_initial_state": torch.ones(batch_size, dtype=torch.int32),
     }
     for attention_idx, layer_idx in enumerate(attention_layer_ids):
@@ -537,6 +544,8 @@ def test_qwen35_tp2_model_uses_local_attention_and_gdn_dimensions(
     assert recurrent_state.dim_range["value_heads"] == [2]
     assert recurrent_state.dim_range["value_head_dim"] == [32]
     assert recurrent_state.dim_range["key_head_dim"] == [32]
+    assert recurrent_inputs["source_state_slot_mapping"].name == "source_state_slot_mapping"
+    assert recurrent_inputs["target_state_slot_mapping"].name == "target_state_slot_mapping"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3.5 engine test requires CUDA")

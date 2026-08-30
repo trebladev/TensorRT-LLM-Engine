@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -184,7 +184,7 @@ def read_model_name(engine_dir: str, is_hf: bool = False):
     if 'GLM' in model_arch:
         model_version = config['pretrained_config']['chatglm_version']
     if 'qwen' in model_arch.lower():
-        model_version = config['pretrained_config']['qwen_type']
+        model_version = config['pretrained_config'].get('qwen_type')
     return model_arch, model_version
 
 

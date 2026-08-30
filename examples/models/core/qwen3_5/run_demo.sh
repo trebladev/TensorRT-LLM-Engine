@@ -10,6 +10,7 @@ repo_root="$(cd -- "${script_dir}/../../../.." && pwd)"
 python_bin="${QWEN35_PYTHON:-python}"
 engine_dir="${1:-${QWEN35_ENGINE_DIR:-/tmp/qwen35_engine_bf16_tp1}}"
 model_dir="${2:-${QWEN35_MODEL_DIR:-/root/code_x/Qwen3.5-2B}}"
+run_script="${QWEN35_RUN_SCRIPT:-${repo_root}/examples/run.py}"
 default_input_text='1.2.2 基于神经辐射场的重建方法
 新视角合成（Novel View Synthesis, NVS）是三维重建领域的一个重要分支，
 其目标是从给定视角的图片中渲染出场景的新视角图像。传统方法中，使用网
@@ -103,6 +104,10 @@ if [[ ! -d "${model_dir}" ]]; then
     printf 'Qwen3.5 tokenizer directory does not exist: %s\n' "${model_dir}" >&2
     exit 1
 fi
+if [[ ! -f "${run_script}" ]]; then
+    printf 'Qwen3.5 run script does not exist: %s\n' "${run_script}" >&2
+    exit 1
+fi
 if ! compgen -G "${bindings_dir}/bindings*.so" >/dev/null; then
     printf 'TensorRT-LLM source bindings do not exist in: %s\n' "${bindings_dir}" >&2
     printf 'Build them with: cmake --build cpp/build --target bindings --parallel 8\n' >&2
@@ -125,6 +130,7 @@ export TRT_LLM_NO_LIB_INIT=1
 export QWEN35_BINDINGS_DIR="${bindings_dir}"
 export QWEN35_PLUGIN_LIB="${plugin_lib}"
 export QWEN35_MODEL_DIR="${model_dir}"
+export QWEN35_RUN_SCRIPT="${run_script}"
 export QWEN35_USE_CHAT_TEMPLATE="${use_chat_template}"
 cd "${repo_root}"
 
@@ -172,7 +178,7 @@ if os.environ["QWEN35_USE_CHAT_TEMPLATE"] == "1":
     )
 
 sys.path.insert(0, os.path.join(os.getcwd(), "examples"))
-runpy.run_path("examples/run.py", run_name="__main__")
+runpy.run_path(os.environ["QWEN35_RUN_SCRIPT"], run_name="__main__")
 sys.stdout.flush()
 sys.stderr.flush()
 os._exit(0)

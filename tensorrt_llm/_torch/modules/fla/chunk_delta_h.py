@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_delta_h.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
 # -*- coding: utf-8 -*-
@@ -42,6 +45,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h0,
     h0_i,
     ht,
+    ht_i,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -93,9 +97,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
     if USE_INDEXED_STATE:
-        state_index = tl.load(h0_i + i_n).to(tl.int64)
-        h0 = h0 + state_index * stride_h0
-        ht = h0
+        source_state_index = tl.load(h0_i + i_n).to(tl.int64)
+        target_state_index = tl.load(ht_i + i_n).to(tl.int64)
+        h0 = h0 + source_state_index * stride_h0
+        ht = ht + target_state_index * stride_h0
     if USE_INITIAL_STATE:
         h0 = h0 + ((i_h if USE_INDEXED_STATE else i_nh) * K * V)
     if STORE_FINAL_STATE:
@@ -254,6 +259,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -279,6 +285,8 @@ def chunk_gated_delta_rule_fwd_h(
             "Indexed chunk state updates require inplace_indexed_state_update=True."
         )
     store_final_state_in_kernel = output_final_state and not use_indexed_state
+    if use_indexed_state and output_state_indices is None:
+        output_state_indices = initial_state_indices
     # Kernel writes final state in [V, K] layout (K innermost) to match the
     # pool layout. Allocate accordingly so the tensor's shape reflects memory.
     final_state = (k.new_empty(N, H, V, K, dtype=torch.float32)
@@ -298,7 +306,8 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         h0=initial_state,
         h0_i=initial_state_indices,
-        ht=final_state,
+        ht=initial_state if use_indexed_state else final_state,
+        ht_i=output_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -313,5 +322,5 @@ def chunk_gated_delta_rule_fwd_h(
         # The indexed kernel path updates h0 in-place, so returning
         # the final state means gathering those updated slots back out.
         final_state = initial_state.index_select(
-            0, initial_state_indices.to(torch.long))
+            0, output_state_indices.to(torch.long))
     return h, v_new, final_state

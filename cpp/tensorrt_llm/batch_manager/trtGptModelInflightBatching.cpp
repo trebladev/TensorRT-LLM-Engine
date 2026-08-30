@@ -125,9 +125,7 @@ std::map<SizeType32, SizeType32> TrtGptModelInflightBatching::calculateCacheSize
 bool TrtGptModelInflightBatching::executorConfigIsValid(
     ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    if (modelConfig.isAttentionLinearHybrid()
-        && (executorConfig.getKvCacheConfig().getEnableBlockReuse()
-            || executorConfig.getKvCacheConfig().getEnablePartialReuse()))
+    if (modelConfig.isAttentionLinearHybrid() && executorConfig.getKvCacheConfig().getEnablePartialReuse())
     {
         return false;
     }
@@ -151,45 +149,35 @@ executor::ExecutorConfig TrtGptModelInflightBatching::fixExecutorConfig(
     ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
     // Make sure logic in this function matches executorConfigIsValid
-    if (modelConfig.isAttentionLinearHybrid())
+    auto kvCacheConfig = executorConfig.getKvCacheConfig();
+    bool configChanged = false;
+    if (modelConfig.isAttentionLinearHybrid() && kvCacheConfig.getEnablePartialReuse())
     {
-        auto kvCacheConfig = executorConfig.getKvCacheConfig();
-        if (kvCacheConfig.getEnableBlockReuse())
-        {
-            TLLM_LOG_WARNING(
-                "Fixing executorConfig: KV cache block reuse is disabled for attention-linear hybrid "
-                "models.");
-            kvCacheConfig.setEnableBlockReuse(false);
-        }
-        if (kvCacheConfig.getEnablePartialReuse())
-        {
-            TLLM_LOG_WARNING(
-                "Fixing executorConfig: partial KV cache reuse is disabled for attention-linear hybrid "
-                "models.");
-            kvCacheConfig.setEnablePartialReuse(false);
-        }
-        auto fixedExecutorConfig = executor::ExecutorConfig(executorConfig);
-        fixedExecutorConfig.setKvCacheConfig(kvCacheConfig);
-        return fixedExecutorConfig;
+        TLLM_LOG_WARNING(
+            "Fixing executorConfig: partial KV cache reuse is disabled for attention-linear hybrid models.");
+        kvCacheConfig.setEnablePartialReuse(false);
+        configChanged = true;
     }
-    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
+    if (kvCacheConfig.getEnableBlockReuse())
     {
-        auto kvCacheConfig = executorConfig.getKvCacheConfig();
-
         if (!modelConfig.getPagedContextFMHA())
         {
             TLLM_LOG_WARNING(
                 "Fixing executorConfig: KV cache reuse disabled because model was not built with paged context FMHA "
                 "support");
             kvCacheConfig.setEnableBlockReuse(false);
+            configChanged = true;
         }
         if (modelConfig.computeContextLogits())
         {
             TLLM_LOG_WARNING(
                 "Fixing executorConfig: KV cache reuse disabled because model was built to return context logits");
             kvCacheConfig.setEnableBlockReuse(false);
+            configChanged = true;
         }
-
+    }
+    if (configChanged)
+    {
         auto fixedExecutorConfig = executor::ExecutorConfig(executorConfig);
         fixedExecutorConfig.setKvCacheConfig(kvCacheConfig);
         return fixedExecutorConfig;
@@ -277,8 +265,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         TLLM_CHECK_WITH_INFO(
             mModelConfig.getKVCacheType() == ModelConfig::KVCacheType::kPAGED && mModelConfig.usePagedState(),
             "Attention-linear hybrid models require paged KV cache and paged state.");
-        TLLM_CHECK_WITH_INFO(!kvCacheConfig.getEnableBlockReuse() && !kvCacheConfig.getEnablePartialReuse(),
-            "Attention-linear hybrid models do not yet support KV cache block or partial reuse.");
+        TLLM_CHECK_WITH_INFO(!kvCacheConfig.getEnablePartialReuse(),
+            "Attention-linear hybrid models do not support partial KV cache reuse.");
         TLLM_CHECK_WITH_INFO(!kvCacheConfig.getHostCacheSize().has_value()
                 && !kvCacheConfig.getSecondaryOffloadMinPriority().has_value() && !kvCacheConfig.getUseUvm(),
             "Attention-linear hybrid models do not yet support KV cache offload or UVM.");
@@ -488,6 +476,20 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             executorConfig.getSchedulerConfig().getContextChunkingPolicy().value_or(
                 executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED),
             chunkUnitSize};
+    }
+
+    if (mKvCacheManager && mKvCacheManager->isEnableBlockReuse())
+    {
+        auto const& linearAttentionMetadata = mKvCacheManager->getBlockManager().getLinearAttentionMetadata();
+        if (linearAttentionMetadata && linearAttentionMetadata->statesSnapshotInterval > 0)
+        {
+            if (!ctxChunkConfig)
+            {
+                ctxChunkConfig = batch_scheduler::ContextChunkingConfig{
+                    executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, mKvCacheManager->getTokensPerBlock()};
+            }
+            ctxChunkConfig->stateSnapshotInterval = linearAttentionMetadata->statesSnapshotInterval;
+        }
     }
 
     auto maxNumTokens = getMaxNumTokens();
@@ -779,8 +781,9 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         kv_cache_manager::LinearAttentionMetadata metadata{};
         metadata.cacheType = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
         metadata.allRecurrentStatesBytes = linearConfig.getStateSlotBytes();
-        metadata.statesSnapshotInterval = 0;
-        metadata.saveLastSnapshot = false;
+        constexpr SizeType32 kRecurrentStateSnapshotInterval = 256;
+        metadata.statesSnapshotInterval = kvCacheConfig.getEnableBlockReuse() ? kRecurrentStateSnapshotInterval : 0;
+        metadata.saveLastSnapshot = kvCacheConfig.getEnableBlockReuse();
 
         SizeType32 localAttentionIdx = 0;
         for (SizeType32 localLayerIdx = 0; localLayerIdx < numLocalDecoderLayers; ++localLayerIdx)
@@ -856,8 +859,9 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     {
         auto const [statePrimaryBlocks, stateSecondaryBlocks]
             = blocksPerWindow.at(kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
-        TLLM_CHECK_WITH_INFO(statePrimaryBlocks == getMaxNumSequences(),
-            "Linear attention state pool must allocate one primary slot per sequence, got %d and expected %d.",
+        TLLM_CHECK_WITH_INFO(statePrimaryBlocks >= getMaxNumSequences(),
+            "Linear attention state pool must allocate at least one primary slot per sequence, got %d and expected "
+            "at least %d.",
             statePrimaryBlocks, getMaxNumSequences());
         TLLM_CHECK_WITH_INFO(
             stateSecondaryBlocks == 0, "Linear attention state pool does not support secondary blocks.");

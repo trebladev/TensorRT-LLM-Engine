@@ -59,7 +59,8 @@ class MambaConv1d(Module):
                 host_context_lengths: Optional[Tensor] = None,
                 slot_mapping: Optional[Tensor] = None,
                 conv_indices: Optional[Tensor] = None,
-                host_has_initial_state: Optional[Tensor] = None):
+                host_has_initial_state: Optional[Tensor] = None,
+                target_slot_mapping: Optional[Tensor] = None):
         '''
         Parameters:
             x: [B, L, D] or [T, D]
@@ -69,19 +70,32 @@ class MambaConv1d(Module):
             host_context_lengths: [B]
             slot_mapping: [B]
             conv_indices: [B]
+            target_slot_mapping: [B]
         '''
         if default_net().plugin_config.mamba_conv1d_plugin:
             transposed_weight = permute(
                 view(self.weight.value, shape=[self.d_inner, 1, self.d_conv]),
                 (1, 2, 0))
             x_conv, conv_state = mamba_conv1d(
-                x, conv_state, transposed_weight, self.bias.value,
-                host_request_types, last_token_ids, self.d_inner, self.d_conv,
-                self.dtype, self.pre_stride, self.post_stride,
-                host_context_lengths, slot_mapping, self.apply_silu,
-                host_has_initial_state, self.state_slot_stride_bytes,
+                x,
+                conv_state,
+                transposed_weight,
+                self.bias.value,
+                host_request_types,
+                last_token_ids,
+                self.d_inner,
+                self.d_conv,
+                self.dtype,
+                self.pre_stride,
+                self.post_stride,
+                host_context_lengths,
+                slot_mapping,
+                self.apply_silu,
+                host_has_initial_state,
+                self.state_slot_stride_bytes,
                 self.state_channel_stride_bytes,
-                self.state_history_stride_bytes)
+                self.state_history_stride_bytes,
+                target_slot_mapping=target_slot_mapping)
         else:
             assert not default_net().plugin_config.paged_state
             assert len(

@@ -39,8 +39,9 @@ class GatedDeltaRulePrefillRunner;
 //      between adjacent slots.
 //   6. host_request_types: [N], int32 on the host. 0 is context and 1 is generation.
 //   7. cu_seqlens: [N + 1], int32.
-//   8. state_slot_mapping: [N], int32.
-//   9. host_has_initial_state: [N], int8 or int32 on the host.
+//   8. source_state_slot_mapping: [N], int32.
+//   9. target_state_slot_mapping: [N], int32, optional when separate state-slot mapping is enabled.
+//   9/10. host_has_initial_state: [N], int8 or int32 on the host.
 // Outputs:
 //   0. output: same shape and type as value.
 //   1. final_state: [N, Hv, V, K], float32. In paged mode it is valid for context requests and ignored for
@@ -51,7 +52,7 @@ public:
     GatedDeltaRulePlugin() = delete;
     GatedDeltaRulePlugin(int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim, int32_t chunkSize,
         nvinfer1::DataType type, nvinfer1::DataType stateType, int64_t stateSlotStrideBytes, bool removeInputPadding,
-        bool pagedState, bool useQkL2norm);
+        bool pagedState, bool useQkL2norm, bool useSeparateStateSlotMapping);
     GatedDeltaRulePlugin(GatedDeltaRulePlugin const& plugin) = default;
 
     // IPluginV3 methods
@@ -101,9 +102,8 @@ private:
         kState,
         kHostRequestTypes,
         kCuSeqLens,
-        kStateSlotMapping,
-        kHostHasInitialState,
-        kNumInputs
+        kSourceStateSlotMapping,
+        kNumBaseInputs
     };
 
     enum class RequestType : int32_t
@@ -114,6 +114,9 @@ private:
 
     void initFieldsToSerialize();
     void validateConfig() const;
+    [[nodiscard]] int32_t getTargetStateSlotMappingIdx() const;
+    [[nodiscard]] int32_t getHostHasInitialStateIdx() const;
+    [[nodiscard]] int32_t getNumInputs() const;
     [[nodiscard]] int64_t getStateSlotStrideElements() const;
     int32_t enqueuePrefill(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
@@ -131,6 +134,7 @@ private:
     bool mRemoveInputPadding;
     bool mPagedState;
     bool mUseQkL2norm;
+    bool mUseSeparateStateSlotMapping;
 
     std::shared_ptr<GatedDeltaRuleDecodeRunner> mDecodeRunner;
     std::shared_ptr<GatedDeltaRulePrefillRunner> mPrefillRunner;

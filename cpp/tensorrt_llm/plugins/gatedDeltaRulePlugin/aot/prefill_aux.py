@@ -57,7 +57,7 @@ def prepare_chunk_metadata_kernel(
 @triton.jit
 def zero_missing_states_kernel(
     state,
-    state_slot_mapping,
+    target_state_slot_mapping,
     state_stride,
     has_initial_state,
     num_requests,
@@ -73,7 +73,7 @@ def zero_missing_states_kernel(
     if request_idx >= num_requests or tl.load(has_initial_state + request_idx) != 0:
         return
 
-    state_slot = tl.load(state_slot_mapping + request_idx).to(tl.int64)
+    state_slot = tl.load(target_state_slot_mapping + request_idx).to(tl.int64)
     state += state_slot * state_stride + head_idx * V * K
     state_block = tl.make_block_ptr(
         state,
@@ -91,7 +91,7 @@ def zero_missing_states_kernel(
 def gather_states_kernel(
     state,
     final_state,
-    state_slot_mapping,
+    target_state_slot_mapping,
     state_stride,
     num_requests,
     H: tl.constexpr,
@@ -106,7 +106,7 @@ def gather_states_kernel(
     if request_idx >= num_requests:
         return
 
-    state_slot = tl.load(state_slot_mapping + request_idx).to(tl.int64)
+    state_slot = tl.load(target_state_slot_mapping + request_idx).to(tl.int64)
     state += state_slot * state_stride + head_idx * V * K
     final_state += (request_idx * H + head_idx) * V * K
     state_block = tl.make_block_ptr(

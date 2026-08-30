@@ -285,6 +285,11 @@ def _build_paged_mamba_conv1d_session(
         )
         state_slot_mapping_tensor = Tensor("state_slot_mapping", trt.int32,
                                            input_shapes["state_slot_mapping"])
+        target_state_slot_mapping_tensor = None
+        if "target_state_slot_mapping" in input_shapes:
+            target_state_slot_mapping_tensor = Tensor(
+                "target_state_slot_mapping", trt.int32,
+                input_shapes["target_state_slot_mapping"])
         host_has_initial_state_tensor = Tensor(
             "host_has_initial_state",
             trt.int8,
@@ -307,6 +312,7 @@ def _build_paged_mamba_conv1d_session(
             state_slot_stride_bytes=state_slot_stride_bytes,
             state_channel_stride_bytes=(dconv - 1) * torch.bfloat16.itemsize,
             state_history_stride_bytes=torch.bfloat16.itemsize,
+            target_slot_mapping=target_state_slot_mapping_tensor,
         )
         output_tensor.mark_output("output")
 
@@ -341,16 +347,21 @@ def _mamba_conv1d_paged_reference(
     bias: torch.Tensor,
     state_slot_mapping: torch.Tensor,
     host_has_initial_state: torch.Tensor,
+    target_state_slot_mapping: torch.Tensor | None = None,
     apply_silu: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(input_tensor)
     expected_state_pool = state_pool.clone()
+    if target_state_slot_mapping is None:
+        target_state_slot_mapping = state_slot_mapping
     input_offset = 0
     for request_idx, sequence_length in enumerate(sequence_lengths):
-        slot = state_slot_mapping[request_idx].item()
-        initial_state = (state_pool[slot:slot + 1]
+        source_slot = state_slot_mapping[request_idx].item()
+        target_slot = target_state_slot_mapping[request_idx].item()
+        initial_state = (state_pool[source_slot:source_slot + 1]
                          if host_has_initial_state[request_idx].item() else
-                         torch.zeros_like(state_pool[slot:slot + 1]))
+                         torch.zeros_like(state_pool[source_slot:source_slot +
+                                                     1]))
         request_input = input_tensor[input_offset:input_offset +
                                      sequence_length].transpose(0, 1)[None]
         request_output, request_state = mamba_conv1d_ref(
@@ -362,7 +373,7 @@ def _mamba_conv1d_paged_reference(
         )
         output[input_offset:input_offset +
                sequence_length] = request_output[0].transpose(0, 1)
-        expected_state_pool[slot] = request_state[0]
+        expected_state_pool[target_slot] = request_state[0]
         input_offset += sequence_length
     return output, expected_state_pool
 
@@ -377,9 +388,12 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
     num_slots = 8
     sequence_lengths = (5, 9, 17)
     num_requests = len(sequence_lengths)
-    state_slot_mapping = torch.tensor([6, 2, 5],
+    state_slot_mapping = torch.tensor([6, 3, 5],
                                       device=device,
                                       dtype=torch.int32)
+    target_state_slot_mapping = torch.tensor([1, 3, 7],
+                                             device=device,
+                                             dtype=torch.int32)
     host_has_initial_state = torch.tensor([1, 0, 1], dtype=torch.int8)
 
     ssm_state_bytes = 4096
@@ -426,6 +440,7 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
         "last_token_ids": last_token_ids,
         "host_context_lengths": host_context_lengths,
         "state_slot_mapping": state_slot_mapping,
+        "target_state_slot_mapping": target_state_slot_mapping,
         "host_has_initial_state": host_has_initial_state,
     }
     prefill_session = _build_paged_mamba_conv1d_session(
@@ -446,6 +461,7 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
         bias,
         state_slot_mapping,
         host_has_initial_state,
+        target_state_slot_mapping,
     )
 
     torch.testing.assert_close(output.float(),
@@ -457,9 +473,14 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
                                atol=1e-2,
                                rtol=1e-2)
     assert torch.equal(record_pool[:, :ssm_state_bytes], ssm_prefix)
-    unused_slots = torch.tensor([0, 1, 3, 4, 7],
-                                device=device,
-                                dtype=torch.long)
+    readonly_source_slots = torch.tensor([6, 5],
+                                         device=device,
+                                         dtype=torch.long)
+    assert torch.equal(
+        record_pool.index_select(0, readonly_source_slots),
+        initial_record_pool.index_select(0, readonly_source_slots),
+    )
+    unused_slots = torch.tensor([0, 2, 4], device=device, dtype=torch.long)
     assert torch.equal(
         record_pool.index_select(0, unused_slots),
         initial_record_pool.index_select(0, unused_slots),
@@ -467,6 +488,7 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
 
     state_before_decode = conv_state_pool.clone()
     record_before_decode = record_pool.clone()
+    state_slot_mapping = target_state_slot_mapping
     decode_input = torch.randn(num_requests,
                                dim,
                                device=device,
@@ -482,6 +504,7 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
                                      dtype=torch.int32),
         "host_context_lengths": torch.ones(num_requests, dtype=torch.int32),
         "state_slot_mapping": state_slot_mapping,
+        "target_state_slot_mapping": state_slot_mapping,
         "host_has_initial_state": torch.ones(num_requests, dtype=torch.int8),
     }
     decode_session = _build_paged_mamba_conv1d_session(

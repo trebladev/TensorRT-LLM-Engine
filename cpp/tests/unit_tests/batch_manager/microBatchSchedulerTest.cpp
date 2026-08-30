@@ -1054,6 +1054,90 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensChunkShiftNonLastChunk)
     EXPECT_EQ(req1->getContextChunkSize(), 0) << "req1: no budget remaining";
 }
 
+TEST_F(MicroBatchSchedulerTest, StateSnapshotBoundaryColdPrompt)
+{
+    batch_scheduler::ContextChunkingConfig chunkConfig{
+        ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, /*chunkUnitSize=*/32};
+    chunkConfig.stateSnapshotInterval = 256;
+    auto scheduler = MicroBatchScheduler{chunkConfig};
+
+    RequestVector activeRequests{createRequest(/*promptLen=*/700, /*maxNewTokens=*/1, /*reqId=*/0)};
+    auto const [contextRequests, generationRequests]
+        = scheduler(activeRequests, {}, /*maxBatchSizeRuntime=*/4, /*maxNumTokensRuntime=*/1000);
+
+    ASSERT_EQ(contextRequests.size(), 1);
+    EXPECT_EQ(contextRequests.front()->getContextChunkSize(), 256);
+    EXPECT_TRUE(generationRequests.empty());
+}
+
+TEST_F(MicroBatchSchedulerTest, StateSnapshotBoundaryAfterPrefixHit)
+{
+    batch_scheduler::ContextChunkingConfig chunkConfig{
+        ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, /*chunkUnitSize=*/32};
+    chunkConfig.stateSnapshotInterval = 256;
+    auto scheduler = MicroBatchScheduler{chunkConfig};
+
+    auto request = createRequest(/*promptLen=*/700, /*maxNewTokens=*/1, /*reqId=*/0);
+    request->setEstimatedReusableTokens(288);
+    RequestVector activeRequests{request};
+    auto const [contextRequests, generationRequests]
+        = scheduler(activeRequests, {}, /*maxBatchSizeRuntime=*/4, /*maxNumTokensRuntime=*/1000);
+
+    ASSERT_EQ(contextRequests.size(), 1);
+    EXPECT_EQ(contextRequests.front()->getContextChunkSize(), 224);
+    EXPECT_TRUE(generationRequests.empty());
+}
+
+TEST_F(MicroBatchSchedulerTest, StateSnapshotBoundaryAllowsPromptEnd)
+{
+    batch_scheduler::ContextChunkingConfig chunkConfig{
+        ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, /*chunkUnitSize=*/32};
+    chunkConfig.stateSnapshotInterval = 256;
+    auto scheduler = MicroBatchScheduler{chunkConfig};
+
+    auto request = createRequest(/*promptLen=*/700, /*maxNewTokens=*/1, /*reqId=*/0);
+    request->setContextCurrentPosition(512);
+    RequestVector activeRequests{request};
+    auto const [contextRequests, generationRequests]
+        = scheduler(activeRequests, {}, /*maxBatchSizeRuntime=*/4, /*maxNumTokensRuntime=*/1000);
+
+    ASSERT_EQ(contextRequests.size(), 1);
+    EXPECT_EQ(contextRequests.front()->getContextChunkSize(), 188);
+    EXPECT_TRUE(generationRequests.empty());
+}
+
+TEST_F(MicroBatchSchedulerTest, StateSnapshotBoundaryDefersInsufficientChunk)
+{
+    batch_scheduler::ContextChunkingConfig chunkConfig{
+        ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, /*chunkUnitSize=*/32};
+    chunkConfig.stateSnapshotInterval = 256;
+    auto scheduler = MicroBatchScheduler{chunkConfig};
+
+    auto request = createRequest(/*promptLen=*/700, /*maxNewTokens=*/1, /*reqId=*/0);
+    RequestVector activeRequests{request};
+    auto const [contextRequests, generationRequests]
+        = scheduler(activeRequests, {}, /*maxBatchSizeRuntime=*/4, /*maxNumTokensRuntime=*/128);
+
+    EXPECT_TRUE(contextRequests.empty());
+    EXPECT_EQ(request->getContextChunkSize(), 0);
+    EXPECT_TRUE(generationRequests.empty());
+}
+
+TEST_F(MicroBatchSchedulerTest, NoStateSnapshotBoundaryKeepsExistingChunking)
+{
+    batch_scheduler::ContextChunkingConfig chunkConfig{
+        ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, /*chunkUnitSize=*/32};
+    auto scheduler = MicroBatchScheduler{chunkConfig};
+
+    RequestVector activeRequests{createRequest(/*promptLen=*/700, /*maxNewTokens=*/1, /*reqId=*/0)};
+    auto const [contextRequests, generationRequests]
+        = scheduler(activeRequests, {}, /*maxBatchSizeRuntime=*/4, /*maxNumTokensRuntime=*/1000);
+
+    ASSERT_EQ(contextRequests.size(), 1);
+    EXPECT_EQ(contextRequests.front()->getContextChunkSize(), 700);
+    EXPECT_TRUE(generationRequests.empty());
+}
+
 TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
 {
     // Verify that zero reusable tokens (the default) produces identical scheduling

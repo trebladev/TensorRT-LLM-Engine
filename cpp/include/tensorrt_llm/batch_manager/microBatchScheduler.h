@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,10 @@ struct ContextChunkingConfig
     /// multiples (except for the last context chunk) to avoid fragmentation.
     /// When set to null, it indicates that the context chunk is disabled.
     tensorrt_llm::runtime::SizeType32 chunkUnitSize;
+
+    /// If set, context chunks must end at a recurrent-state snapshot boundary
+    /// or at the end of the prompt.
+    std::optional<tensorrt_llm::runtime::SizeType32> stateSnapshotInterval = std::nullopt;
 };
 
 } // namespace batch_scheduler
@@ -60,7 +64,8 @@ public:
 
     static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
         std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
-        std::optional<SizeType32> const& maxContextLength);
+        std::optional<SizeType32> const& maxContextLength,
+        std::optional<SizeType32> stateSnapshotInterval = std::nullopt);
 
 private:
     template <ContextChunkingPolicy tPolicy>
@@ -71,6 +76,10 @@ private:
     /// any draft tokens that don't fit.
     static void fitDraftTokens(RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
         SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextLength);
+
+    /// Adjust context chunks so that every non-final chunk produces a reusable
+    /// recurrent-state snapshot.
+    static void alignToStateSnapshotBoundaries(RequestVector& contextsToBeChunked, SizeType32 stateSnapshotInterval);
 
     /// The maximum length of the context. If the context exceeds this length,
     /// it must be chunked, otherwise it cannot be processed. Therefore, it

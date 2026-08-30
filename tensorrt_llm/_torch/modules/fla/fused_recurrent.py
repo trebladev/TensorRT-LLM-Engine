@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/fused_recurrent.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/fused_recurrent.py
 # -*- coding: utf-8 -*-
@@ -335,6 +338,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o,
     h0_source,
     h0_indices,
+    output_state_indices,
     h0_stride,
     cu_seqlens,
     scale,
@@ -454,7 +458,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Store final state back to h0_source with bounds checking
     # ssm states (pool layout [slots, HV, V, K], K innermost).
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(output_state_indices + i_n)
         if idx >= 0:  # Add bounds checking
             p_h0 = (h0_source + idx * h0_stride + i_hv * V * K + o_k[:, None] +
                     o_v[None, :] * K)
@@ -476,6 +480,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -493,6 +498,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o = q.new_empty(NK, *v.shape)
 
     grid = (NK, NV, N * HV)
+    if output_state_indices is None:
+        output_state_indices = initial_state_indices
 
     fused_recurrent_gated_delta_rule_update_fwd_kernel[grid](
         q=q,
@@ -503,6 +510,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        output_state_indices=output_state_indices,
         h0_stride=initial_state_source.stride(0),
         cu_seqlens=cu_seqlens,
         scale=scale,
@@ -547,6 +555,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         disable_output_calculation: bool = False,
         intermediate_states_buffer: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
+        output_state_indices: Optional[torch.Tensor] = None,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -557,6 +566,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             scale=scale,
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
             disable_state_update=disable_state_update,
@@ -591,6 +601,7 @@ def fused_recurrent_gated_delta_rule_update(
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -602,6 +613,11 @@ def fused_recurrent_gated_delta_rule_update(
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
+            )
+        if (output_state_indices is not None
+                and output_state_indices.shape[0] != len(cu_seqlens) - 1):
+            raise ValueError(
+                "The number of output state indices must match the number of input sequences."
             )
     if scale is None:
         scale = k.shape[-1]**-0.5
@@ -624,5 +640,6 @@ def fused_recurrent_gated_delta_rule_update(
         disable_output_calculation,
         intermediate_states_buffer,
         cache_steps,
+        output_state_indices,
     )
     return o

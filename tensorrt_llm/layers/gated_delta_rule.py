@@ -63,6 +63,7 @@ class GatedDeltaRule(Module):
         cu_seqlens: Tensor,
         state_slot_mapping: Tensor,
         host_has_initial_state: Tensor,
+        target_state_slot_mapping: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         return gated_delta_rule(
             query=query,
@@ -75,6 +76,7 @@ class GatedDeltaRule(Module):
             cu_seqlens=cu_seqlens,
             state_slot_mapping=state_slot_mapping,
             host_has_initial_state=host_has_initial_state,
+            target_state_slot_mapping=target_state_slot_mapping,
             num_q_heads=self.num_q_heads,
             num_v_heads=self.num_v_heads,
             head_k_dim=self.head_k_dim,

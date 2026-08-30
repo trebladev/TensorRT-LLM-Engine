@@ -40,8 +40,10 @@ public:
     using TensorMap = runtime::ITensor::TensorMap;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    TensorPtr stateSlotMappingHost;
-    TensorPtr stateSlotMappingDevice;
+    TensorPtr sourceStateSlotMappingHost;
+    TensorPtr sourceStateSlotMappingDevice;
+    TensorPtr targetStateSlotMappingHost;
+    TensorPtr targetStateSlotMappingDevice;
     TensorPtr cuSeqlensHost;
     TensorPtr cuSeqlensDevice;
     TensorPtr hostHasInitialState;

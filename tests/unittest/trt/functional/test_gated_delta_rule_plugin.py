@@ -82,6 +82,13 @@ def _build_gated_delta_rule_session(
         state_slot_mapping_tensor = Tensor(
             "state_slot_mapping", trt.int32, input_shapes["state_slot_mapping"]
         )
+        target_state_slot_mapping_tensor = None
+        if "target_state_slot_mapping" in input_shapes:
+            target_state_slot_mapping_tensor = Tensor(
+                "target_state_slot_mapping",
+                trt.int32,
+                input_shapes["target_state_slot_mapping"],
+            )
         host_has_initial_state_tensor = Tensor(
             "host_has_initial_state",
             trt.int8,
@@ -111,6 +118,7 @@ def _build_gated_delta_rule_session(
             cu_seqlens_tensor,
             state_slot_mapping_tensor,
             host_has_initial_state_tensor,
+            target_state_slot_mapping=target_state_slot_mapping_tensor,
         )
         output_tensor.mark_output("output")
         final_state_tensor.mark_output("final_state")
@@ -195,8 +203,14 @@ def _gated_delta_rule_paged_decode_reference(
     state_pool: torch.Tensor,
     state_slot_mapping: torch.Tensor,
     has_initial_state: torch.Tensor,
+    target_state_slot_mapping: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     slot_indices = state_slot_mapping.to(torch.long)
+    target_slot_indices = (
+        slot_indices
+        if target_state_slot_mapping is None
+        else target_state_slot_mapping.to(torch.long)
+    )
     request_states = state_pool.index_select(0, slot_indices)
     output, updated_request_states = _gated_delta_rule_decode_reference(
         query,
@@ -208,7 +222,7 @@ def _gated_delta_rule_paged_decode_reference(
         has_initial_state,
     )
     updated_state_pool = state_pool.clone()
-    updated_state_pool.index_copy_(0, slot_indices, updated_request_states)
+    updated_state_pool.index_copy_(0, target_slot_indices, updated_request_states)
     return output, updated_state_pool
 
 
@@ -342,6 +356,7 @@ def _gated_delta_rule_prefill_reference(
     cu_seqlens: torch.Tensor,
     state_slot_mapping: torch.Tensor,
     has_initial_state: torch.Tensor,
+    target_state_slot_mapping: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     activation_dtype = value.dtype
     query = query.squeeze(0).float()
@@ -360,6 +375,11 @@ def _gated_delta_rule_prefill_reference(
     final_state = state.clone().float()
     sequence_offsets = cu_seqlens.cpu().tolist()
     state_slots = state_slot_mapping.cpu().tolist()
+    target_state_slots = (
+        state_slots
+        if target_state_slot_mapping is None
+        else target_state_slot_mapping.cpu().tolist()
+    )
     initial_state_flags = has_initial_state.cpu().tolist()
     scale = HEAD_K_DIM**-0.5
     for request_idx, (begin, end) in enumerate(zip(sequence_offsets[:-1], sequence_offsets[1:])):
@@ -379,7 +399,7 @@ def _gated_delta_rule_prefill_reference(
             output[token_idx] = torch.einsum(
                 "hvk,hk->hv", recurrent_state, query[token_idx] * scale
             )
-        final_state[state_slot] = recurrent_state
+        final_state[target_state_slots[request_idx]] = recurrent_state
     return output.unsqueeze(0).to(activation_dtype), final_state
 
 
@@ -766,7 +786,8 @@ def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping() -> None:
     initial_state_pool = state_pool.clone()
     state_pointer = torch.tensor([state_pool.data_ptr()], dtype=torch.int64)
     state_slot_mapping = torch.tensor([6, 2, 5], device=device, dtype=torch.int32)
-    host_has_initial_state = torch.tensor([1, 0, 1], dtype=torch.int8)
+    target_state_slot_mapping = torch.tensor([1, 3, 7], device=device, dtype=torch.int32)
+    host_has_initial_state = torch.ones(num_requests, dtype=torch.int8)
     host_request_types = torch.zeros(num_requests, dtype=torch.int32)
     cu_seqlens = torch.tensor(
         [0, *np.cumsum(sequence_lengths).tolist()], device=device, dtype=torch.int32
@@ -790,6 +811,7 @@ def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping() -> None:
         "host_request_types": host_request_types,
         "cu_seqlens": cu_seqlens,
         "state_slot_mapping": state_slot_mapping,
+        "target_state_slot_mapping": target_state_slot_mapping,
         "host_has_initial_state": host_has_initial_state,
     }
     session = _build_gated_delta_rule_session(
@@ -810,17 +832,24 @@ def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping() -> None:
         cu_seqlens,
         state_slot_mapping,
         host_has_initial_state,
+        target_state_slot_mapping,
     )
 
     torch.testing.assert_close(output.float(), output_ref.float(), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(state_pool, expected_state_pool, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         final_state,
-        expected_state_pool.index_select(0, state_slot_mapping.to(torch.long)),
+        expected_state_pool.index_select(0, target_state_slot_mapping.to(torch.long)),
         atol=1e-2,
         rtol=1e-2,
     )
-    unused_slots = torch.tensor([0, 1, 3, 4, 7], device=device, dtype=torch.long)
+    torch.testing.assert_close(
+        state_pool.index_select(0, state_slot_mapping.to(torch.long)),
+        initial_state_pool.index_select(0, state_slot_mapping.to(torch.long)),
+        atol=0,
+        rtol=0,
+    )
+    unused_slots = torch.tensor([0, 4], device=device, dtype=torch.long)
     torch.testing.assert_close(
         state_pool.index_select(0, unused_slots),
         initial_state_pool.index_select(0, unused_slots),

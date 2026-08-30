@@ -256,7 +256,8 @@ class Qwen35LinearAttention(Module):
         last_token_ids: Tensor,
         host_context_lengths: Tensor,
         cu_seqlens: Tensor,
-        state_slot_mapping: Tensor,
+        source_state_slot_mapping: Tensor,
+        target_state_slot_mapping: Tensor,
         host_has_initial_state: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         paged_state = default_net().plugin_config.paged_state
@@ -278,7 +279,8 @@ class Qwen35LinearAttention(Module):
             host_request_types,
             last_token_ids,
             host_context_lengths=host_context_lengths,
-            slot_mapping=state_slot_mapping,
+            slot_mapping=source_state_slot_mapping,
+            target_slot_mapping=target_state_slot_mapping,
             host_has_initial_state=host_has_initial_state,
         )
         query, key, value = split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -303,8 +305,9 @@ class Qwen35LinearAttention(Module):
             recurrent_state,
             host_request_types,
             cu_seqlens,
-            state_slot_mapping,
+            source_state_slot_mapping,
             host_has_initial_state,
+            target_state_slot_mapping=target_state_slot_mapping,
         )
         output = output.view(concat([num_tokens * self.num_v_heads, self.head_v_dim]))
         gate = gate.view(concat([num_tokens * self.num_v_heads, self.head_v_dim]))
@@ -353,7 +356,8 @@ class Qwen35DecoderLayer(Module):
         last_token_ids=None,
         host_context_lengths=None,
         cu_seqlens=None,
-        state_slot_mapping=None,
+        source_state_slot_mapping=None,
+        target_state_slot_mapping=None,
         host_has_initial_state=None,
     ):
         residual = hidden_states
@@ -382,7 +386,8 @@ class Qwen35DecoderLayer(Module):
                 last_token_ids,
                 host_context_lengths,
                 cu_seqlens,
-                state_slot_mapping,
+                source_state_slot_mapping,
+                target_state_slot_mapping,
                 host_has_initial_state,
             )
             present_kv = None
@@ -421,7 +426,8 @@ class Qwen35Model(Module):
         last_token_ids,
         host_context_lengths,
         cu_seqlens,
-        state_slot_mapping,
+        source_state_slot_mapping,
+        target_state_slot_mapping,
         host_has_initial_state,
     ):
         hidden_states = self.vocab_embedding(input_ids)
@@ -468,7 +474,8 @@ class Qwen35Model(Module):
                 last_token_ids,
                 host_context_lengths,
                 cu_seqlens,
-                state_slot_mapping,
+                source_state_slot_mapping,
+                target_state_slot_mapping,
                 host_has_initial_state,
             )
             if present_kv is not None:
@@ -525,7 +532,8 @@ class Qwen35ForCausalLM(PretrainedModel):
         recurrent_states=None,
         host_request_types=None,
         cu_seqlens=None,
-        state_slot_mapping=None,
+        source_state_slot_mapping=None,
+        target_state_slot_mapping=None,
         host_has_initial_state=None,
     ):
         del position_ids
@@ -543,7 +551,8 @@ class Qwen35ForCausalLM(PretrainedModel):
             last_token_ids,
             attention_params.host_context_lengths,
             cu_seqlens,
-            state_slot_mapping,
+            source_state_slot_mapping,
+            target_state_slot_mapping,
             host_has_initial_state,
         )
         if not self.gather_context_logits:
@@ -638,8 +647,17 @@ class Qwen35ForCausalLM(PretrainedModel):
                 shape=[-1],
                 dim_range=OrderedDict([("batch_size_plus_one", cu_seqlens_range)]),
             ),
-            "state_slot_mapping": Tensor(
-                name="state_slot_mapping", dtype=trt.int32, shape=[-1], dim_range=batch_dim_range
+            "source_state_slot_mapping": Tensor(
+                name="source_state_slot_mapping",
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=batch_dim_range,
+            ),
+            "target_state_slot_mapping": Tensor(
+                name="target_state_slot_mapping",
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=batch_dim_range,
             ),
             "host_has_initial_state": Tensor(
                 name="host_has_initial_state",

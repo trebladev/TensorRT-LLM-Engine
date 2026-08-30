@@ -197,21 +197,38 @@ struct LinearAttentionMetadata
         {
             return 1;
         }
-        SizeType32 count = 0;
+
+        TLLM_CHECK_WITH_INFO(promptLen > 0, "The prompt length (%d) must be positive.", promptLen);
+        TLLM_CHECK_WITH_INFO(
+            tokensPerBlock > 0, "The number of tokens per block (%d) must be positive.", tokensPerBlock);
+        TLLM_CHECK_WITH_INFO(statesSnapshotInterval == 0 || statesSnapshotInterval % tokensPerBlock == 0,
+            "The recurrent-state snapshot interval (%d) must be a multiple of tokens per block (%d).",
+            statesSnapshotInterval, tokensPerBlock);
+
+        auto const finalBlockEndTokenIdx = ((promptLen - 1) / tokensPerBlock + 1) * tokensPerBlock;
+        SizeType32 count = 1; // The block containing the final prompt state is always writable.
+
         if (statesSnapshotInterval > 0)
         {
-            count += promptLen / statesSnapshotInterval; // round down
+            // Count interval snapshots strictly before the final prompt block. If the final block also ends at an
+            // interval boundary, it is already represented by the writable block above.
+            count += (finalBlockEndTokenIdx - 1) / statesSnapshotInterval;
         }
-        if (saveLastSnapshot
-            && (promptLen / tokensPerBlock * tokensPerBlock
-                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+
+        if (saveLastSnapshot && promptLen % tokensPerBlock != 0)
         {
-            count += 1;
+            auto const lastFullBlockEndTokenIdx = promptLen / tokensPerBlock * tokensPerBlock;
+            if (lastFullBlockEndTokenIdx > 0
+                && (statesSnapshotInterval == 0 || lastFullBlockEndTokenIdx % statesSnapshotInterval != 0))
+            {
+                ++count;
+            }
         }
+
         if (promptLen % tokensPerBlock == 0)
         {
-            // corner case
-            count += 1;
+            // The final full prompt block can be stored for reuse. Reserve another writable live block for decode.
+            ++count;
         }
         return count;
     }
@@ -807,6 +824,10 @@ struct PrefixReuseSummary
     /// Total number of prefix blocks cached (allocated or free-cached).
     /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
     SizeType32 reusableBlocksAll{0};
+
+    /// Number of prefix tokens whose cache state can be restored by every managed window.
+    /// For recurrent-state windows, this ends at the latest materialized snapshot.
+    SizeType32 reusableTokens{0};
 
     /// First block key NOT found in the radix tree. std::nullopt means either all full
     /// prefix blocks matched (full prefix hit) or the request has no full block key to
@@ -1837,6 +1858,11 @@ public:
         return mWindowBlockManagers.at(windowSize);
     }
 
+    [[nodiscard]] WindowBlockManager const& getWindowBlockManager(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize);
+    }
+
     [[nodiscard]] runtime::BufferManager const& getBufferManager(SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getBufferManager();
@@ -2599,6 +2625,21 @@ public:
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
     [[nodiscard]] SizeType32 getRecurrentStateSlot(RequestIdType requestId, SizeType32 beamIdx = 0) const;
+
+    /// Return the recurrent-state slot that stores the state after @p tokenIdx.
+    [[nodiscard]] SizeType32 getRecurrentStateSlotForToken(
+        RequestIdType requestId, SizeType32 tokenIdx, SizeType32 beamIdx = 0) const;
+
+    struct RecurrentStateSlotPair
+    {
+        std::optional<SizeType32> sourceSlot;
+        SizeType32 targetSlot;
+    };
+
+    /// Resolve the read-only source snapshot and writable target snapshot for
+    /// one recurrent-state update.
+    [[nodiscard]] RecurrentStateSlotPair getRecurrentStateSlotPair(RequestIdType requestId,
+        std::optional<SizeType32> sourceTokenIdx, SizeType32 targetTokenIdx, SizeType32 beamIdx = 0) const;
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override;

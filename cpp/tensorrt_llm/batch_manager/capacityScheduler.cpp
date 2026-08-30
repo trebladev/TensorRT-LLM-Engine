@@ -313,22 +313,18 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;
                 if (isFirstChunkContext)
                 {
-                    // analyzePrefixReuse asserts on variable-window managers; skip the walk there
-                    // and let downstream callers fall back to their fresh tree-walk path.
-                    if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
+                    if (kvCacheManager.isEnableBlockReuse())
                     {
                         auto uniqueTokens = req->getUniqueTokens(0);
                         summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
                     }
-                    if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                        && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                    if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
                     {
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                         crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                     }
                 }
-                else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                    && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
                 {
                     // Encoder admission only needs the cross summary for reuse ordering.
                     auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
@@ -481,10 +477,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         bool const isFirstChunkContext
             = req->isContextInitState() && req->isFirstContextChunk() && !req->isDisaggGenerationInitState();
         std::optional<kv_cache_manager::PrefixReuseSummary> summary;
-        // analyzePrefixReuse asserts on variable-window managers; skip the walk there
-        // and let downstream callers fall back to their fresh tree-walk path.
-        if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse()
-            && !kvCacheManager.getBlockManager().isVariableWindow())
+        if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse())
         {
             auto uniqueTokens = req->getUniqueTokens(0);
             summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);

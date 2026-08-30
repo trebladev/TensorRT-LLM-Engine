@@ -38,7 +38,8 @@ struct MambaConv1dParamsBase
     void* __restrict__ bias_ptr;
     void* __restrict__ out_ptr;
     int const* __restrict__ last_token_ids_ptr;
-    int const* __restrict__ state_slot_mapping_ptr;
+    int const* __restrict__ source_state_slot_mapping_ptr;
+    int const* __restrict__ target_state_slot_mapping_ptr;
     int8_t const* __restrict__ has_initial_state_ptr;
 };
 

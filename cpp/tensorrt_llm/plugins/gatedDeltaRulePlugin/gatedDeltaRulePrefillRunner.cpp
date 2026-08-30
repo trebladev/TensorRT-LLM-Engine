@@ -220,7 +220,8 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     CUdeviceptr output = reinterpret_cast<CUdeviceptr>(params.output);
     CUdeviceptr state = reinterpret_cast<CUdeviceptr>(params.state);
     CUdeviceptr finalState = reinterpret_cast<CUdeviceptr>(params.finalState);
-    CUdeviceptr stateSlotMapping = reinterpret_cast<CUdeviceptr>(params.stateSlotMapping);
+    CUdeviceptr sourceStateSlotMapping = reinterpret_cast<CUdeviceptr>(params.sourceStateSlotMapping);
+    CUdeviceptr targetStateSlotMapping = reinterpret_cast<CUdeviceptr>(params.targetStateSlotMapping);
     CUdeviceptr cuSeqLens = reinterpret_cast<CUdeviceptr>(params.cuSeqLens);
     int32_t totalTokens = params.totalTokens;
     int32_t numRequests = params.numRequests;
@@ -264,7 +265,7 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     launch(mPrepareChunks, static_cast<unsigned int>(numRequests), 1, 1, prepareChunksParams);
 
     void* zeroStateParams[]{
-        &state, &stateSlotMapping, &stateStride, &hasInitialState, &numRequests, &globalScratch, &profileScratch};
+        &state, &targetStateSlotMapping, &stateStride, &hasInitialState, &numRequests, &globalScratch, &profileScratch};
     launch(mZeroState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kIoBlockV)),
         static_cast<unsigned int>(numRequests * mNumVHeads), 1, zeroStateParams);
 
@@ -285,8 +286,9 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
         &totalTokens, &globalScratch, &profileScratch};
     launch(mRecompute, static_cast<unsigned int>(maxChunks), static_cast<unsigned int>(mNumVHeads), 1, recomputeParams);
 
-    void* stateParams[]{&normalizedKey, &u, &w, &u, &gCumsum, &h, &state, &stateSlotMapping, &cuSeqLens, &chunkOffsets,
-        &totalTokens, &stateStride, &globalScratch, &profileScratch};
+    void* stateParams[]{&normalizedKey, &u, &w, &u, &gCumsum, &h, &state, &sourceStateSlotMapping, &state,
+        &targetStateSlotMapping, &cuSeqLens, &chunkOffsets, &totalTokens, &stateStride, &globalScratch,
+        &profileScratch};
     launch(mState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kStateBlockV)),
         static_cast<unsigned int>(numRequests * mNumVHeads), 1, stateParams);
 
@@ -298,7 +300,7 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     if (params.pagedState)
     {
         void* gatherStateParams[]{
-            &state, &finalState, &stateSlotMapping, &stateStride, &numRequests, &globalScratch, &profileScratch};
+            &state, &finalState, &targetStateSlotMapping, &stateStride, &numRequests, &globalScratch, &profileScratch};
         launch(mGatherState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kIoBlockV)),
             static_cast<unsigned int>(numRequests * mNumVHeads), 1, gatherStateParams);
     }

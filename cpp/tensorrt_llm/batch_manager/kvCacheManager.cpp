@@ -1411,9 +1411,24 @@ void WindowBlockManager::offloadBlock(
 PrefixReuseSummary BlockManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
-    TLLM_CHECK_WITH_INFO(!isVariableWindow(), "analyzePrefixReuse does not work for variable window attention");
-    auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
-    return onlyManager.analyzePrefixReuse(uniqueTokens, llmRequest);
+    if (!isVariableWindow())
+    {
+        auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
+        return onlyManager.analyzePrefixReuse(uniqueTokens, llmRequest);
+    }
+
+    PrefixReuseSummary combinedSummary;
+    bool isFirstWindow = true;
+    for (auto const& windowManager : mWindowBlockManagers)
+    {
+        auto const& manager = windowManager.second;
+        auto const windowSummary = manager.analyzePrefixReuse(uniqueTokens, llmRequest);
+        combinedSummary.reusableTokens = isFirstWindow
+            ? windowSummary.reusableTokens
+            : std::min(combinedSummary.reusableTokens, windowSummary.reusableTokens);
+        isFirstWindow = false;
+    }
+    return combinedSummary;
 }
 
 PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
@@ -1429,8 +1444,10 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     auto reuseMatches = findReusableBlockMatches(
         blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, std::numeric_limits<SizeType32>::max());
 
+    SizeType32 matchedTokens{0};
     for (auto const& match : reuseMatches.matches)
     {
+        matchedTokens += match.numMatchedTokens;
         if (match.isTraversalOnly)
         {
             continue;
@@ -1441,11 +1458,22 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
         {
             ++summary.reusableBlocksAllocated;
         }
+
+        if (isRecurrentState() && !match.block->isPlaceholder())
+        {
+            summary.reusableTokens = matchedTokens;
+        }
+    }
+    if (!isRecurrentState())
+    {
+        summary.reusableTokens = reuseMatches.totalMatchedTokens;
     }
     summary.firstNewBlock = reuseMatches.firstNewBlock;
 
-    TLLM_LOG_DEBUG("%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, hasNewBlock=%d", mLogPrefix.c_str(),
-        summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.firstNewBlock.has_value());
+    TLLM_LOG_DEBUG(
+        "%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, reusableTokens=%d, hasNewBlock=%d",
+        mLogPrefix.c_str(), summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.reusableTokens,
+        summary.firstNewBlock.has_value());
     return summary;
 }
 
@@ -3450,31 +3478,38 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
     // Default to zero; overwritten below when block reuse is active for a first-chunk context request.
     req.setEstimatedReusableTokens(0);
 
+    std::optional<PrefixReuseSummary> reuseSummary;
+    if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk() && !isCrossKv()
+        && !req.isDisaggGenerationInitState())
+    {
+        reuseSummary
+            = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
+        TLLM_CHECK_WITH_INFO(req.mPromptLen > 0, "Unexpected: promptLen == 0");
+        auto const maxRecoverableTokens = (req.mPromptLen - 1) / getTokensPerBlock() * getTokensPerBlock();
+        req.setEstimatedReusableTokens(std::min(reuseSummary->reusableTokens, maxRecoverableTokens));
+    }
+
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         auto const maxDraftTokensToAdd = std::min(req.getNumDraftTokens(), req.mMaxNewTokens);
-        auto const promptCacheLen
-            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd,
-                  windowSize + mChunkSize)
-            + mSinkBubbleLength;
+        auto const promptInputLen
+            = (isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd;
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
         {
             return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
-                promptCacheLen, getTokensPerBlock(), mEnableBlockReuse);
+                promptInputLen, getTokensPerBlock(), mEnableBlockReuse);
         }
+        auto const promptCacheLen
+            = std::min(promptInputLen, windowSize + mChunkSize) + mSinkBubbleLength;
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
-            && !req.isDisaggGenerationInitState())
+        // Aggregate block counts have no common capacity meaning for variable-window managers.
+        if (reuseSummary.has_value() && !mBlockManager.isVariableWindow())
         {
-            // Use the cached summary if provided; otherwise perform a fresh tree walk.
-            auto const summary
-                = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
             auto const promptInputLen = std::min(req.mPromptLen, windowSize + mChunkSize);
             // Sequence insertion ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
@@ -3486,15 +3521,8 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // double-count the eviction policy's free count and over-admit requests. Only subtract from
             // shared blocks, since reusable blocks are always shared.
             auto const reusableAllocatedBlocks
-                = std::min({summary.reusableBlocksAllocated, numSharedBlocks, maxRecoverableSharedBlocks});
+                = std::min({reuseSummary->reusableBlocksAllocated, numSharedBlocks, maxRecoverableSharedBlocks});
             numRequiredBlocks -= reusableAllocatedBlocks;
-            // Token (compute) budget: all cached prefix blocks skip recompute regardless of ref state,
-            // since the engine recovers their KV via prepopulatedPromptLen. This matches the accounting
-            // in getRemainingBlocksToCompletion (GUARANTEED_NO_EVICT) so the micro batch scheduler does
-            // not under-credit reuse and serialize context requests.
-            auto const reusableAllBlocks
-                = std::min({summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks});
-            req.setEstimatedReusableTokens(reusableAllBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
     }
@@ -3549,6 +3577,16 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         return 0; // cross KV cache doesn't grow after the initial context phase
     }
 
+    std::optional<PrefixReuseSummary> reuseSummary;
+    if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk())
+    {
+        reuseSummary
+            = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
+        TLLM_CHECK_WITH_INFO(req.mPromptLen > 0, "Unexpected: promptLen == 0");
+        auto const maxRecoverableTokens = (req.mPromptLen - 1) / getTokensPerBlock() * getTokensPerBlock();
+        req.setEstimatedReusableTokens(std::min(reuseSummary->reusableTokens, maxRecoverableTokens));
+    }
+
     if (windowSize == LinearAttentionMetadata::kRecurrentStates)
     {
         if (req.isGenerationInProgressState())
@@ -3596,28 +3634,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
     // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
-    if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
-        && numAllocBlocksPerBeam == 0)
+    if (reuseSummary.has_value() && !mBlockManager.isVariableWindow() && numAllocBlocksPerBeam == 0)
     {
-        // Use the cached summary if provided; otherwise perform a fresh tree walk.
-        auto const summary
-            = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
         // Block budget: only subtract blocks that are already allocated (have active refs).
         // Free cached blocks are already counted in the eviction policy's free pool and
         // must not be double-counted against the capacity estimate.
         // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
         // block-aligned (last full block has not been committed to the tree yet).
         SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
-        numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
-        // Token budget: count all reusable blocks (free or allocated). Cached tokens need
-        // not be recomputed regardless of whether their blocks currently have active refs.
-        req.setEstimatedReusableTokens(
-            std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
+        numReusableContextBlocks
+            = std::min({reuseSummary->reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
-            req.mRequestId, numContextBlocks, summary.reusableBlocksAllocated, summary.reusableBlocksAll,
+            req.mRequestId, numContextBlocks, reuseSummary->reusableBlocksAllocated, reuseSummary->reusableBlocksAll,
             numReusableContextBlocks, numGenBlocksPerBeam);
     }
 
@@ -4579,6 +4610,46 @@ SizeType32 KVCacheManager::getRecurrentStateSlot(RequestIdType requestId, SizeTy
     }
     TLLM_THROW(
         "No recurrent state block found for request %lu beam %d.", static_cast<unsigned long>(requestId), beamIdx);
+}
+
+SizeType32 KVCacheManager::getRecurrentStateSlotForToken(
+    RequestIdType requestId, SizeType32 tokenIdx, SizeType32 beamIdx) const
+{
+    // Without reuse, recurrent state is kept in one live slot per request.
+    if (!mEnableBlockReuse)
+    {
+        return getRecurrentStateSlot(requestId, beamIdx);
+    }
+
+    TLLM_CHECK_WITH_INFO(tokenIdx >= 0, "The recurrent-state token index (%d) must be non-negative.", tokenIdx);
+    auto const& blockIds
+        = getCacheBlockIds(requestId, LinearAttentionMetadata::LinearCacheType::kRecurrentStates).at(beamIdx);
+    auto const blockIdx = tokenIdx / mTokensPerBlock;
+    TLLM_CHECK_WITH_INFO(blockIdx < static_cast<SizeType32>(blockIds.size()),
+        "No recurrent-state block for request %lu beam %d token %d (block index %d, block count %zu).",
+        static_cast<unsigned long>(requestId), beamIdx, tokenIdx, blockIdx, blockIds.size());
+
+    auto const blockId = blockIds.at(blockIdx);
+    auto const block = mBlockManager.getBlockById(blockId, LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+    TLLM_CHECK_WITH_INFO(block != nullptr, "Unknown recurrent state block id %d for request %lu.", blockId,
+        static_cast<unsigned long>(requestId));
+    TLLM_CHECK_WITH_INFO(!block->isPlaceholder(),
+        "Recurrent state block for request %lu beam %d token %d is a placeholder.",
+        static_cast<unsigned long>(requestId), beamIdx, tokenIdx);
+    TLLM_CHECK_WITH_INFO(block->isPrimary(),
+        "Recurrent state block for request %lu beam %d token %d must be in the primary pool.",
+        static_cast<unsigned long>(requestId), beamIdx, tokenIdx);
+    return block->getMemoryPoolBlockIndex();
+}
+
+KVCacheManager::RecurrentStateSlotPair KVCacheManager::getRecurrentStateSlotPair(RequestIdType requestId,
+    std::optional<SizeType32> sourceTokenIdx, SizeType32 targetTokenIdx, SizeType32 beamIdx) const
+{
+    auto const targetSlot = getRecurrentStateSlotForToken(requestId, targetTokenIdx, beamIdx);
+    auto const sourceSlot = sourceTokenIdx
+        ? std::make_optional(getRecurrentStateSlotForToken(requestId, sourceTokenIdx.value(), beamIdx))
+        : std::nullopt;
+    return {sourceSlot, targetSlot};
 }
 
 std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(

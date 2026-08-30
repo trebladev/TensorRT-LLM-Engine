@@ -6902,7 +6902,8 @@ def mamba_conv1d(input: Tensor,
                  host_has_initial_state: Optional[Tensor] = None,
                  state_slot_stride_bytes: int = 0,
                  state_channel_stride_bytes: int = 0,
-                 state_history_stride_bytes: int = 0):
+                 state_history_stride_bytes: int = 0,
+                 target_slot_mapping: Optional[Tensor] = None):
     '''
     Parameters:
         input : Tensor (On GPU)
@@ -6948,7 +6949,11 @@ def mamba_conv1d(input: Tensor,
             A host tensor that contains the lengths of the different inputs,
 
         slot_mapping: Tensor (On GPU) (Optional)
-            Real page index in state. Its shape is [batch_size], used for paged state.
+            Source page index in state. Its shape is [batch_size], used for paged state.
+
+        target_slot_mapping: Tensor (On GPU) (Optional)
+            Target page index in state. When omitted, state updates are written to
+            ``slot_mapping`` for backward compatibility.
 
         apply_silu: bool
             Is there a SiLU operation after the conv1d? When True apply
@@ -6976,6 +6981,8 @@ def mamba_conv1d(input: Tensor,
         if stride_bytes < 0:
             raise ValueError(f'{stride_name} must be non-negative')
     use_initial_state_mask = host_has_initial_state is not None
+    use_separate_state_slot_mapping = (default_net().plugin_config.paged_state
+                                       and target_slot_mapping is not None)
     mamba_conv1d_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'MambaConv1d', '2', TRT_LLM_PLUGIN_NAMESPACE)
     assert mamba_conv1d_plg_creator is not None
@@ -7013,13 +7020,17 @@ def mamba_conv1d(input: Tensor,
         "use_initial_state_mask",
         np.array(np.int8(use_initial_state_mask), dtype=np.int8),
         trt.PluginFieldType.INT8)
+    use_separate_state_slot_mapping_field = trt.PluginField(
+        "use_separate_state_slot_mapping",
+        np.array(np.int8(use_separate_state_slot_mapping), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     pfc = trt.PluginFieldCollection([
         dim, dconv, pre_stride, post_stride, pf_type, remove_input_padding,
         paged_state, apply_silu,
         int64_field("state_slot_stride_bytes", state_slot_stride_bytes),
         int64_field("state_channel_stride_bytes", state_channel_stride_bytes),
-        int64_field("state_history_stride_bytes",
-                    state_history_stride_bytes), use_initial_state_mask_field
+        int64_field("state_history_stride_bytes", state_history_stride_bytes),
+        use_initial_state_mask_field, use_separate_state_slot_mapping_field
     ])
     mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
         "mamba_conv1d", pfc)
@@ -7031,6 +7042,8 @@ def mamba_conv1d(input: Tensor,
         plug_inputs += [host_context_lengths]
     if default_net().plugin_config.paged_state:
         plug_inputs += [slot_mapping]
+        if use_separate_state_slot_mapping:
+            plug_inputs += [target_slot_mapping]
     if use_initial_state_mask:
         plug_inputs += [host_has_initial_state]
     plug_inputs = [i.trt_tensor for i in plug_inputs]
@@ -7730,27 +7743,30 @@ def cp_split_plugin(
                           layer), _create_tensor(layer.get_output(2), layer)
 
 
-def gated_delta_rule(query: Tensor,
-                     key: Tensor,
-                     value: Tensor,
-                     log_decay: Tensor,
-                     beta: Tensor,
-                     state: Tensor,
-                     host_request_types: Tensor,
-                     cu_seqlens: Tensor,
-                     state_slot_mapping: Tensor,
-                     host_has_initial_state: Tensor,
-                     num_q_heads: int,
-                     num_v_heads: int,
-                     head_k_dim: int,
-                     head_v_dim: int,
-                     chunk_size: int,
-                     dtype: Union[str, trt.DataType],
-                     state_dtype: Union[str, trt.DataType] = 'float32',
-                     state_slot_stride_bytes: int = 0,
-                     remove_input_padding: Optional[bool] = None,
-                     paged_state: Optional[bool] = None,
-                     use_qk_l2norm: bool = True) -> Tuple[Tensor, Tensor]:
+def gated_delta_rule(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    log_decay: Tensor,
+    beta: Tensor,
+    state: Tensor,
+    host_request_types: Tensor,
+    cu_seqlens: Tensor,
+    state_slot_mapping: Tensor,
+    host_has_initial_state: Tensor,
+    num_q_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    chunk_size: int,
+    dtype: Union[str, trt.DataType],
+    state_dtype: Union[str, trt.DataType] = 'float32',
+    state_slot_stride_bytes: int = 0,
+    remove_input_padding: Optional[bool] = None,
+    paged_state: Optional[bool] = None,
+    use_qk_l2norm: bool = True,
+    target_state_slot_mapping: Optional[Tensor] = None
+) -> Tuple[Tensor, Tensor]:
     """Add a Gated Delta Rule operation implemented by an IPluginV3 layer."""
     plg_creator = trt.get_plugin_registry().get_creator(
         'GatedDeltaRule', '2', TRT_LLM_PLUGIN_NAMESPACE)
@@ -7766,6 +7782,7 @@ def gated_delta_rule(query: Tensor,
         paged_state = default_net().plugin_config.paged_state
     if state_slot_stride_bytes < 0:
         raise ValueError('state_slot_stride_bytes must be non-negative')
+    use_separate_state_slot_mapping = target_state_slot_mapping is not None
 
     def int32_field(name: str, value: int) -> trt.PluginField:
         return trt.PluginField(name, np.array([int(value)], dtype=np.int32),
@@ -7792,6 +7809,8 @@ def gated_delta_rule(query: Tensor,
         int8_field('remove_input_padding', remove_input_padding),
         int8_field('paged_state', paged_state),
         int8_field('use_qk_l2norm', use_qk_l2norm),
+        int8_field('use_separate_state_slot_mapping',
+                   use_separate_state_slot_mapping),
     ])
     plugin = plg_creator.create_plugin('gated_delta_rule', pfc,
                                        trt.TensorRTPhase.BUILD)
@@ -7799,8 +7818,11 @@ def gated_delta_rule(query: Tensor,
 
     plug_inputs = [
         query, key, value, log_decay, beta, state, host_request_types,
-        cu_seqlens, state_slot_mapping, host_has_initial_state
+        cu_seqlens, state_slot_mapping
     ]
+    if use_separate_state_slot_mapping:
+        plug_inputs.append(target_state_slot_mapping)
+    plug_inputs.append(host_has_initial_state)
     layer = default_trtnet().add_plugin_v3(
         [tensor.trt_tensor for tensor in plug_inputs], [], plugin)
     _add_plugin_info(layer, plg_creator, 'gated_delta_rule', pfc)

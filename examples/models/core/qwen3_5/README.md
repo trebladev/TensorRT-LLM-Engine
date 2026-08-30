@@ -28,7 +28,7 @@ full-attention layers with gated-delta linear-attention layers.
 | Gated-delta linear attention | Supported with paged recurrent state |
 | KV/state management | Paged KV cache and paged linear-attention state |
 | Generation | Prefill followed by decode, beam width 1 |
-| Prefix cache / block reuse | Not supported |
+| Prefix cache / block reuse | Supported for full-attention KV and gated-delta recurrent state with beam width 1 |
 | Mixed prefill and decode batch | Not supported |
 | Quantization | Not supported |
 | Vision inputs | Not supported; vision weights are ignored during conversion |
@@ -38,6 +38,72 @@ full-attention layers with gated-delta linear-attention layers.
 The implementation has been validated with the `Qwen3.5-2B` Hugging Face
 checkpoint. Other dense Qwen3.5 sizes using the same text-decoder architecture
 are expected to use the same graph, but have not been validated yet.
+
+## Planned MTP enablement
+
+> [!NOTE]
+> Multi-token prediction (MTP) is not supported by this TensorRT graph yet.
+> This section records the intended implementation and validation order; it is
+> not a description of currently available functionality.
+
+MTP target verification runs the engine with the current token followed by up
+to `K` draft tokens. The engine therefore needs a generation profile that
+supports `K + 1` input tokens, returns target logits for every verification
+position, and preserves the state associated with the accepted prefix.
+
+Attention KV cache support can reuse much of the existing speculative-decoding
+infrastructure because KV entries retain a token dimension. Rejected entries
+can be ignored by updating the effective sequence length and, when necessary,
+reordering the accepted path. Gated-delta recurrent state is more restrictive:
+the state after all draft tokens cannot be rolled back by changing a sequence
+length. Convolution state has the same commit problem, although its state is
+small enough to retain per-step snapshots.
+
+The implementation should proceed in the following order:
+
+| Stage | Implementation | Test types |
+| --- | --- | --- |
+| 1 | Define input, logits, accepted-length, and cache-commit semantics | Configuration, interface, and golden-trace tests |
+| 2 | Build the target engine with a `K + 1` generation profile and accept externally supplied draft tokens | Engine build/profile, dynamic-shape, and logits-equivalence tests |
+| 3 | Add speculative attention and KV cache commit/rollback | Attention-plugin, paged-KV, block-boundary, and cache-lifecycle tests |
+| 4 | Support multi-token gated-delta execution using full intermediate state snapshots as the correctness reference | Kernel, plugin, state-equivalence, and snapshot-selection tests |
+| 5 | Save and promote the convolution state selected by the accepted prefix | Convolution-kernel and accepted-index promotion tests |
+| 6 | Integrate acceptance with atomic KV, gated-delta, and convolution-state commit | Acceptance-unit, cache-consistency, and external-draft end-to-end tests |
+| 7 | Convert and integrate the Qwen3.5 MTP modules and their hidden-state/token history | Weight-conversion, MTP-logits, draft-token, and engine-integration tests |
+| 8 | Replace full gated-delta snapshots with compact replay | Replay-kernel, full-state-oracle, random-acceptance, and long-sequence tests |
+| 9 | Integrate replay metadata and buffers with the cache manager and inflight batching | PNAT, double-buffer, slot-reuse, mixed-batch, and scheduler tests |
+| 10 | Enable optimized and distributed configurations | Stress, compatibility, memory, performance, and non-MTP regression tests |
+
+The first correctness milestone should deliberately use a restricted
+configuration: Qwen3.5 BF16, TP=1, beam width 1, greedy decoding, a fixed draft
+length, a small batch, externally supplied draft tokens, and full gated-delta
+intermediate states. This keeps target verification independent of the MTP
+drafter and provides a reference for compact replay.
+
+### Gated-delta compact replay
+
+Full intermediate recurrent-state snapshots are sufficient for correctness,
+but their storage scales with the draft length and the full recurrent-state
+size. This is likely to become a memory-capacity and bandwidth bottleneck at
+useful batch sizes. Compact replay should instead retain one checkpoint state
+and a bounded history of the update factors needed to reconstruct accepted
+state, such as `x`, `B`, `dt`, and cumulative `dA` values.
+
+The replay cache requires:
+
+- A bounded, double-buffered update history for every recurrent-state slot.
+- A previous-number-of-accepted-tokens (PNAT) value identifying the valid
+  history after the checkpoint.
+- An active-buffer index and checkpoint/overflow handling.
+- Acceptance-side metadata updates that exclude rejected draft tokens.
+- Numerical comparison against the full intermediate-state implementation over
+  random acceptance sequences and multiple checkpoint cycles.
+
+Convolution state should initially continue to use per-step intermediate
+snapshots followed by accepted-index promotion. Acceptance is expected to run
+outside the TensorRT target graph, after target logits are available, with the
+runtime or batch manager committing KV, recurrent, and convolution state as one
+logical operation.
 
 ## Checkpoint conversion
 
@@ -110,8 +176,99 @@ weights and activation workspace.
 
 For standard runtime generation, build with paged KV cache (the default). The
 runtime allocates both attention KV blocks and gated-delta recurrent-state
-blocks through the KV cache manager. Prefix-cache block reuse is disabled for
-this initial hybrid-model implementation.
+blocks through the KV cache manager.
+
+## Prefix-cache validation demo
+
+The prefix-cache demo turns the default long prompt into two sequential
+requests on the same `ModelRunnerCpp` instance. The first request populates the
+cache with the long-text prefix. The second request sends the exact same token
+prefix followed by `总结上述内容`, then reports request-level statistics when
+retained by the executor and the cumulative reused-block delta as a fallback.
+
+```bash
+examples/models/core/qwen3_5/run_prefix_cache_demo.sh \
+    /path/to/qwen3_5_engine \
+    /path/to/Qwen3.5-2B
+```
+
+The script aligns the first request to a 256-token recurrent-state snapshot
+boundary. A successful run ends with `PASS` and a reused block count greater
+than zero. Both requests must run in the same process; invoking `run_demo.sh`
+twice creates two executors and cannot reuse the first request's cache.
+
+Add `--compare_direct_ttft` to measure streaming time to first token for the
+cold prefix request, the warm prefix-cache summary request, and the same
+combined input on a fresh executor:
+
+```bash
+examples/models/core/qwen3_5/run_prefix_cache_demo.sh \
+    /path/to/qwen3_5_engine \
+    /path/to/Qwen3.5-2B \
+    --compare_direct_ttft
+```
+
+Each executor receives one untimed prompt with the same length but a different
+first token before measurement. This warms the same long-context CUDA and
+TensorRT paths while ensuring that the measured prompt cannot reuse its prefix.
+
+### 50K/100K TTFT benchmark
+
+Build a TP=2 engine with a 100K sequence profile on GPUs 0 and 1:
+
+```bash
+examples/models/core/qwen3_5/build_long_context_tp2.sh \
+    /path/to/qwen3_5_bf16_tp2 \
+    /tmp/qwen35_engine_long_ttft_tp2
+```
+
+Run the benchmark:
+
+```bash
+examples/models/core/qwen3_5/run_long_context_ttft.sh \
+    /tmp/qwen35_engine_long_ttft_tp2 \
+    /path/to/Qwen3.5-2B
+```
+
+Each trial uses one executor for all measured requests. It first runs an
+untimed, nonmatching 100K warmup, then measures a 100K cold request, a 50K
+prefix population request, and a 100K request that shares the populated 50K
+prefix. Trials alternate between `cold -> prefix -> hit` and
+`prefix -> hit -> cold` order to reduce ordering bias. The final report includes
+the median, minimum, and maximum TTFT, per-trial speedup, and reused-block
+validation. The default is three trials with one warmup request per trial:
+
+```bash
+QWEN35_NUM_TRIALS=3 QWEN35_WARMUP_REQUESTS=1 \
+examples/models/core/qwen3_5/run_long_context_ttft.sh \
+    /tmp/qwen35_engine_long_ttft_tp2 \
+    /path/to/Qwen3.5-2B
+```
+
+Here K means 1024 tokens. The reusable boundary is therefore 51,200 tokens and
+the long request contains 102,400 tokens. Set
+`QWEN35_CUDA_VISIBLE_DEVICES` to select different physical GPUs; the
+single-process orchestrator maps its worker device IDs to the two visible
+devices. Set `QWEN35_KV_CACHE_FREE_GPU_MEMORY_FRACTION` to tune cache capacity.
+Pass `--request_order cold_first` or `--request_order hit_first` to disable
+alternating request order.
+
+The following reference result was measured with Qwen3.5-2B BF16, TP=2, two
+NVIDIA GeForce RTX 4090 D GPUs, a 4,096-token context chunk budget, a 0.7 KV
+cache free-memory fraction, two trials, and one 100K warmup per trial:
+
+| Request | Median TTFT |
+| --- | ---: |
+| 50K cold prefix population | 8,415.00 ms |
+| 100K cold input | 20,548.47 ms |
+| 100K input with a 50K prefix hit | 12,626.38 ms |
+
+The 50K prefix hit reduced median TTFT by 7,922.09 ms (38.55%) and produced a
+1.63x speedup. Both request orders reused exactly 1,800 blocks: 1,600
+full-attention KV blocks at 32 tokens per block and 200 gated-delta recurrent
+state snapshots at 256 tokens per snapshot. These numbers are a reference for
+this machine and configuration; use the aggregate output from the benchmark
+when comparing other GPUs, engine profiles, or cache capacities.
 
 ## Validation
 

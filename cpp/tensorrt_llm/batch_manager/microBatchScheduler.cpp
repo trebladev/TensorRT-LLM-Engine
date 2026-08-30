@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,6 +101,38 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
                 llmReq->discardDraftTokens(draftTokensToDiscard);
             }
         }
+    }
+}
+
+void MicroBatchScheduler::alignToStateSnapshotBoundaries(
+    RequestVector& contextsToBeChunked, SizeType32 const stateSnapshotInterval)
+{
+    TLLM_CHECK_WITH_INFO(stateSnapshotInterval > 0, "The recurrent-state snapshot interval (%d) must be positive.",
+        stateSnapshotInterval);
+
+    for (auto& llmReq : contextsToBeChunked)
+    {
+        auto const allocatedChunkSize = llmReq->getContextChunkSize();
+        if (allocatedChunkSize == 0)
+        {
+            continue;
+        }
+
+        // The capacity scheduler discovers reusable tokens before it updates
+        // contextCurrentPosition. Account for both representations here.
+        auto const estimatedReusableTokens = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
+        auto const snapshotStart = std::max(llmReq->getContextCurrentPosition(), estimatedReusableTokens);
+        auto const promptLength = llmReq->mPromptLen;
+        TLLM_CHECK_WITH_INFO(snapshotStart < promptLength,
+            "The recurrent-state snapshot start (%d) must be smaller than the prompt length (%d) for request %lu.",
+            snapshotStart, promptLength, static_cast<unsigned long>(llmReq->mRequestId));
+
+        auto const nextSnapshotBoundary
+            = std::min(promptLength, (snapshotStart / stateSnapshotInterval + 1) * stateSnapshotInterval);
+        auto const requiredChunkSize = nextSnapshotBoundary - snapshotStart;
+
+        // Do not execute a partial chunk that cannot reach a state snapshot.
+        llmReq->setContextChunkSize(allocatedChunkSize >= requiredChunkSize ? requiredChunkSize : 0);
     }
 }
 
@@ -276,7 +308,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 // See the individual template specialisations above for full details.
 void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChunked,
     ContextChunkingPolicy const ctxChunkPolicy, std::optional<SizeType32> ctxTokensCapacity,
-    SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextLength)
+    SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextLength,
+    std::optional<SizeType32> const stateSnapshotInterval)
 {
     for (auto& llmReq : contextsToBeChunked)
     {
@@ -297,6 +330,11 @@ void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChu
             contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextLength);
         break;
     default: TLLM_THROW("The chunked scheduling type `NO_CHUNKING` cannot be performed.");
+    }
+
+    if (stateSnapshotInterval)
+    {
+        alignToStateSnapshotBoundaries(contextsToBeChunked, stateSnapshotInterval.value());
     }
 
     // After scheduling chunk sizes, discard draft tokens that won't fit.
@@ -449,7 +487,12 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         auto const ctxTokensCapacity
             = maxNumTokensRuntime ? std::make_optional(maxNumTokensRuntime.value() - batchNumTokens) : std::nullopt;
         setCtxRequestsChunkSize(contextsToBeChunked, mCtxChunkConfig.value().chunkingPolicy, ctxTokensCapacity,
-            mCtxChunkConfig.value().chunkUnitSize, mMaxContextLength);
+            mCtxChunkConfig.value().chunkUnitSize, mMaxContextLength, mCtxChunkConfig.value().stateSnapshotInterval);
+    }
+    else if (mCtxChunkConfig && mCtxChunkConfig->stateSnapshotInterval)
+    {
+        alignToStateSnapshotBoundaries(contextsToBeChunked, mCtxChunkConfig->stateSnapshotInterval.value());
+        fitDraftTokens(contextsToBeChunked, std::nullopt, mCtxChunkConfig->chunkUnitSize, mMaxContextLength);
     }
     for (auto const& llmReq : contextsToBeChunked)
     {

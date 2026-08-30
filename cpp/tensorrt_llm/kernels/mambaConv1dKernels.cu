@@ -214,7 +214,7 @@ __global__
         >
     mambaConv1dContextKernel(int B_, int L_, int D_, int S_pre_, int S_post_, T_* g_mxYa_, T_* g_mxYs_,
         T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_, bool applySilu_,
-        int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
+        int const* lastTokenIdsPtr_, int const* targetStateSlotMappingPtr_ = nullptr)
 {
     using namespace tensorrt_llm::common;
 
@@ -297,9 +297,9 @@ __global__
         L = lastTokenIdsPtr_[blockIdx.z];
     }
 
-    if (stateSlotMappingPtr_)
+    if (targetStateSlotMappingPtr_)
     {
-        sStart = stateSlotMappingPtr_[blockIdx.z] * (K_ - 1) * D_;
+        sStart = targetStateSlotMappingPtr_[blockIdx.z] * (K_ - 1) * D_;
     }
 
     if (lStart >= L)
@@ -521,7 +521,7 @@ __global__
 template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, bool aligned_, typename T_>
 __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(int B_, int L_, int D_, int S_pre_,
     int S_post_, T_* g_mxYa_, T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_,
-    bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
+    bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* targetStateSlotMappingPtr_ = nullptr)
 {
     static_assert(laneD_ >= 1 && laneD_ <= 32 && (laneD_ & (laneD_ - 1)) == 0);
 
@@ -580,9 +580,9 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
         L = lastTokenIdsPtr_[blockIdx.z];
     }
 
-    if (stateSlotMappingPtr_)
+    if (targetStateSlotMappingPtr_)
     {
-        sStart = stateSlotMappingPtr_[blockIdx.z] * (K_ - 1) * D_;
+        sStart = targetStateSlotMappingPtr_[blockIdx.z] * (K_ - 1) * D_;
     }
 
     if (lStart >= L)
@@ -804,7 +804,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
 
     void (*f)(int B_, int L_, int D_, int S_pre_, int S_post_, input_t* g_mxYa_, input_t* g_mxYs_,
         input_t const* g_mxXa_, input_t const* g_mxXs_, input_t const* g_mxW_, input_t const* g_mxB_,
-        bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_);
+        bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* targetStateSlotMappingPtr_);
 
     if (std::is_same_v<input_t, float>)
     {
@@ -1192,14 +1192,15 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     bool rmpd = params.remove_padding;
     bool silu = params.apply_silu;
     int const* ltip = params.last_token_ids_ptr;
-    int const* ssmp = params.state_slot_mapping_ptr;
+    int const* targetStateSlotMapping = params.target_state_slot_mapping_ptr;
 
     dim3 blks(D / tileD, (L + tileL - 1) / tileL, B);
     dim3 thds(32, warpD, warpL);
 
     cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
 
-    f<<<blks, thds, shmem, stream>>>(B, L, D, S_pre, S_post, ya, ys, xa, xs, w, b, rmpd, silu, ltip, ssmp);
+    f<<<blks, thds, shmem, stream>>>(
+        B, L, D, S_pre, S_post, ya, ys, xa, xs, w, b, rmpd, silu, ltip, targetStateSlotMapping);
 }
 
 template <typename input_t, int DCONV = 4>
@@ -1233,8 +1234,13 @@ __global__ void mamba_conv1d_strided_context_kernel(MambaConv1dParamsBase params
         sequenceLength = params.last_token_ids_ptr[sample];
     }
 
-    int const slot = params.state_slot_mapping_ptr == nullptr ? sample : params.state_slot_mapping_ptr[sample];
-    int64_t const stateBase = static_cast<int64_t>(slot) * params.state_slot_stride
+    int const sourceSlot
+        = params.source_state_slot_mapping_ptr == nullptr ? sample : params.source_state_slot_mapping_ptr[sample];
+    int const targetSlot
+        = params.target_state_slot_mapping_ptr == nullptr ? sample : params.target_state_slot_mapping_ptr[sample];
+    int64_t const sourceStateBase = static_cast<int64_t>(sourceSlot) * params.state_slot_stride
+        + static_cast<int64_t>(channel) * params.state_channel_stride;
+    int64_t const targetStateBase = static_cast<int64_t>(targetSlot) * params.state_slot_stride
         + static_cast<int64_t>(channel) * params.state_channel_stride;
     bool const hasInitialState = params.has_initial_state_ptr != nullptr && params.has_initial_state_ptr[sample] != 0;
 
@@ -1242,9 +1248,10 @@ __global__ void mamba_conv1d_strided_context_kernel(MambaConv1dParamsBase params
 #pragma unroll
     for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
     {
-        history[historyIdx] = hasInitialState ? tensorrt_llm::common::cuda_cast<float, input_t>(
-                                  stateIn[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride])
-                                              : 0.0F;
+        history[historyIdx] = hasInitialState
+            ? tensorrt_llm::common::cuda_cast<float, input_t>(
+                stateIn[sourceStateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride])
+            : 0.0F;
     }
 
     float const channelBias = tensorrt_llm::common::cuda_cast<float, input_t>(bias[channel]);
@@ -1279,7 +1286,7 @@ __global__ void mamba_conv1d_strided_context_kernel(MambaConv1dParamsBase params
 #pragma unroll
     for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
     {
-        stateOut[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]
+        stateOut[targetStateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]
             = tensorrt_llm::common::cuda_cast<input_t, float>(history[historyIdx]);
     }
 }
@@ -1302,8 +1309,13 @@ __global__ void mamba_conv1d_strided_generation_kernel(MambaConv1dParamsBase par
     auto* output = reinterpret_cast<input_t*>(params.out_ptr);
 
     int const inputChannels = params.dim + params.pre_stride + params.post_stride;
-    int const slot = params.state_slot_mapping_ptr == nullptr ? sample : params.state_slot_mapping_ptr[sample];
-    int64_t const stateBase = static_cast<int64_t>(slot) * params.state_slot_stride
+    int const sourceSlot
+        = params.source_state_slot_mapping_ptr == nullptr ? sample : params.source_state_slot_mapping_ptr[sample];
+    int const targetSlot
+        = params.target_state_slot_mapping_ptr == nullptr ? sample : params.target_state_slot_mapping_ptr[sample];
+    int64_t const sourceStateBase = static_cast<int64_t>(sourceSlot) * params.state_slot_stride
+        + static_cast<int64_t>(channel) * params.state_channel_stride;
+    int64_t const targetStateBase = static_cast<int64_t>(targetSlot) * params.state_slot_stride
         + static_cast<int64_t>(channel) * params.state_channel_stride;
 
     float history[DCONV - 1];
@@ -1311,7 +1323,7 @@ __global__ void mamba_conv1d_strided_generation_kernel(MambaConv1dParamsBase par
     for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
     {
         history[historyIdx] = tensorrt_llm::common::cuda_cast<float, input_t>(
-            stateIn[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]);
+            stateIn[sourceStateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]);
     }
     float const current = tensorrt_llm::common::cuda_cast<float, input_t>(
         input[static_cast<int64_t>(sample) * inputChannels + params.pre_stride + channel]);
@@ -1334,10 +1346,10 @@ __global__ void mamba_conv1d_strided_generation_kernel(MambaConv1dParamsBase par
 #pragma unroll
     for (int historyIdx = 0; historyIdx < DCONV - 2; ++historyIdx)
     {
-        stateOut[stateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]
+        stateOut[targetStateBase + static_cast<int64_t>(historyIdx) * params.state_history_stride]
             = tensorrt_llm::common::cuda_cast<input_t, float>(history[historyIdx + 1]);
     }
-    stateOut[stateBase + static_cast<int64_t>(DCONV - 2) * params.state_history_stride]
+    stateOut[targetStateBase + static_cast<int64_t>(DCONV - 2) * params.state_history_stride]
         = tensorrt_llm::common::cuda_cast<input_t, float>(current);
 }
 
@@ -1386,11 +1398,14 @@ __launch_bounds__(64, 8) __global__
     for (int sample = micro_batch * micro_batchsize; sample < min((micro_batch + 1) * micro_batchsize, params.batch);
          ++sample)
     {
-        int const slot_idx = params.state_slot_mapping_ptr == nullptr ? sample : params.state_slot_mapping_ptr[sample];
+        int const sourceSlot
+            = params.source_state_slot_mapping_ptr == nullptr ? sample : params.source_state_slot_mapping_ptr[sample];
+        int const targetSlot
+            = params.target_state_slot_mapping_ptr == nullptr ? sample : params.target_state_slot_mapping_ptr[sample];
         input_t* token_input = input + sample * num_channels_in;
         input_t* token_output = output + sample * params.dim;
-        input_t* token_state_in = state_in + slot_idx * (params.dconv - 1) * params.dim;
-        input_t* token_state_out = state_out + slot_idx * (params.dconv - 1) * params.dim;
+        input_t* token_state_in = state_in + sourceSlot * (params.dconv - 1) * params.dim;
+        input_t* token_state_out = state_out + targetSlot * (params.dconv - 1) * params.dim;
 #pragma unroll
         for (int i = 0; i < DCONV - 1; ++i)
         {

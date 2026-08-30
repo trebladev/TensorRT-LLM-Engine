@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,13 +105,15 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
 
         params.state_in_ptr = *reinterpret_cast<void**>(const_cast<void*>(conv_state.data_ptr()));
         params.state_out_ptr = *reinterpret_cast<void**>(const_cast<void*>(conv_state.data_ptr()));
-        params.state_slot_mapping_ptr = static_cast<int const*>(slot_mapping.value().const_data_ptr());
+        params.source_state_slot_mapping_ptr = static_cast<int const*>(slot_mapping.value().const_data_ptr());
+        params.target_state_slot_mapping_ptr = params.source_state_slot_mapping_ptr;
     }
     else
     {
         params.state_in_ptr = conv_state.data_ptr();
         params.state_out_ptr = state_out.data_ptr();
-        params.state_slot_mapping_ptr = nullptr;
+        params.source_state_slot_mapping_ptr = nullptr;
+        params.target_state_slot_mapping_ptr = nullptr;
     }
 
     c10::ScalarType dtype = input.scalar_type();

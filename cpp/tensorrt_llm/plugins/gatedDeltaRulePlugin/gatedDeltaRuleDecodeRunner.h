@@ -37,7 +37,8 @@ struct GatedDeltaRuleDecodeParams
     void* output;
     void* state;
     int64_t stateSlotStrideElements;
-    int32_t const* stateSlotMapping;
+    int32_t const* sourceStateSlotMapping;
+    int32_t const* targetStateSlotMapping;
     int32_t const* cuSeqLens;
     int32_t batchSize;
 };
