@@ -24,24 +24,31 @@ import tensorrt as trt
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (
+    ACT2FN,
     Tensor,
     cast,
     concat,
     exp,
     gather_last_token_logits,
+    matmul,
     shape,
     sigmoid,
+    softmax,
     softplus,
     split,
 )
+from ...functional import sum as reduce_sum
 from ...layers import (
     Attention,
     AttentionMaskType,
     ColumnLinear,
+    Conv3d,
     Embedding,
     GatedDeltaRule,
     GatedMLP,
     KeyValueCacheParams,
+    LayerNorm,
+    Linear,
     RmsNorm,
     RmsNormGate,
     RowLinear,
@@ -61,6 +68,216 @@ if TYPE_CHECKING:
 
 _BF16_ELEMENT_BYTES = 2
 _FP32_ELEMENT_BYTES = 4
+
+
+class Qwen35VisionPatchEmbed(Module):
+    """Convert flattened image or video patches into visual token embeddings."""
+
+    def __init__(self, config: Qwen35Config) -> None:
+        super().__init__()
+        self.in_channels = config.vision_in_channels
+        self.temporal_patch_size = config.vision_temporal_patch_size
+        self.patch_size = config.vision_patch_size
+        self.hidden_size = config.vision_hidden_size
+        kernel_size = (
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        self.proj = Conv3d(
+            in_channels=self.in_channels,
+            out_channels=self.hidden_size,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=True,
+            dtype=config.dtype,
+        )
+
+    def forward(self, pixel_values: Tensor) -> Tensor:
+        num_patches = shape(pixel_values, 0)
+        pixel_values = pixel_values.view(
+            concat(
+                [
+                    num_patches,
+                    self.in_channels,
+                    self.temporal_patch_size,
+                    self.patch_size,
+                    self.patch_size,
+                ]
+            )
+        )
+        patch_embeds = self.proj(cast(pixel_values, self.proj.weight.dtype))
+        return patch_embeds.view(concat([num_patches, self.hidden_size]))
+
+
+class Qwen35VisionMLP(Module):
+    def __init__(self, config: Qwen35Config) -> None:
+        super().__init__()
+        self.linear_fc1 = Linear(
+            config.vision_hidden_size,
+            config.vision_intermediate_size,
+            bias=True,
+            dtype=config.dtype,
+        )
+        self.linear_fc2 = Linear(
+            config.vision_intermediate_size,
+            config.vision_hidden_size,
+            bias=True,
+            dtype=config.dtype,
+        )
+        self.hidden_act = config.vision_hidden_act
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        hidden_states = self.linear_fc1(hidden_states)
+        hidden_states = ACT2FN[self.hidden_act](hidden_states)
+        return self.linear_fc2(hidden_states)
+
+
+class Qwen35VisionAttention(Module):
+    """Non-causal visual self-attention with externally prepared RoPE and mask."""
+
+    def __init__(self, config: Qwen35Config) -> None:
+        super().__init__()
+        self.hidden_size = config.vision_hidden_size
+        self.num_heads = config.vision_num_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scaling = self.head_dim**-0.5
+        self.qkv = Linear(
+            self.hidden_size,
+            self.hidden_size * 3,
+            bias=True,
+            dtype=config.dtype,
+        )
+        self.proj = Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=True,
+            dtype=config.dtype,
+        )
+
+    def _apply_rotary(
+        self,
+        query: Tensor,
+        key: Tensor,
+        rotary_cos: Tensor,
+        rotary_sin: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        query_dtype = query.dtype
+        key_dtype = key.dtype
+        query = cast(query, "float32")
+        key = cast(key, "float32")
+        rotary_cos = cast(rotary_cos.unsqueeze(-2), "float32")
+        rotary_sin = cast(rotary_sin.unsqueeze(-2), "float32")
+        query_first, query_second = split(query, [self.head_dim // 2, self.head_dim // 2], dim=-1)
+        key_first, key_second = split(key, [self.head_dim // 2, self.head_dim // 2], dim=-1)
+        rotated_query = concat([-1.0 * query_second, query_first], dim=-1)
+        rotated_key = concat([-1.0 * key_second, key_first], dim=-1)
+        query = query * rotary_cos + rotated_query * rotary_sin
+        key = key * rotary_cos + rotated_key * rotary_sin
+        return cast(query, query_dtype), cast(key, key_dtype)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        rotary_cos: Tensor,
+        rotary_sin: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        num_tokens = shape(hidden_states, 0)
+        qkv = self.qkv(hidden_states).view(concat([num_tokens, 3, self.num_heads, self.head_dim]))
+        query, key, value = qkv.permute([1, 0, 2, 3]).unbind(0)
+        query, key = self._apply_rotary(query, key, rotary_cos, rotary_sin)
+        query = query.transpose(0, 1).unsqueeze(0)
+        key = key.transpose(0, 1).unsqueeze(0)
+        value = value.transpose(0, 1).unsqueeze(0)
+
+        attention_scores = matmul(query, key, transb=True) * self.scaling
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+        attention_probs = cast(softmax(cast(attention_scores, "float32"), dim=-1), query.dtype)
+        context = matmul(attention_probs, value)
+        context = context.transpose(1, 2).view(concat([num_tokens, self.hidden_size]))
+        return self.proj(context)
+
+
+class Qwen35VisionBlock(Module):
+    def __init__(self, config: Qwen35Config) -> None:
+        super().__init__()
+        self.norm1 = LayerNorm(config.vision_hidden_size, eps=1e-6, dtype=config.dtype)
+        self.norm2 = LayerNorm(config.vision_hidden_size, eps=1e-6, dtype=config.dtype)
+        self.attn = Qwen35VisionAttention(config)
+        self.mlp = Qwen35VisionMLP(config)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        rotary_cos: Tensor,
+        rotary_sin: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states), rotary_cos, rotary_sin, attention_mask
+        )
+        return hidden_states + self.mlp(self.norm2(hidden_states))
+
+
+class Qwen35VisionPatchMerger(Module):
+    def __init__(self, config: Qwen35Config) -> None:
+        super().__init__()
+        self.hidden_size = config.vision_hidden_size * config.vision_spatial_merge_size**2
+        self.norm = LayerNorm(config.vision_hidden_size, eps=1e-6, dtype=config.dtype)
+        self.linear_fc1 = Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=True,
+            dtype=config.dtype,
+        )
+        self.linear_fc2 = Linear(
+            self.hidden_size,
+            config.vision_output_hidden_size,
+            bias=True,
+            dtype=config.dtype,
+        )
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states.view(concat([-1, self.hidden_size]))
+        hidden_states = ACT2FN["gelu"](self.linear_fc1(hidden_states))
+        return self.linear_fc2(hidden_states)
+
+
+class Qwen35VisionModel(Module):
+    """Qwen3.5 vision tower with host-precomputed position metadata."""
+
+    def __init__(self, config: Qwen35Config) -> None:
+        super().__init__()
+        self.patch_embed = Qwen35VisionPatchEmbed(config)
+        self.pos_embed = Embedding(
+            config.vision_num_position_embeddings,
+            config.vision_hidden_size,
+            dtype=config.dtype,
+        )
+        self.blocks = ModuleList([Qwen35VisionBlock(config) for _ in range(config.vision_depth)])
+        self.merger = Qwen35VisionPatchMerger(config)
+
+    def forward(
+        self,
+        pixel_values: Tensor,
+        position_ids: Tensor,
+        position_weights: Tensor,
+        rotary_cos: Tensor,
+        rotary_sin: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        hidden_states = self.patch_embed(pixel_values)
+        position_embeds = self.pos_embed(position_ids)
+        position_embeds = position_embeds * cast(
+            position_weights.unsqueeze(-1), position_embeds.dtype
+        )
+        hidden_states = hidden_states + reduce_sum(position_embeds, dim=0)
+        for block in self.blocks:
+            hidden_states = block(hidden_states, rotary_cos, rotary_sin, attention_mask)
+        return hidden_states, self.merger(hidden_states)
 
 
 class _AttentionGate:
@@ -429,8 +646,16 @@ class Qwen35Model(Module):
         source_state_slot_mapping,
         target_state_slot_mapping,
         host_has_initial_state,
+        prompt_embedding_table: Tensor | None = None,
+        prompt_tasks: Tensor | None = None,
+        prompt_vocab_size: Tensor | None = None,
     ):
-        hidden_states = self.vocab_embedding(input_ids)
+        prompt_tuning_args = (
+            [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
+            if prompt_embedding_table is not None
+            else []
+        )
+        hidden_states = self.vocab_embedding(input_ids, *prompt_tuning_args)
         kv_cache_params.fill_none_tensor_list(
             sum(layer.layer_type == "full_attention" for layer in self.layers)
         )
@@ -507,6 +732,7 @@ class Qwen35ForCausalLM(PretrainedModel):
         ]
         Attention.create_attention_const_params(self, config)
         self.position_embedding_type = config.position_embedding_type
+        self.visual = Qwen35VisionModel(config) if config.has_vision else None
         self.transformer = Qwen35Model(config)
         self.lm_head = ColumnLinear(
             config.hidden_size,
@@ -535,6 +761,9 @@ class Qwen35ForCausalLM(PretrainedModel):
         source_state_slot_mapping=None,
         target_state_slot_mapping=None,
         host_has_initial_state=None,
+        prompt_embedding_table: Tensor | None = None,
+        prompt_tasks: Tensor | None = None,
+        prompt_vocab_size: Tensor | None = None,
     ):
         del position_ids
         attention_params = Attention.fill_attention_params(self, attention_params)
@@ -554,6 +783,9 @@ class Qwen35ForCausalLM(PretrainedModel):
             source_state_slot_mapping,
             target_state_slot_mapping,
             host_has_initial_state,
+            prompt_embedding_table,
+            prompt_tasks,
+            prompt_vocab_size,
         )
         if not self.gather_context_logits:
             hidden_states = gather_last_token_logits(
@@ -700,10 +932,10 @@ class Qwen35ForCausalLM(PretrainedModel):
             raise ValueError(
                 "The initial Qwen3.5 implementation does not support variable generation lengths"
             )
-        if prompt_embedding_table_size != 0 or position_encoding_2d or lora_target_modules:
-            raise ValueError(
-                "The initial Qwen3.5 implementation does not support prompt tuning or LoRA"
-            )
+        if lora_target_modules:
+            raise ValueError("The initial Qwen3.5 implementation does not support LoRA")
+        if position_encoding_2d:
+            raise ValueError("The initial Qwen3.5 implementation does not support 2D positions")
         if not default_net().plugin_config.remove_input_padding:
             raise ValueError("Qwen3.5 GatedDeltaRule currently requires remove_input_padding=true")
         if not default_net().plugin_config.mamba_conv1d_plugin:
@@ -726,6 +958,7 @@ class Qwen35ForCausalLM(PretrainedModel):
             use_cache=use_cache,
             max_beam_width=max_beam_width,
             opt_num_tokens=opt_num_tokens,
+            prompt_embedding_table_size=prompt_embedding_table_size,
             max_draft_len=max_draft_len,
             gather_context_logits=gather_context_logits,
             opt_batch_size=opt_batch_size,
@@ -754,6 +987,13 @@ class Qwen35ForCausalLM(PretrainedModel):
             multiple_profiles=default_net().plugin_config.multiple_profiles,
             kv_cache_type=kv_cache_type,
         )
+        if result["last_token_ids"] is None:
+            result["last_token_ids"] = Tensor(
+                name="last_token_ids",
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([("batch_size_last_token_ids", ranges["bbd_range"])]),
+            )
         recurrent_inputs = self._prepare_recurrent_inputs(num_profiles, ranges["bb_range"])
         result.update(recurrent_inputs)
         result["host_request_types"] = result["attention_params"].host_request_types
@@ -768,7 +1008,7 @@ class Qwen35ForCausalLM(PretrainedModel):
         quant_config: QuantConfig | None = None,
         **kwargs,
     ) -> "Qwen35ForCausalLM":
-        """Create and load the dense text-only Qwen3.5 TensorRT-LLM model."""
+        """Create and load the dense Qwen3.5 TensorRT-LLM model."""
         import transformers
 
         if isinstance(hf_model_or_dir, transformers.PreTrainedModel):

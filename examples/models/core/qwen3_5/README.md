@@ -3,12 +3,13 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Qwen3.5 Dense Text Model
+# Qwen3.5 Dense Model
 
 > [!WARNING]
 > The `convert_checkpoint.py` and `trtllm-build` workflow is part of the legacy
-> TensorRT engine backend. This initial Qwen3.5 implementation is intentionally
-> limited to dense text-only BF16 inference with TP=1 or TP=2.
+> TensorRT engine backend. This initial Qwen3.5 implementation is limited to
+> dense BF16 inference with TP=1 or TP=2. Multimodal execution uses a separate
+> TensorRT vision engine and the prompt-tuning input path.
 
 This directory contains the checkpoint conversion entry point for the dedicated
 Qwen3.5 TensorRT graph in
@@ -31,7 +32,7 @@ full-attention layers with gated-delta linear-attention layers.
 | Prefix cache / block reuse | Supported for full-attention KV and gated-delta recurrent state with beam width 1 |
 | Mixed prefill and decode batch | Not supported |
 | Quantization | Not supported |
-| Vision inputs | Not supported; vision weights are ignored during conversion |
+| Vision inputs | Supported for batch-1 image input by `multimodal_demo.py` |
 | Standard legacy runtime/generation | Supported through `ModelRunnerCpp` |
 | Speculative decoding, disaggregated serving, and offload | Not supported |
 
@@ -127,7 +128,9 @@ The converter applies the following Qwen3.5-specific transformations:
   projections.
 - It maps Hugging Face `gate_proj`, `up_proj`, and `down_proj` to the TensorRT
   LLM gated-MLP `fc`, `gate`, and `proj` weights, respectively.
-- It ignores the vision tower and converts only `model.language_model`.
+- It maps both `model.visual` and `model.language_model` weights. The standard
+  checkpoint still stores the converted vision weights even though
+  `trtllm-build` builds only the LLM engine from it.
 
 The script rejects parallel configurations other than TP=1 or TP=2, PP=1, and
 CP=1.
@@ -177,6 +180,64 @@ weights and activation workspace.
 For standard runtime generation, build with paged KV cache (the default). The
 runtime allocates both attention KV blocks and gated-delta recurrent-state
 blocks through the KV cache manager.
+
+## Multimodal image demo
+
+`multimodal_demo.py` connects the Hugging Face processor, a TensorRT vision
+engine, Qwen3.5 MRoPE preparation, request-local fake token IDs, the prompt
+embedding table, and `ModelRunnerCpp`. It also compares:
+
+- The TensorRT and Hugging Face pooled vision embeddings.
+- The TensorRT and Hugging Face logits for the last context token, including
+  cosine similarity and top-k tokens.
+
+The initial demo supports one local image and runtime batch size 1. It builds
+and caches the vision engine on its first run. The LLM engine must enable prompt
+tuning and context logits. For example, build an engine with room for up to
+4,096 total prompt-table rows:
+
+```bash
+examples/models/core/qwen3_5/build.sh \
+    /path/to/qwen3_5_bf16_tp1 \
+    /path/to/qwen3_5_multimodal_engine \
+    --max_prompt_embedding_table_size 4096 \
+    --gather_context_logits
+```
+
+Run the end-to-end demo and make the HF comparison enforce its default
+thresholds:
+
+```bash
+examples/models/core/qwen3_5/run_multimodal_demo.sh \
+    /path/to/Qwen3.5-2B \
+    /path/to/qwen3_5_multimodal_engine \
+    /path/to/qwen3_5_vision_engine \
+    /path/to/image.jpg \
+    --prompt "Describe this image in detail." \
+    --check
+```
+
+The wrapper loads the source-built TensorRT-LLM plugin and shared libraries used
+by `build.sh`. Set `QWEN35_PLUGIN_LIB` when the plugin is in another location.
+It exits without normal Python runtime cleanup after printing the result to
+avoid an ABI-specific destructor failure when the source bindings and installed
+TensorRT Python package use different minor versions.
+
+The demo defaults to `min_pixels=3,136` and `max_pixels=200,704` so that the
+Hugging Face eager-attention reference fits on a typical development GPU. Pass
+`--min_pixels` and `--max_pixels` to change the processor's resize bounds.
+Larger images increase vision attention memory quadratically.
+
+By default, a newly built vision engine is profiled for the current image's
+pre-merge patch-token count. Pass `--max_vision_tokens N` when building it if
+the cache should accept larger later images, or pass
+`--rebuild_vision_engine` to replace an existing profile.
+
+The LLM prompt-table capacity is measured after spatial merging. For batch size
+`B` and at most `V` visual tokens per request, build with
+`--max_prompt_embedding_table_size >= B * V`. The demo reports both the
+pre-merge patch-token count and the merged prompt-token count and fails with a
+rebuild hint when the cached vision profile or LLM prompt table is too small.
 
 ## Prefix-cache validation demo
 

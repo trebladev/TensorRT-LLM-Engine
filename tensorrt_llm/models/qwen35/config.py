@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class Qwen35Config(PretrainedConfig):
-    """Configuration for the dense, text-only Qwen3.5 TensorRT graph."""
+    """Configuration for the dense Qwen3.5 TensorRT graph."""
 
     def __init__(
         self,
@@ -46,6 +46,22 @@ class Qwen35Config(PretrainedConfig):
         linear_num_value_heads: int = 32,
         gated_delta_chunk_size: int = 64,
         state_dtype: str = "float32",
+        vision_depth: int | None = None,
+        vision_hidden_size: int | None = None,
+        vision_intermediate_size: int | None = None,
+        vision_num_heads: int | None = None,
+        vision_in_channels: int | None = None,
+        vision_patch_size: int | None = None,
+        vision_temporal_patch_size: int | None = None,
+        vision_spatial_merge_size: int | None = None,
+        vision_num_position_embeddings: int | None = None,
+        vision_output_hidden_size: int | None = None,
+        vision_hidden_act: str | None = None,
+        vision_deepstack_visual_indexes: list[int] | None = None,
+        image_token_id: int | None = None,
+        video_token_id: int | None = None,
+        vision_start_token_id: int | None = None,
+        vision_end_token_id: int | None = None,
         **kwargs,
     ) -> None:
         layer_type_map = {
@@ -71,6 +87,22 @@ class Qwen35Config(PretrainedConfig):
         self.linear_num_value_heads = linear_num_value_heads
         self.gated_delta_chunk_size = gated_delta_chunk_size
         self.state_dtype = state_dtype
+        self.vision_depth = vision_depth
+        self.vision_hidden_size = vision_hidden_size
+        self.vision_intermediate_size = vision_intermediate_size
+        self.vision_num_heads = vision_num_heads
+        self.vision_in_channels = vision_in_channels
+        self.vision_patch_size = vision_patch_size
+        self.vision_temporal_patch_size = vision_temporal_patch_size
+        self.vision_spatial_merge_size = vision_spatial_merge_size
+        self.vision_num_position_embeddings = vision_num_position_embeddings
+        self.vision_output_hidden_size = vision_output_hidden_size
+        self.vision_hidden_act = vision_hidden_act
+        self.vision_deepstack_visual_indexes = list(vision_deepstack_visual_indexes or [])
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
 
         super().__init__(**kwargs)
 
@@ -119,11 +151,50 @@ class Qwen35Config(PretrainedConfig):
             raise ValueError("The GatedDeltaRule plugin currently requires chunk_size=64")
         if not self.mrope_interleaved:
             raise ValueError("Qwen3.5 requires interleaved MRoPE")
+        if len(self.mrope_section) != 3:
+            raise ValueError(
+                f"Qwen3.5 mrope_section must contain temporal, height, and width sizes, got {self.mrope_section}"
+            )
         if sum(self.mrope_section) * 2 != self.rotary_embedding_dim:
             raise ValueError(
                 "Twice the sum of mrope_section must equal rotary_embedding_dim, "
                 f"got {self.mrope_section} and {self.rotary_embedding_dim}"
             )
+        if self.has_vision:
+            required_vision_fields = {
+                "vision_hidden_size": self.vision_hidden_size,
+                "vision_intermediate_size": self.vision_intermediate_size,
+                "vision_num_heads": self.vision_num_heads,
+                "vision_in_channels": self.vision_in_channels,
+                "vision_patch_size": self.vision_patch_size,
+                "vision_temporal_patch_size": self.vision_temporal_patch_size,
+                "vision_spatial_merge_size": self.vision_spatial_merge_size,
+                "vision_num_position_embeddings": self.vision_num_position_embeddings,
+                "vision_output_hidden_size": self.vision_output_hidden_size,
+                "vision_hidden_act": self.vision_hidden_act,
+            }
+            missing_vision_fields = [
+                name for name, value in required_vision_fields.items() if value is None
+            ]
+            if missing_vision_fields:
+                raise ValueError(
+                    f"A Qwen3.5 vision config is missing required fields: {missing_vision_fields}"
+                )
+            if self.vision_hidden_size % self.vision_num_heads != 0:
+                raise ValueError(
+                    "vision_hidden_size must be divisible by vision_num_heads, "
+                    f"got {self.vision_hidden_size} and {self.vision_num_heads}"
+                )
+            if self.vision_output_hidden_size != self.hidden_size:
+                raise ValueError(
+                    "vision_output_hidden_size must match the text hidden_size, "
+                    f"got {self.vision_output_hidden_size} and {self.hidden_size}"
+                )
+
+    @property
+    def has_vision(self) -> bool:
+        """Whether this config contains a Qwen3.5 vision tower."""
+        return self.vision_depth is not None
 
     @classmethod
     def from_hugging_face(
@@ -145,8 +216,10 @@ class Qwen35Config(PretrainedConfig):
                 str(hf_config_or_dir), trust_remote_code=trust_remote_code
             )
 
-        if hasattr(hf_config, "text_config"):
-            hf_config = hf_config.text_config
+        multimodal_config = hf_config
+        vision_config = getattr(multimodal_config, "vision_config", None)
+        if hasattr(multimodal_config, "text_config"):
+            hf_config = multimodal_config.text_config
         if hf_config.model_type != "qwen3_5_text":
             raise ValueError(
                 f"Expected a Qwen3.5 text config, got model_type={hf_config.model_type!r}"
@@ -202,6 +275,24 @@ class Qwen35Config(PretrainedConfig):
             linear_num_value_heads=hf_config.linear_num_value_heads,
             gated_delta_chunk_size=64,
             state_dtype="float32",
+            vision_depth=getattr(vision_config, "depth", None),
+            vision_hidden_size=getattr(vision_config, "hidden_size", None),
+            vision_intermediate_size=getattr(vision_config, "intermediate_size", None),
+            vision_num_heads=getattr(vision_config, "num_heads", None),
+            vision_in_channels=getattr(vision_config, "in_channels", None),
+            vision_patch_size=getattr(vision_config, "patch_size", None),
+            vision_temporal_patch_size=getattr(vision_config, "temporal_patch_size", None),
+            vision_spatial_merge_size=getattr(vision_config, "spatial_merge_size", None),
+            vision_num_position_embeddings=getattr(vision_config, "num_position_embeddings", None),
+            vision_output_hidden_size=getattr(vision_config, "out_hidden_size", None),
+            vision_hidden_act=getattr(vision_config, "hidden_act", None),
+            vision_deepstack_visual_indexes=getattr(
+                vision_config, "deepstack_visual_indexes", None
+            ),
+            image_token_id=getattr(multimodal_config, "image_token_id", None),
+            video_token_id=getattr(multimodal_config, "video_token_id", None),
+            vision_start_token_id=getattr(multimodal_config, "vision_start_token_id", None),
+            vision_end_token_id=getattr(multimodal_config, "vision_end_token_id", None),
             mapping=mapping,
             quantization=quant_config,
             tie_word_embeddings=hf_config.tie_word_embeddings,

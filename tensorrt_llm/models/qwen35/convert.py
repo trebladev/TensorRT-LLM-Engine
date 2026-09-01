@@ -29,9 +29,9 @@ if TYPE_CHECKING:
     import transformers
 
 
-def _normalize_hf_name(name: str) -> str | None:
-    if name.startswith("model.visual.") or name.startswith("visual."):
-        return None
+def _normalize_hf_name(name: str) -> str:
+    if name.startswith("model.visual."):
+        return "visual." + name.removeprefix("model.visual.")
     if name.startswith("model.language_model."):
         return "model." + name.removeprefix("model.language_model.")
     if name.startswith("language_model."):
@@ -119,8 +119,10 @@ def _convert_parameter(
     name: str, param: torch.Tensor, config: Qwen35Config
 ) -> dict[str, torch.Tensor]:
     name = _normalize_hf_name(name)
-    if name is None:
-        return {}
+    if name.startswith("visual."):
+        if not config.has_vision:
+            return {}
+        return {name: _to_bfloat16(param)}
 
     if name == "model.embed_tokens.weight":
         return {"transformer.vocab_embedding.weight": _to_bfloat16(param)}
@@ -244,7 +246,11 @@ def convert_hf_qwen35(
     weights: dict[str, torch.Tensor] = {}
     for name, param in state_dict.items():
         weights.update(_convert_parameter(name, param, config))
-    if "lm_head.weight" not in weights and config.tie_word_embeddings:
+    if (
+        "lm_head.weight" not in weights
+        and config.tie_word_embeddings
+        and "transformer.vocab_embedding.weight" in weights
+    ):
         weights["lm_head.weight"] = _convert_lm_head(
             weights["transformer.vocab_embedding.weight"].clone(), config
         )
@@ -261,7 +267,11 @@ def load_weights_from_hf_checkpoint(
         for name, param in state_dict.items():
             weights.update(_convert_parameter(name, param, config))
         del state_dict
-    if "lm_head.weight" not in weights and config.tie_word_embeddings:
+    if (
+        "lm_head.weight" not in weights
+        and config.tie_word_embeddings
+        and "transformer.vocab_embedding.weight" in weights
+    ):
         weights["lm_head.weight"] = _convert_lm_head(
             weights["transformer.vocab_embedding.weight"].clone(), config
         )

@@ -14,16 +14,22 @@
 # limitations under the License.
 
 import json
+import math
 from pathlib import Path
 
 import pytest
+import tensorrt as trt
 import torch
 from safetensors import safe_open
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm import Builder
+from tensorrt_llm.functional import Tensor
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.qwen35.config import Qwen35Config
 from tensorrt_llm.models.qwen35.convert import convert_hf_qwen35
+from tensorrt_llm.models.qwen35.model import Qwen35ForCausalLM, Qwen35VisionModel
+from tensorrt_llm.network import net_guard
 
 _MODEL_DIR_NAMES = ("Qwen3.5-2B", "Qwen3.5/Qwen3.5-2B")
 _EMBEDDING_KEY = "model.language_model.embed_tokens.weight"
@@ -75,6 +81,109 @@ def test_qwen35_layer_types_use_linear_classification() -> None:
     )
 
     assert config.layer_types == ["linear", "linear", "linear", "attention"]
+    assert not config.has_vision
+
+
+def _small_qwen35_config(mapping: Mapping | None = None) -> Qwen35Config:
+    return Qwen35Config(
+        architecture="Qwen35ForCausalLM",
+        dtype="bfloat16",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_size=8,
+        vocab_size=128,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        norm_epsilon=1e-6,
+        tie_word_embeddings=True,
+        rotary_embedding_dim=8,
+        mrope_section=[1, 1, 2],
+        decoder_layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+        vision_depth=2,
+        vision_hidden_size=16,
+        vision_intermediate_size=32,
+        vision_num_heads=4,
+        vision_in_channels=3,
+        vision_patch_size=2,
+        vision_temporal_patch_size=2,
+        vision_spatial_merge_size=2,
+        vision_num_position_embeddings=16,
+        vision_output_hidden_size=32,
+        vision_hidden_act="gelu_pytorch_tanh",
+        image_token_id=120,
+        video_token_id=121,
+        vision_start_token_id=122,
+        vision_end_token_id=123,
+        mapping=mapping,
+    )
+
+
+def test_qwen35_vision_parameter_names_and_conversion() -> None:
+    config = _small_qwen35_config()
+    vision_model = Qwen35VisionModel(config)
+    target_parameters = {
+        f"visual.{name}": parameter for name, parameter in vision_model.named_parameters()
+    }
+    source = {
+        f"model.{name}": torch.arange(math.prod(parameter.shape), dtype=torch.float32).reshape(
+            parameter.shape
+        )
+        for name, parameter in target_parameters.items()
+    }
+
+    converted = convert_hf_qwen35(source, config)
+    assert set(converted) == set(target_parameters)
+    for source_name, source_tensor in source.items():
+        target_name = source_name.removeprefix("model.")
+        expected = source_tensor.to(torch.bfloat16)
+        _assert_exact(converted[target_name], expected)
+        assert converted[target_name].device.type == "cpu"
+        assert converted[target_name].is_contiguous()
+
+    tp2_config = _small_qwen35_config(Mapping(world_size=2, rank=1, tp_size=2))
+    tp2_converted = convert_hf_qwen35(source, tp2_config)
+    for name in converted:
+        _assert_exact(tp2_converted[name], converted[name])
+
+    model = Qwen35ForCausalLM(config)
+    assert isinstance(model.visual, Qwen35VisionModel)
+    assert dict(model.named_parameters())["visual.patch_embed.proj.weight"].shape == (
+        16,
+        3,
+        2,
+        2,
+        2,
+    )
+
+
+def test_qwen35_vision_graph_construction() -> None:
+    model = Qwen35VisionModel(_small_qwen35_config())
+    network = Builder().create_network()
+    with net_guard(network):
+        network.set_named_parameters(model.named_parameters())
+        hidden_states, merged_hidden_states = model(
+            Tensor(name="pixel_values", dtype=trt.bfloat16, shape=[8, 24]),
+            Tensor(name="position_ids", dtype=trt.int32, shape=[4, 8]),
+            Tensor(name="position_weights", dtype=trt.bfloat16, shape=[4, 8]),
+            Tensor(name="rotary_cos", dtype=trt.bfloat16, shape=[8, 4]),
+            Tensor(name="rotary_sin", dtype=trt.bfloat16, shape=[8, 4]),
+            Tensor(
+                name="vision_attention_mask",
+                dtype=trt.bfloat16,
+                shape=[1, 1, 8, 8],
+            ),
+        )
+
+    assert hidden_states.shape == (8, 16)
+    assert merged_hidden_states.shape == (2, 32)
 
 
 @pytest.fixture(scope="module")
@@ -93,6 +202,20 @@ def qwen35_checkpoint_dir() -> Path:
     assert (model_dir / "config.json").is_file()
     assert (model_dir / "model.safetensors.index.json").is_file()
     return model_dir
+
+
+def test_qwen35_checkpoint_vision_parameter_names(qwen35_checkpoint_dir: Path) -> None:
+    config = Qwen35Config.from_hugging_face(qwen35_checkpoint_dir)
+    vision_model = Qwen35VisionModel(config)
+    model_names = {f"visual.{name}" for name, _ in vision_model.named_parameters()}
+    index_path = qwen35_checkpoint_dir / "model.safetensors.index.json"
+    checkpoint_names = {
+        name.removeprefix("model.")
+        for name in json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+        if name.startswith("model.visual.")
+    }
+
+    assert checkpoint_names == model_names
 
 
 def _load_checkpoint_tensors(model_dir: Path) -> dict[str, torch.Tensor]:
@@ -144,6 +267,23 @@ def test_qwen35_checkpoint_source_dtypes(
     assert config.decoder_layer_types[3] == "full_attention"
     assert config.layer_types[0] == "linear"
     assert config.layer_types[3] == "attention"
+    assert config.has_vision
+    assert config.vision_depth == 24
+    assert config.vision_hidden_size == 1024
+    assert config.vision_intermediate_size == 4096
+    assert config.vision_num_heads == 16
+    assert config.vision_in_channels == 3
+    assert config.vision_patch_size == 16
+    assert config.vision_temporal_patch_size == 2
+    assert config.vision_spatial_merge_size == 2
+    assert config.vision_num_position_embeddings == 2304
+    assert config.vision_output_hidden_size == config.hidden_size
+    assert config.vision_hidden_act == "gelu_pytorch_tanh"
+    assert config.vision_deepstack_visual_indexes == []
+    assert config.image_token_id == 248056
+    assert config.video_token_id == 248057
+    assert config.vision_start_token_id == 248053
+    assert config.vision_end_token_id == 248054
 
     source_fp32_keys = {
         "model.language_model.layers.0.linear_attn.norm.weight",
@@ -189,6 +329,7 @@ def test_convert_real_qwen35_checkpoint_dtypes_and_values(
         "transformer.layers.3.attention.dense.proj.weight",
         "transformer.layers.3.attention.qkv.query_norm.weight",
         "transformer.layers.3.attention.qkv.key_norm.weight",
+        "visual.blocks.0.norm1.weight",
     }
     assert set(converted) == expected_keys
 
@@ -289,6 +430,7 @@ def test_convert_real_qwen35_checkpoint_dtypes_and_values(
         "model.language_model.layers.3.self_attn.o_proj.weight": (
             "transformer.layers.3.attention.dense.proj.weight"
         ),
+        _VISION_KEY: "visual.blocks.0.norm1.weight",
     }
     for source_key, target_key in passthrough_weights.items():
         _assert_exact(converted[target_key], source[source_key])
@@ -300,7 +442,6 @@ def test_convert_real_qwen35_checkpoint_dtypes_and_values(
         converted["lm_head.weight"].data_ptr()
         != converted["transformer.vocab_embedding.weight"].data_ptr()
     )
-    assert _VISION_KEY not in converted
 
 
 def _merge_gdn_qkv_shards(

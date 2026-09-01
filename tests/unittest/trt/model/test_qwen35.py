@@ -467,7 +467,7 @@ def test_qwen35_tp2_model_uses_local_attention_and_gdn_dimensions(
         vocab_size=32_000,
         max_position_embeddings=1024,
         rotary_embedding_dim=64,
-        mrope_section=[16, 16],
+        mrope_section=[11, 11, 10],
         decoder_layer_types=["linear_attention", "full_attention"],
         linear_key_head_dim=32,
         linear_value_head_dim=32,
