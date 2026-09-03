@@ -7,20 +7,25 @@ import argparse
 import gc
 import json
 import os
+import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import tensorrt as trt
 import torch
 from PIL import Image
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+from transformers.video_utils import VideoMetadata
 
 from tensorrt_llm import Builder
 from tensorrt_llm._common import serialize_engine
 from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from tensorrt_llm.functional import Tensor
+from tensorrt_llm.inputs.multimodal import apply_mm_hashes, hexdigest_to_int32
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.layers.attention import MropeParams
 from tensorrt_llm.models.qwen35.config import Qwen35Config
 from tensorrt_llm.models.qwen35.convert import convert_hf_qwen35
@@ -28,6 +33,7 @@ from tensorrt_llm.models.qwen35.model import Qwen35VisionModel
 from tensorrt_llm.models.qwen35.vision_utils import (
     prepare_qwen35_executor_prompt_inputs,
     prepare_qwen35_mrope_inputs,
+    prepare_qwen35_multimodal_cache_input,
     prepare_qwen35_vision_position_inputs,
 )
 from tensorrt_llm.network import net_guard
@@ -38,6 +44,7 @@ _VISION_ENGINE_NAME = "rank0.engine"
 _VISION_CONFIG_NAME = "config.json"
 _DEFAULT_MIN_PIXELS = 4 * 28 * 28
 _DEFAULT_MAX_PIXELS = 256 * 28 * 28
+_DEFAULT_VIDEO_NUM_FRAMES = 0
 
 
 @dataclass(frozen=True)
@@ -47,21 +54,44 @@ class Comparison:
     max_absolute_error: float
 
 
+@dataclass(frozen=True)
+class DecodedVideo:
+    frames: torch.Tensor
+    metadata: VideoMetadata
+
+
+@dataclass(frozen=True)
+class CacheObservation:
+    request_reused_blocks: int
+    request_hit_rate: float
+    cumulative_reused_blocks: int
+    cumulative_hit_rate: float
+    tokens_per_block: int
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run an image through the Qwen3.5 TensorRT vision and LLM engines, "
+            "Run an image or video through the Qwen3.5 TensorRT vision and LLM engines, "
             "then compare vision embeddings and context logits with Hugging Face."
         )
     )
     parser.add_argument("--model_dir", type=Path, required=True)
     parser.add_argument("--llm_engine_dir", type=Path, required=True)
     parser.add_argument("--vision_engine_dir", type=Path, required=True)
-    parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--prompt", default="Describe this image in detail.")
+    media_group = parser.add_mutually_exclusive_group(required=True)
+    media_group.add_argument("--image", type=Path)
+    media_group.add_argument("--video", type=Path)
+    parser.add_argument("--prompt")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--min_pixels", type=int, default=_DEFAULT_MIN_PIXELS)
     parser.add_argument("--max_pixels", type=int, default=_DEFAULT_MAX_PIXELS)
+    parser.add_argument(
+        "--video_num_frames",
+        type=int,
+        default=_DEFAULT_VIDEO_NUM_FRAMES,
+        help="Number of frames to sample uniformly with ffmpeg; use 0 to decode every frame.",
+    )
     parser.add_argument(
         "--max_vision_tokens",
         type=int,
@@ -79,6 +109,23 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--vision_workspace_gb", type=int, default=12)
     parser.add_argument("--vision_builder_optimization_level", type=int, default=0)
     parser.add_argument("--kv_cache_free_gpu_memory_fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--kv_cache_enable_block_reuse",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable content-aware LLM prefix-cache reuse for the visual prompt.",
+    )
+    parser.add_argument(
+        "--prefix_cache_requests",
+        type=int,
+        default=2,
+        help="Number of identical LLM requests to issue when block reuse is enabled.",
+    )
+    parser.add_argument(
+        "--enable_chunked_context",
+        action="store_true",
+        help="Split long prompts across multiple context-phase executor iterations.",
+    )
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument(
         "--check",
@@ -95,14 +142,18 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Hugging Face model directory does not exist: {args.model_dir}")
     if not args.llm_engine_dir.is_dir():
         raise FileNotFoundError(f"LLM engine directory does not exist: {args.llm_engine_dir}")
-    if not args.image.is_file():
+    if args.image is not None and not args.image.is_file():
         raise FileNotFoundError(f"Image does not exist: {args.image}")
+    if args.video is not None and not args.video.is_file():
+        raise FileNotFoundError(f"Video does not exist: {args.video}")
     if args.max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
     if args.min_pixels <= 0 or args.max_pixels <= 0:
         raise ValueError("min_pixels and max_pixels must be positive")
     if args.min_pixels > args.max_pixels:
         raise ValueError("min_pixels must not exceed max_pixels")
+    if args.video_num_frames < 0:
+        raise ValueError("video_num_frames must be non-negative")
     if args.max_vision_tokens is not None and args.max_vision_tokens <= 0:
         raise ValueError("max_vision_tokens must be positive")
     if args.vision_workspace_gb <= 0:
@@ -111,11 +162,34 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise ValueError("vision_builder_optimization_level must be between 0 and 5")
     if not 0 < args.kv_cache_free_gpu_memory_fraction <= 1:
         raise ValueError("kv_cache_free_gpu_memory_fraction must be in (0, 1]")
+    if args.prefix_cache_requests <= 0:
+        raise ValueError("prefix_cache_requests must be positive")
+    if args.kv_cache_enable_block_reuse and args.prefix_cache_requests < 2:
+        raise ValueError("prefix_cache_requests must be at least 2 when block reuse is enabled")
     if args.top_k <= 0:
         raise ValueError("top_k must be positive")
 
 
-def _prepare_processor_inputs(
+def _validate_processor_inputs(
+    inputs: dict[str, object],
+    required_inputs: set[str],
+    modality: str,
+) -> dict[str, torch.Tensor]:
+    tensor_inputs = {
+        name: value for name, value in inputs.items() if isinstance(value, torch.Tensor)
+    }
+    missing_inputs = sorted(required_inputs - tensor_inputs.keys())
+    if missing_inputs:
+        raise ValueError(
+            f"The Qwen3.5 processor did not return the required {modality} inputs: "
+            f"{missing_inputs}. Returned keys: {sorted(inputs.keys())}"
+        )
+    if tensor_inputs["input_ids"].shape[0] != 1:
+        raise ValueError("This Qwen3.5 multimodal demo supports batch size 1")
+    return tensor_inputs
+
+
+def _prepare_image_processor_inputs(
     processor: AutoProcessor,
     image: Image.Image,
     prompt: str,
@@ -136,25 +210,225 @@ def _prepare_processor_inputs(
         return_dict=True,
         return_tensors="pt",
     )
-    tensor_inputs = {
-        name: value for name, value in inputs.items() if isinstance(value, torch.Tensor)
-    }
-    required_inputs = {
-        "input_ids",
-        "attention_mask",
-        "mm_token_type_ids",
-        "pixel_values",
-        "image_grid_thw",
-    }
-    missing_inputs = sorted(required_inputs - tensor_inputs.keys())
-    if missing_inputs:
-        raise ValueError(
-            "The Qwen3.5 processor did not return the required image inputs: "
-            f"{missing_inputs}. Returned keys: {sorted(inputs.keys())}"
+    return _validate_processor_inputs(
+        inputs,
+        {
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+            "pixel_values",
+            "image_grid_thw",
+        },
+        "image",
+    )
+
+
+def _parse_frame_rate(value: str | None) -> float | None:
+    if value in (None, "", "N/A", "0/0"):
+        return None
+    rate = Fraction(value)
+    if rate <= 0:
+        return None
+    return float(rate)
+
+
+def _probe_video(video_path: Path) -> tuple[int, int, int, float, float]:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-count_frames",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,duration",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("ffprobe is required to run the Qwen3.5 video demo") from error
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"ffprobe failed for {video_path}: {error.stderr.strip()}") from error
+
+    metadata = json.loads(result.stdout)
+    streams = metadata.get("streams", [])
+    if len(streams) != 1:
+        raise ValueError(f"Expected one selected video stream in {video_path}, got {len(streams)}")
+    stream = streams[0]
+    width = int(stream["width"])
+    height = int(stream["height"])
+    frame_rate = _parse_frame_rate(stream.get("avg_frame_rate"))
+    if frame_rate is None:
+        frame_rate = _parse_frame_rate(stream.get("r_frame_rate"))
+    if frame_rate is None:
+        raise ValueError(f"Could not determine the frame rate of {video_path}")
+
+    duration_value = metadata.get("format", {}).get("duration") or stream.get("duration")
+    duration = float(duration_value) if duration_value not in (None, "N/A") else 0.0
+    frame_count_value = stream.get("nb_read_frames") or stream.get("nb_frames")
+    if frame_count_value in (None, "N/A"):
+        if duration <= 0:
+            raise ValueError(f"Could not determine the frame count of {video_path}")
+        frame_count = max(1, round(duration * frame_rate))
+    else:
+        frame_count = int(frame_count_value)
+    if frame_count <= 0:
+        raise ValueError(f"Video contains no decodable frames: {video_path}")
+    if duration <= 0:
+        duration = frame_count / frame_rate
+    return width, height, frame_count, frame_rate, duration
+
+
+def _sample_frame_indices(frame_count: int, requested_frames: int) -> list[int]:
+    if frame_count <= 0 or requested_frames < 0:
+        raise ValueError("frame_count must be positive and requested_frames must be non-negative")
+    if requested_frames == 0:
+        return list(range(frame_count))
+    sample_count = min(frame_count, requested_frames)
+    if sample_count == 1:
+        return [0]
+    return [round(index * (frame_count - 1) / (sample_count - 1)) for index in range(sample_count)]
+
+
+def _decode_video_with_ffmpeg(video_path: Path, requested_frames: int) -> DecodedVideo:
+    width, height, frame_count, frame_rate, duration = _probe_video(video_path)
+    frame_indices = _sample_frame_indices(frame_count, requested_frames)
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+    ]
+    if requested_frames > 0:
+        select_expression = "+".join(f"eq(n\\,{index})" for index in frame_indices)
+        command.extend(["-vf", f"select={select_expression}", "-fps_mode", "passthrough"])
+    command.extend(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+    try:
+        result = subprocess.run(command, check=True, capture_output=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("ffmpeg is required to run the Qwen3.5 video demo") from error
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed for {video_path}: {stderr}") from error
+
+    frame_size = height * width * 3
+    expected_size = len(frame_indices) * frame_size
+    if len(result.stdout) != expected_size:
+        raise RuntimeError(
+            f"ffmpeg returned {len(result.stdout)} RGB bytes, expected {expected_size} "
+            f"for {len(frame_indices)} frames of size {width}x{height}"
         )
-    if tensor_inputs["input_ids"].shape[0] != 1:
-        raise ValueError("This initial Qwen3.5 multimodal demo supports batch size 1")
-    return tensor_inputs
+    frames = torch.frombuffer(bytearray(result.stdout), dtype=torch.uint8).reshape(
+        len(frame_indices), height, width, 3
+    )
+    video_metadata = VideoMetadata(
+        total_num_frames=frame_count,
+        fps=frame_rate,
+        width=width,
+        height=height,
+        duration=duration,
+        video_backend="ffmpeg",
+        frames_indices=frame_indices,
+    )
+    print(
+        f"Decoded video with ffmpeg: size={width}x{height}, fps={frame_rate:.3f}, "
+        f"duration={duration:.3f}s, decoded_frames={len(frame_indices)}/{frame_count}"
+    )
+    return DecodedVideo(frames=frames, metadata=video_metadata)
+
+
+def _prepare_video_processor_inputs(
+    processor: AutoProcessor,
+    video: DecodedVideo,
+    prompt: str,
+) -> dict[str, torch.Tensor]:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": video.frames},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs={
+            "do_sample_frames": False,
+            "video_metadata": [video.metadata],
+        },
+    )
+    return _validate_processor_inputs(
+        inputs,
+        {
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+            "pixel_values_videos",
+            "video_grid_thw",
+        },
+        "video",
+    )
+
+
+def _video_data_for_hash(video: DecodedVideo) -> VideoData:
+    metadata = {
+        "total_num_frames": video.metadata.total_num_frames,
+        "fps": video.metadata.fps,
+        "duration": video.metadata.duration,
+        "frames_indices": list(video.metadata.frames_indices),
+    }
+    return VideoData(frames=list(video.frames.unbind(0)), metadata=metadata)
+
+
+def _hash_multimodal_content(modality: str, content: object) -> list[int]:
+    hashes, _ = apply_mm_hashes({modality: [content]})
+    return hexdigest_to_int32(hashes[modality][0])
+
+
+def _collect_cache_observation(runner: ModelRunnerCpp) -> CacheObservation:
+    request_reused_blocks = 0
+    request_hit_rate = 0.0
+    for per_iteration in runner.session.get_latest_request_stats():
+        for request_stats in per_iteration.request_stats:
+            request_reused_blocks = max(
+                request_reused_blocks,
+                int(request_stats.reused_blocks_per_request),
+            )
+            request_hit_rate = max(
+                request_hit_rate,
+                float(request_stats.kv_cache_hit_rate_per_request),
+            )
+
+    cumulative_reused_blocks = 0
+    cumulative_hit_rate = 0.0
+    tokens_per_block = 0
+    for iteration_stats in runner.session.get_latest_iteration_stats():
+        kv_cache_stats = iteration_stats.kv_cache_stats
+        cumulative_reused_blocks = int(kv_cache_stats.reused_blocks)
+        cumulative_hit_rate = float(kv_cache_stats.cache_hit_rate)
+        tokens_per_block = int(kv_cache_stats.tokens_per_block)
+
+    return CacheObservation(
+        request_reused_blocks=request_reused_blocks,
+        request_hit_rate=request_hit_rate,
+        cumulative_reused_blocks=cumulative_reused_blocks,
+        cumulative_hit_rate=cumulative_hit_rate,
+        tokens_per_block=tokens_per_block,
+    )
 
 
 def _set_eager_attention(hf_config: object) -> None:
@@ -184,7 +458,7 @@ def _vision_profile(
     minimum_tokens = spatial_merge_size**2
     if actual_tokens < minimum_tokens:
         raise ValueError(
-            f"The image produced {actual_tokens} patch tokens, fewer than {minimum_tokens}"
+            f"The visual input produced {actual_tokens} patch tokens, fewer than {minimum_tokens}"
         )
     maximum_tokens = actual_tokens if max_tokens is None else max_tokens
     if maximum_tokens < actual_tokens:
@@ -376,7 +650,7 @@ def _resolve_vision_engine(
     if actual_tokens > maximum_tokens:
         raise ValueError(
             f"The cached vision engine accepts at most {maximum_tokens} patch tokens, "
-            f"but this image produced {actual_tokens}; rebuild with "
+            f"but this visual input produced {actual_tokens}; rebuild with "
             f"--max_vision_tokens {actual_tokens} or larger"
         )
     print(f"Loading cached vision engine: {engine_path}")
@@ -386,12 +660,12 @@ def _resolve_vision_engine(
 def _run_vision_engine(
     engine_path: Path,
     pixel_values: torch.Tensor,
-    image_grid_thw: torch.Tensor,
+    grid_thw: torch.Tensor,
     config: Qwen35Config,
 ) -> tuple[torch.Tensor, Session]:
     session = Session.from_serialized_engine(engine_path.read_bytes())
     position_inputs = prepare_qwen35_vision_position_inputs(
-        image_grid_thw,
+        grid_thw,
         config,
         dtype=torch.bfloat16,
         device="cuda",
@@ -527,9 +801,32 @@ def main() -> None:
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
     )
-    with Image.open(args.image) as image_file:
-        image = image_file.convert("RGB")
-    processor_inputs = _prepare_processor_inputs(processor, image, args.prompt)
+    if args.image is not None:
+        prompt = args.prompt or "Describe this image in detail."
+        with Image.open(args.image) as image_file:
+            image = image_file.convert("RGB")
+        processor_inputs = _prepare_image_processor_inputs(processor, image, prompt)
+        visual_content_hash = (
+            _hash_multimodal_content("image", image) if args.kv_cache_enable_block_reuse else None
+        )
+        modality = "image"
+        modality_name = "Image"
+        pixel_values_name = "pixel_values"
+        grid_name = "image_grid_thw"
+    else:
+        prompt = args.prompt or "总结一下这段视频"
+        decoded_video = _decode_video_with_ffmpeg(args.video, args.video_num_frames)
+        processor_inputs = _prepare_video_processor_inputs(processor, decoded_video, prompt)
+        visual_content_hash = (
+            _hash_multimodal_content("video", _video_data_for_hash(decoded_video))
+            if args.kv_cache_enable_block_reuse
+            else None
+        )
+        modality = "video"
+        modality_name = "Video"
+        pixel_values_name = "pixel_values_videos"
+        grid_name = "video_grid_thw"
+        del decoded_video
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     _set_eager_attention(hf_config)
@@ -537,24 +834,49 @@ def main() -> None:
     if not config.has_vision:
         raise ValueError("The supplied Qwen3.5 model does not contain a vision tower")
 
-    image_grid_thw = processor_inputs["image_grid_thw"]
-    actual_patch_tokens = int(image_grid_thw.prod(dim=-1).sum().item())
-    if processor_inputs["pixel_values"].shape[0] != actual_patch_tokens:
-        raise ValueError(
-            "Processor pixel values and image grid disagree: "
-            f"{processor_inputs['pixel_values'].shape[0]} and {actual_patch_tokens}"
+    multimodal_cache_input = None
+    if visual_content_hash is not None:
+        multimodal_cache_input = prepare_qwen35_multimodal_cache_input(
+            processor_inputs["input_ids"],
+            processor_inputs["attention_mask"],
+            config,
+            modality,
+            visual_content_hash,
         )
-    print(f"Image grid THW: {image_grid_thw.tolist()}")
+        print(
+            "Multimodal prefix-cache spans: "
+            f"positions={multimodal_cache_input.multimodal_positions}, "
+            f"lengths={multimodal_cache_input.multimodal_lengths}"
+        )
+
+    grid_thw = processor_inputs[grid_name]
+    pixel_values = processor_inputs[pixel_values_name]
+    actual_patch_tokens = int(grid_thw.prod(dim=-1).sum().item())
+    if pixel_values.shape[0] != actual_patch_tokens:
+        raise ValueError(
+            f"Processor pixel values and {modality_name.lower()} grid disagree: "
+            f"{pixel_values.shape[0]} and {actual_patch_tokens}"
+        )
+    print(f"{modality_name} grid (T, H, W): {grid_thw.tolist()}")
     print(f"Vision patch tokens: {actual_patch_tokens}")
 
-    # MRoPE must be prepared while the original image placeholder IDs are still present.
-    mrope_inputs = prepare_qwen35_mrope_inputs(
-        processor_inputs["input_ids"],
-        config,
-        attention_mask=processor_inputs["attention_mask"],
-        mm_token_type_ids=processor_inputs["mm_token_type_ids"],
-        image_grid_thw=image_grid_thw,
-    )
+    # MRoPE must be prepared while the original visual placeholder IDs are still present.
+    if args.image is not None:
+        mrope_inputs = prepare_qwen35_mrope_inputs(
+            processor_inputs["input_ids"],
+            config,
+            attention_mask=processor_inputs["attention_mask"],
+            mm_token_type_ids=processor_inputs["mm_token_type_ids"],
+            image_grid_thw=grid_thw,
+        )
+    else:
+        mrope_inputs = prepare_qwen35_mrope_inputs(
+            processor_inputs["input_ids"],
+            config,
+            attention_mask=processor_inputs["attention_mask"],
+            mm_token_type_ids=processor_inputs["mm_token_type_ids"],
+            video_grid_thw=grid_thw,
+        )
 
     hf_model = _load_hf_model(args.model_dir, hf_config)
     vision_engine_path = _resolve_vision_engine(
@@ -563,20 +885,20 @@ def main() -> None:
         hf_model,
         actual_patch_tokens,
     )
-    trt_image_features, vision_session = _run_vision_engine(
+    trt_visual_features, vision_session = _run_vision_engine(
         vision_engine_path,
-        processor_inputs["pixel_values"],
-        image_grid_thw,
+        pixel_values,
+        grid_thw,
         config,
     )
-    print(f"Merged vision tokens: {trt_image_features.shape[0]}")
+    print(f"Merged vision tokens: {trt_visual_features.shape[0]}")
 
     hf_model = hf_model.to("cuda")
     hf_inputs = _hf_inputs_on_cuda(processor_inputs)
     with torch.inference_mode():
         hf_vision_outputs = hf_model.model.visual(
-            hf_inputs["pixel_values"].to(torch.bfloat16),
-            grid_thw=hf_inputs["image_grid_thw"],
+            hf_inputs[pixel_values_name].to(torch.bfloat16),
+            grid_thw=hf_inputs[grid_name],
             return_dict=True,
         )
         hf_outputs = hf_model(
@@ -585,7 +907,7 @@ def main() -> None:
             logits_to_keep=1,
             return_dict=True,
         )
-    vision_comparison = _compare(trt_image_features, hf_vision_outputs.pooler_output)
+    vision_comparison = _compare(trt_visual_features, hf_vision_outputs.pooler_output)
     _print_comparison("Vision pooled embedding", vision_comparison)
     hf_last_logits = hf_outputs.logits[0, -1, : config.vocab_size].float().cpu()
 
@@ -597,12 +919,20 @@ def main() -> None:
     gc.collect()
     torch.cuda.empty_cache()
 
-    executor_inputs = prepare_qwen35_executor_prompt_inputs(
-        processor_inputs["input_ids"],
-        processor_inputs["attention_mask"],
-        config,
-        image_features=trt_image_features,
-    )
+    if args.image is not None:
+        executor_inputs = prepare_qwen35_executor_prompt_inputs(
+            processor_inputs["input_ids"],
+            processor_inputs["attention_mask"],
+            config,
+            image_features=trt_visual_features,
+        )
+    else:
+        executor_inputs = prepare_qwen35_executor_prompt_inputs(
+            processor_inputs["input_ids"],
+            processor_inputs["attention_mask"],
+            config,
+            video_features=trt_visual_features,
+        )
     input_length = executor_inputs.batch_input_ids[0].numel()
     mrope_params = MropeParams(
         mrope_rotary_cos_sin=mrope_inputs.mrope_rotary_cos_sin,
@@ -615,7 +945,9 @@ def main() -> None:
         max_input_len=input_length,
         max_output_len=args.max_new_tokens,
         max_beam_width=1,
+        kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
         kv_cache_free_gpu_memory_fraction=args.kv_cache_free_gpu_memory_fraction,
+        enable_chunked_context=args.enable_chunked_context,
         use_runtime_defaults=False,
     )
     if not runner.gather_context_logits:
@@ -638,22 +970,67 @@ def main() -> None:
     if end_id is None:
         raise ValueError("The tokenizer does not define eos_token_id")
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else end_id
+    request_count = args.prefix_cache_requests if args.kv_cache_enable_block_reuse else 1
+    outputs = None
+    cache_observations = []
     with torch.inference_mode():
-        outputs = runner.generate(
-            executor_inputs.batch_input_ids,
-            prompt_table=executor_inputs.prompt_table,
-            prompt_tasks=executor_inputs.prompt_tasks,
-            mrope_params=mrope_params,
-            max_new_tokens=args.max_new_tokens,
-            end_id=end_id,
-            pad_id=pad_id,
-            temperature=1.0,
-            top_k=1,
-            top_p=0.0,
-            num_beams=1,
-            return_dict=True,
-            output_sequence_lengths=True,
+        for request_index in range(request_count):
+            request_outputs = runner.generate(
+                executor_inputs.batch_input_ids,
+                prompt_table=executor_inputs.prompt_table,
+                prompt_tasks=executor_inputs.prompt_tasks,
+                multimodal_inputs=(
+                    [multimodal_cache_input] if multimodal_cache_input is not None else None
+                ),
+                mrope_params=mrope_params,
+                max_new_tokens=args.max_new_tokens,
+                end_id=end_id,
+                pad_id=pad_id,
+                temperature=1.0,
+                top_k=1,
+                top_p=0.0,
+                num_beams=1,
+                return_dict=True,
+                output_context_logits=request_index == 0,
+                output_sequence_lengths=True,
+            )
+            if outputs is None:
+                outputs = request_outputs
+            if args.kv_cache_enable_block_reuse:
+                observation = _collect_cache_observation(runner)
+                cache_observations.append(observation)
+                print(
+                    f"Prefix-cache request {request_index + 1}/{request_count}: "
+                    f"reused_blocks={observation.request_reused_blocks}, "
+                    f"request_hit_rate={observation.request_hit_rate:.2%}"
+                )
+
+    if outputs is None:
+        raise RuntimeError("The TensorRT runner returned no outputs")
+    if args.kv_cache_enable_block_reuse:
+        first_observation = cache_observations[0]
+        last_observation = cache_observations[-1]
+        cumulative_reuse_delta = max(
+            0,
+            last_observation.cumulative_reused_blocks - first_observation.cumulative_reused_blocks,
         )
+        observed_reused_blocks = max(
+            last_observation.request_reused_blocks,
+            cumulative_reuse_delta,
+        )
+        print(
+            "Multimodal prefix-cache summary: "
+            f"observed_reused_blocks={observed_reused_blocks}, "
+            f"cumulative_hit_rate={last_observation.cumulative_hit_rate:.2%}, "
+            f"tokens_per_block={last_observation.tokens_per_block}"
+        )
+        if observed_reused_blocks == 0:
+            print(
+                "WARNING: no reused cache blocks were observed. Ensure the "
+                "prompt crosses a cacheable block or recurrent-state snapshot boundary."
+            )
+        else:
+            print("Qwen3.5 multimodal prefix-cache validation: PASS")
 
     trt_last_logits = _select_last_context_logits(
         outputs["context_logits"],

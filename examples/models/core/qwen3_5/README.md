@@ -181,17 +181,19 @@ For standard runtime generation, build with paged KV cache (the default). The
 runtime allocates both attention KV blocks and gated-delta recurrent-state
 blocks through the KV cache manager.
 
-## Multimodal image demo
+## Multimodal image and video demo
 
 `multimodal_demo.py` connects the Hugging Face processor, a TensorRT vision
 engine, Qwen3.5 MRoPE preparation, request-local fake token IDs, the prompt
-embedding table, and `ModelRunnerCpp`. It also compares:
+embedding table, and `ModelRunnerCpp`. Images use Pillow and videos use
+`ffprobe` plus `ffmpeg` to sample RGB frames without requiring PyAV or
+TorchCodec. The demo also compares:
 
 - The TensorRT and Hugging Face pooled vision embeddings.
 - The TensorRT and Hugging Face logits for the last context token, including
   cosine similarity and top-k tokens.
 
-The initial demo supports one local image and runtime batch size 1. It builds
+The demo supports one local image or video and runtime batch size 1. It builds
 and caches the vision engine on its first run. The LLM engine must enable prompt
 tuning and context logits. For example, build an engine with room for up to
 4,096 total prompt-table rows:
@@ -217,20 +219,73 @@ examples/models/core/qwen3_5/run_multimodal_demo.sh \
     --check
 ```
 
+Enable content-aware LLM prefix-cache reuse by issuing at least two identical
+requests through the same executor:
+
+```bash
+examples/models/core/qwen3_5/run_multimodal_demo.sh \
+    /path/to/Qwen3.5-2B \
+    /path/to/qwen3_5_multimodal_engine \
+    /path/to/qwen3_5_vision_engine \
+    /path/to/image.jpg \
+    --kv_cache_enable_block_reuse \
+    --prefix_cache_requests 2
+```
+
+The cache key includes the image content hash or the whole-video hash. Video
+hashes cover the ordered sampled frames, frame indices, FPS, duration, and total
+frame count. A video remains distinct from an image even when it contains a
+single identical frame. This caches the LLM KV/recurrent state; the demo still
+runs the vision encoder once before submitting the repeated LLM requests.
+
+Build a chunked-context LLM engine for the repository-local `women.gif`. Its
+115 full-resolution frames produce 10,440 merged video tokens and an input of
+about 10,919 tokens:
+
+```bash
+QWEN35_MAX_BATCH_SIZE=1 \
+QWEN35_MAX_INPUT_LEN=16384 \
+QWEN35_MAX_SEQ_LEN=16384 \
+QWEN35_MAX_NUM_TOKENS=4096 \
+QWEN35_OPT_NUM_TOKENS=4096 \
+examples/models/core/qwen3_5/build.sh \
+    /path/to/qwen3_5_bf16_tp1 \
+    /path/to/qwen3_5_full_video_engine \
+    --max_prompt_embedding_table_size 16384 \
+    --gather_context_logits
+```
+
+Run all frames with Qwen3.5-2B and the prompt `总结一下这段视频`:
+
+```bash
+examples/models/core/qwen3_5/run_video_demo.sh \
+    /path/to/qwen3_5_full_video_engine \
+    /path/to/qwen3_5_full_video_vision_engine
+```
+
+The video wrapper defaults to `/root/code_x/Qwen3.5-2B`,
+`/root/code_x/women.gif`, all decoded frames, and chunked context. Override the
+first two paths with `QWEN35_MODEL_DIR` and `QWEN35_VIDEO`. Pass
+`--video_num_frames N` after the engine directories to uniformly sample `N`
+frames, or pass `0` to decode every frame. With `max_num_tokens=4096`, the
+10,919-token input is processed in multiple prefill chunks while `max_seq_len=16384`
+remains the total request limit.
+
 The wrapper loads the source-built TensorRT-LLM plugin and shared libraries used
 by `build.sh`. Set `QWEN35_PLUGIN_LIB` when the plugin is in another location.
 It exits without normal Python runtime cleanup after printing the result to
 avoid an ABI-specific destructor failure when the source bindings and installed
 TensorRT Python package use different minor versions.
 
-The demo defaults to `min_pixels=3,136` and `max_pixels=200,704` so that the
-Hugging Face eager-attention reference fits on a typical development GPU. Pass
-`--min_pixels` and `--max_pixels` to change the processor's resize bounds.
-Larger images increase vision attention memory quadratically.
+Image preprocessing defaults to `min_pixels=3,136` and
+`max_pixels=200,704` so that the Hugging Face eager-attention reference fits on
+a typical development GPU. Pass `--min_pixels` and `--max_pixels` to change the
+image resize bounds. Larger visual inputs increase vision attention memory
+quadratically.
 
-By default, a newly built vision engine is profiled for the current image's
-pre-merge patch-token count. Pass `--max_vision_tokens N` when building it if
-the cache should accept larger later images, or pass
+By default, a newly built vision engine is profiled for the current visual
+input's pre-merge patch-token count. Pass `--max_vision_tokens N` when building
+it if the cache should accept larger later inputs, or pass
 `--rebuild_vision_engine` to replace an existing profile.
 
 The LLM prompt-table capacity is measured after spatial merging. For batch size
