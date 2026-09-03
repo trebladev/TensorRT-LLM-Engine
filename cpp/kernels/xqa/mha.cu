@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -2238,10 +2238,9 @@ CUBIN_EXPORT __global__
                   }
                   else
                   {
-                      assert(nbVItersPerXIter == 1);
-                      if ((idxBeam == beamWidth - 1 || isConvergedTile(seqIter)) && vIter == nbVItersPerXIter - 1)
+                      if (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))
                       {
-                          auto const step = exactDiv(xIterSeqStride, tokensPerPage);
+                          auto const step = exactDiv(cacheVTileSeqLen, tokensPerPage);
                           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step >= nbPagesPerCtaTile
                                   ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
                                   : step);

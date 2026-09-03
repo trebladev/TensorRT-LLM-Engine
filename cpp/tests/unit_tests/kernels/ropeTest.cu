@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1011,5 +1011,111 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
             }
         }
         EXPECT_TRUE(kvCacheBlockScalesEqual);
+    }
+}
+
+TYPED_TEST(RopeTest, MropeGenerationUsesPositionDeltaWithStandardCache)
+{
+    using fpType = typename TestFixture::fpType;
+
+    constexpr SizeType32 kBatchSize = 1;
+    constexpr SizeType32 kNumHeads = 2;
+    constexpr SizeType32 kHeadSize = 128;
+    constexpr SizeType32 kRotaryEmbeddingDim = 128;
+    constexpr SizeType32 kRotaryEmbeddingMaxPositions = 32;
+    constexpr SizeType32 kCacheSequenceLength = 20;
+    constexpr SizeType32 kMropePositionDelta = -15;
+    constexpr SizeType32 kExpectedRotaryPosition = 4;
+
+    this->setMembersLLama7b();
+    this->mNumHeads = kNumHeads;
+    this->mNumKVHeads = kNumHeads;
+    this->mHeadSize = kHeadSize;
+    this->mRotaryEmbeddingDim = kRotaryEmbeddingDim;
+    this->mRotaryEmbeddingMaxPositions = kRotaryEmbeddingMaxPositions;
+    this->mPositionEmbeddingType = PositionEmbeddingType::kROPE_M;
+
+    this->batch_size = kBatchSize;
+    this->input_seq_length = 1;
+    this->num_tokens = kBatchSize;
+    this->max_past_kv_len = kCacheSequenceLength;
+    this->max_attention_window = kCacheSequenceLength;
+    this->cyclic_attention_window_size = kCacheSequenceLength;
+
+    this->rotary_cos_sin_tensor = this->mBufferManager->pinned(
+        ITensor::makeShape({kRotaryEmbeddingMaxPositions, kRotaryEmbeddingDim}), nvinfer1::DataType::kFLOAT);
+    this->rotary_fill_help = bufferCast<float>(*this->rotary_cos_sin_tensor);
+    fillWithOnesAndZerosInterleaved(
+        this->rotary_fill_help, kRotaryEmbeddingMaxPositions * kRotaryEmbeddingDim);
+    this->rotary_cos_sin = reinterpret_cast<float2*>(this->rotary_fill_help);
+    auto* expectedRotaryCoefficients
+        = reinterpret_cast<float2*>(this->rotary_fill_help) + kExpectedRotaryPosition * (kRotaryEmbeddingDim / 2);
+    for (SizeType32 index = 0; index < kRotaryEmbeddingDim / 2; ++index)
+    {
+        expectedRotaryCoefficients[index] = make_float2(0.0F, 1.0F);
+    }
+
+    this->q_seq_lengths_tensor
+        = this->mBufferManager->pinned(ITensor::makeShape({kBatchSize}), nvinfer1::DataType::kINT32);
+    this->q_seq_lengths = bufferCast<int32_t>(*this->q_seq_lengths_tensor);
+    this->q_seq_lengths[0] = 1;
+
+    auto const cacheSequenceLengthsTensor
+        = this->mBufferManager->pinned(ITensor::makeShape({kBatchSize}), nvinfer1::DataType::kINT32);
+    this->kv_seq_lengths = bufferCast<int32_t>(*cacheSequenceLengthsTensor);
+    this->kv_seq_lengths[0] = kCacheSequenceLength;
+
+    this->allocateBuffers();
+    this->buildKVCaches();
+    this->buildPreprocessingParams();
+
+    auto const mropePositionDeltasTensor
+        = this->mBufferManager->pinned(ITensor::makeShape({kBatchSize}), nvinfer1::DataType::kINT32);
+    auto* mropePositionDeltas = bufferCast<int32_t>(*mropePositionDeltasTensor);
+    mropePositionDeltas[0] = kMropePositionDelta;
+
+    this->preprocessingParams.tokens_info = nullptr;
+    this->preprocessingParams.cu_seq_lens = nullptr;
+    this->preprocessingParams.mrope_rotary_cos_sin = nullptr;
+    this->preprocessingParams.mrope_position_deltas = mropePositionDeltas;
+    this->preprocessingParams.generation_phase = true;
+
+    auto const referenceQkvBuffer
+        = this->mBufferManager->copyFrom(*this->attention_input_buf, tensorrt_llm::runtime::MemoryType::kPINNEDPOOL);
+    auto* referenceQkv = bufferCast<fpType>(*referenceQkvBuffer);
+    auto const* rotaryCoefficients
+        = this->rotary_cos_sin + kExpectedRotaryPosition * (kRotaryEmbeddingDim / 2);
+
+    auto applyReferenceRope = [&](fpType* head)
+    {
+        std::vector<fpType> const original(head, head + kRotaryEmbeddingDim);
+        for (SizeType32 index = 0; index < kRotaryEmbeddingDim; ++index)
+        {
+            auto const rotatedIndex = (index + kRotaryEmbeddingDim / 2) % kRotaryEmbeddingDim;
+            auto const sign = index < kRotaryEmbeddingDim / 2 ? -1.0F : 1.0F;
+            auto const coefficient = rotaryCoefficients[index % (kRotaryEmbeddingDim / 2)];
+            head[index] = static_cast<fpType>(coefficient.x * static_cast<float>(original[index])
+                + coefficient.y * sign * static_cast<float>(original[rotatedIndex]));
+        }
+    };
+
+    auto const qHiddenSize = kNumHeads * kHeadSize;
+    for (SizeType32 headIndex = 0; headIndex < kNumHeads; ++headIndex)
+    {
+        applyReferenceRope(referenceQkv + headIndex * kHeadSize);
+        applyReferenceRope(referenceQkv + qHiddenSize + headIndex * kHeadSize);
+    }
+
+    invokeQKVPreprocessing(this->preprocessingParams, this->mStream->get());
+    cudaDeviceSynchronize();
+    sync_check_cuda_error(this->mStream->get());
+
+    for (SizeType32 index = 0; index < this->qkv_size; ++index)
+    {
+        EXPECT_TRUE(almostEqual(static_cast<float>(this->attention_input[index]),
+            static_cast<float>(referenceQkv[index]), 1e-3F, 1e-3F))
+            << "Mismatch at QKV index " << index << ", actual "
+            << static_cast<float>(this->attention_input[index]) << ", expected "
+            << static_cast<float>(referenceQkv[index]);
     }
 }

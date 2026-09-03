@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -852,12 +852,13 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         // NOTE: only spec decoding needs the position offsets.
         // In the generation phase, we assume all sequences should have the same input length.
         // Helix parallelism: use helix_position_offsets if available (absolute position).
-        int const rotary_position = params.helix_position_offsets != nullptr
-            ? params.helix_position_offsets[bounded_global_token_idx]
-            : params.spec_decoding_position_offsets != nullptr
-            ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
-                + cache_seq_len - actual_seq_len)
-            : token_idx_in_kv_cache;
+        int const rotary_position
+            = (params.helix_position_offsets != nullptr ? params.helix_position_offsets[bounded_global_token_idx]
+                       : params.spec_decoding_position_offsets != nullptr
+                       ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
+                           + cache_seq_len - actual_seq_len)
+                       : token_idx_in_kv_cache)
+            + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
 
         // Helix parallelism: determine if this rank is inactive for this request.
         bool const helix_inactive
@@ -1611,8 +1612,9 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         || params.max_kv_seq_len > params.rotary_embedding_max_positions;
     bool const has_rotary_cos_sin_cache = params.rotary_coef_cache_buffer != nullptr;
     bool const has_sink_tokens = params.sink_token_len > 0;
-    bool const use_v1_for_mrope
-        = params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_rotary_cos_sin == nullptr;
+    // Generated MRoPE tokens can use the standard RoPE cache after applying mrope_position_deltas.
+    bool const use_v1_for_mrope = params.position_embedding_type == PositionEmbeddingType::kROPE_M
+        && params.mrope_rotary_cos_sin == nullptr && params.rotary_coef_cache_buffer == nullptr;
     // V2 implementation requires multiple of paired 16 bytes for gpt-neox rotation.
     bool const support_rotary_for_v2 = (params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
                                            && params.position_embedding_type != PositionEmbeddingType::kLONG_ROPE)

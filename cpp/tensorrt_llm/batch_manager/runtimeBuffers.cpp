@@ -490,6 +490,12 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     bool const isChatGlm = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kChatGlm;
     bool const isGlm = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kGlm;
     auto const mropeRotaryCosSinSize = modelConfig.getMaxPositionEmbeddings() * modelConfig.getRotaryEmbeddingDim();
+    TensorPtr mropeRotaryCosSinPacked;
+    if (modelConfig.useMrope())
+    {
+        auto const packedSize = static_cast<ITensor::DimType64>(mropeRotaryCosSin->getSize());
+        mropeRotaryCosSinPacked = ITensor::view(mropeRotaryCosSin, ITensor::makeShape({packedSize}));
+    }
 
     {
         NVTX3_SCOPED_RANGE(seqSlotsLoop);
@@ -603,8 +609,17 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                     "Provided MropeRotarySinCos is %ld and expected is %d.\n", optMropeRotaryCosSin->getShape().d[0],
                     int(mropeRotaryCosSinSize));
 
-                auto const mropeRotaryCosSinCtx = ITensor::slice(mropeRotaryCosSin, batchIdx, 1);
-                manager.copy(*optMropeRotaryCosSin, *mropeRotaryCosSinCtx);
+                // Attention preprocessing indexes MRoPE coefficients by the packed token index, so materialize only
+                // this request's current chunk at its packed output offset.
+                auto const rotaryEmbeddingDim = modelConfig.getRotaryEmbeddingDim();
+                auto const mropeInputSize = inputLength * rotaryEmbeddingDim;
+                auto const mropeInputOffset = beginCompute * rotaryEmbeddingDim;
+                auto const mropeOutputOffset = totalInputSize * rotaryEmbeddingDim;
+                auto const mropeRotaryCosSinInput
+                    = ITensor::slice(optMropeRotaryCosSin, mropeInputOffset, mropeInputSize);
+                auto const mropeRotaryCosSinOutput
+                    = ITensor::slice(mropeRotaryCosSinPacked, mropeOutputOffset, mropeInputSize);
+                manager.copy(*mropeRotaryCosSinInput, *mropeRotaryCosSinOutput);
             }
 
             if (modelConfig.useLanguageAdapter())
