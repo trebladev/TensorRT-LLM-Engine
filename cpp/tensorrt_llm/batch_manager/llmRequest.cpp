@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,50 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
+#include <cstdint>
+
 namespace tensorrt_llm::batch_manager
 {
+
+namespace
+{
+
+bool hasValidMultimodalCacheMetadata(LlmRequest const& request)
+{
+    constexpr size_t kMultimodalHashPartCount = 8;
+
+    auto const multimodalHashes = request.getMultimodalHashes();
+    auto const multimodalPositions = request.getMultimodalPositions();
+    auto const multimodalLengths = request.getMultimodalLengths();
+    if (!multimodalHashes || !*multimodalHashes || (*multimodalHashes)->empty() || !multimodalPositions
+        || !*multimodalPositions || !multimodalLengths || !*multimodalLengths)
+    {
+        return false;
+    }
+
+    auto const& hashes = **multimodalHashes;
+    auto const& positions = **multimodalPositions;
+    auto const& lengths = **multimodalLengths;
+    if (hashes.size() != positions.size() || positions.size() != lengths.size())
+    {
+        return false;
+    }
+
+    for (size_t itemIdx = 0; itemIdx < hashes.size(); ++itemIdx)
+    {
+        auto const position = positions[itemIdx];
+        auto const length = lengths[itemIdx];
+        auto const endPosition = static_cast<int64_t>(position) + static_cast<int64_t>(length);
+        if (hashes[itemIdx].size() != kMultimodalHashPartCount || position < 0 || length <= 0
+            || endPosition > request.getOrigPromptLen())
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
 
 template <typename TTensor, typename TStream>
 runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
@@ -304,14 +346,19 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
 
     TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
 
-    // validate extra ids when enabling kv cache reuse with prompt table
+    // Validate cache-key metadata when enabling KV cache reuse with prompt table.
     if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
     {
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
-            "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-            "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
-            mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
+        auto const hasInputTokenExtraIds = mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value();
+        TLLM_CHECK_WITH_INFO(hasInputTokenExtraIds || hasValidMultimodalCacheMetadata(*this),
+            "Input token extra ids must be provided when enabling kv cache reuse with prompt table unless valid "
+            "multimodal cache metadata is provided");
+        if (hasInputTokenExtraIds)
+        {
+            TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
+                "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
+                mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
+        }
     }
 }
 

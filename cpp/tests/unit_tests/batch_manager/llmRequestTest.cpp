@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -302,6 +302,19 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         tb::LlmRequest llmReq(requestId, execReq);
 
         EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), inputTokens.size());
+        llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
+    }
+    {
+        // Validate multimodal cache metadata without legacy extra ids.
+        VecTokens multimodalInputTokens{1, 32000, 32001, 32002, 5};
+        texec::Request execReq(multimodalInputTokens, maxNewTokens);
+        auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {3, 42});
+        execReq.setPromptTuningConfig(texec::PromptTuningConfig(embeddingTable));
+        execReq.setMultimodalInput(
+            texec::MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, /*multimodalPositions=*/{1}, /*multimodalLengths=*/{3}));
+        tb::LlmRequest llmReq(requestId, execReq);
+
+        EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), multimodalInputTokens.size());
         llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
     }
     {
