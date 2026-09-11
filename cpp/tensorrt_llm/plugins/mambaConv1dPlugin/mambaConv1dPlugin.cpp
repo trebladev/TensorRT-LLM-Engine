@@ -220,6 +220,16 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     // only support context or generation, not for both of them
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getHostRequestTypesIdx()]);
 
+    auto const numTokens = mRemovePadding ? inputDesc[getInputTensorIdx()].dims.d[0] : batchSize;
+    bool const isVerification = reqTypes[0] == RequestType::kGENERATION && numTokens != batchSize;
+    if (isVerification)
+    {
+        constexpr int kVerificationTokens = 2;
+        TLLM_CHECK_WITH_INFO(mRemovePadding && mUseInitialStateMask && numTokens == kVerificationTokens * batchSize,
+            "Conv verification requires two packed tokens per request and an initial-state mask");
+        maxSeqLen = kVerificationTokens;
+    }
+
     MambaConv1dParamsBase mambaConv1dParams;
 
     int const* sourceSlotMapping = mPagedState ? static_cast<int const*>(inputs[getSourceSlotMappingIdx()]) : nullptr;
@@ -237,7 +247,18 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         auto const maskIdx = getHostHasInitialStateIdx();
         auto const maskType = inputDesc[maskIdx].type;
         auto const* hostHasInitialState = inputs[maskIdx];
-        if (reqTypes[0] == RequestType::kCONTEXT)
+        if (reqTypes[0] == RequestType::kGENERATION)
+        {
+            for (int requestIdx = 0; requestIdx < batchSize; ++requestIdx)
+            {
+                auto const hasState = maskType == DataType::kINT32
+                    ? static_cast<int32_t const*>(hostHasInitialState)[requestIdx]
+                    : static_cast<int8_t const*>(hostHasInitialState)[requestIdx];
+                TLLM_CHECK_WITH_INFO(
+                    hasState == 1, "MambaConv1d generation request %d does not have an initial state", requestIdx);
+            }
+        }
+        if (reqTypes[0] == RequestType::kCONTEXT || isVerification)
         {
             if (maskType == DataType::kINT32)
             {
@@ -250,17 +271,6 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
                     workspace, hostHasInitialState, batchSize * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
             }
             hasInitialState = static_cast<int8_t const*>(workspace);
-        }
-        else if (reqTypes[0] == RequestType::kGENERATION)
-        {
-            for (int requestIdx = 0; requestIdx < batchSize; ++requestIdx)
-            {
-                auto const hasState = maskType == DataType::kINT32
-                    ? static_cast<int32_t const*>(hostHasInitialState)[requestIdx]
-                    : static_cast<int8_t const*>(hostHasInitialState)[requestIdx];
-                TLLM_CHECK_WITH_INFO(
-                    hasState == 1, "MambaConv1d generation request %d does not have an initial state", requestIdx);
-            }
         }
     }
 
@@ -293,7 +303,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
             "Conv snapshot mapping must contain one slot (or -1) per packed token");
         mambaConv1dParams.snapshot_slot_mapping_ptr = static_cast<int32_t const*>(inputs[idx]);
     }
-    if (reqTypes[0] == RequestType::kCONTEXT)
+    if (reqTypes[0] == RequestType::kCONTEXT || isVerification)
     {
         invokeMambaConv1dContext<T>(mambaConv1dParams, stream);
     }

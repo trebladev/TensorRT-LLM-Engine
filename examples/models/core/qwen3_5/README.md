@@ -47,6 +47,40 @@ are expected to use the same graph, but have not been validated yet.
 > This section records the intended implementation and validation order; it is
 > not a description of currently available functionality.
 
+### Engine-level external-draft verification (K=1)
+
+The first target-verification path supports BF16, TP=1, beam width 1, and
+one externally supplied draft token per request. Build the graph with
+`max_draft_len=1` and `speculative_decoding_draft_tokens_external=True` in
+`Qwen35ForCausalLM.prepare_inputs` (CLI: `--max_draft_len 1
+--speculative_decoding_mode draft_tokens_external`). Execute it directly with
+`Session`; `ModelRunnerCpp` still rejects speculative hybrid engines until
+acceptance and state commit are implemented.
+
+Each generation verification request packs `[current_token, draft_token]`.
+For a batch of N requests, supply:
+
+- `last_token_ids = [1, 2, ..., 2*N]` to return logits at every position.
+- `gated_delta_cu_seqlens = [0, 2, ..., 2*N]` and an initial Conv/GDN state
+  for each request (`host_has_initial_state=1`).
+- `spec_decoding_use=[1]` on the host, and device tensors
+  `spec_decoding_generation_lengths=[2]*N`,
+  `spec_decoding_position_offsets=[[0, 1]]*N`, and causal
+  `spec_decoding_packed_mask=[[1], [3]]` repeated N times.
+- The prefix KV lengths and `sequence_length=prefix_length+2`, plus the usual
+  state-slot mappings and text MRoPE inputs.
+
+Prefill and ordinary single-token decode use `spec_decoding_use=[0]`.
+The GDN and Conv plugins use their stateful prefill kernels for two-token
+verification. All resulting caches are **tentative**: retain the prefix state
+and do not promote the verification state after rejecting a draft. Automatic
+acceptance, accepted-prefix snapshots, and cache commit are not included yet.
+The engine contains no MTP drafter. Greedy verification is covered by
+`test_qwen35_external_draft_verification`, which compares both logits, final
+cache state, and the next decode against sequential single-token execution.
+
+### Remaining implementation order
+
 MTP target verification runs the engine with the current token followed by up
 to `K` draft tokens. The engine therefore needs a generation profile that
 supports `K + 1` input tokens, returns target logits for every verification

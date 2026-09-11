@@ -33,6 +33,7 @@ from ...functional import (
     matmul,
     shape,
     sigmoid,
+    slice,
     softmax,
     softplus,
     split,
@@ -52,6 +53,7 @@ from ...layers import (
     RmsNorm,
     RmsNormGate,
     RowLinear,
+    SpecDecodingParams,
 )
 from ...layers.ssm import MambaConv1d
 from ...mapping import Mapping
@@ -491,11 +493,14 @@ class Qwen35LinearAttention(Module):
         )
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
+        # Logits may select every verification token; Conv needs one packed
+        # sequence end per request, regardless of how many logits are requested.
+        conv_last_token_ids = slice(cu_seqlens, [1], shape(cu_seqlens, 0) - 1)
         mixed_qkv, present_conv_state = self.conv1d(
             mixed_qkv,
             conv_state,
             host_request_types,
-            last_token_ids,
+            conv_last_token_ids,
             host_context_lengths=host_context_lengths,
             slot_mapping=source_state_slot_mapping,
             target_slot_mapping=target_state_slot_mapping,
@@ -580,6 +585,7 @@ class Qwen35DecoderLayer(Module):
         target_state_slot_mapping=None,
         host_has_initial_state=None,
         snapshot_slot_mapping: Tensor | None = None,
+        spec_decoding_params: SpecDecodingParams | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -591,6 +597,7 @@ class Qwen35DecoderLayer(Module):
                 kv_cache_params=kv_cache_params,
                 attention_params=attention_params,
                 mrope_params=mrope_params,
+                spec_decoding_params=spec_decoding_params,
             )
             if use_cache:
                 token_mixer_output, present_kv = token_mixer_output
@@ -655,6 +662,7 @@ class Qwen35Model(Module):
         prompt_tasks: Tensor | None = None,
         prompt_vocab_size: Tensor | None = None,
         snapshot_slot_mapping: Tensor | None = None,
+        spec_decoding_params: SpecDecodingParams | None = None,
     ):
         prompt_tuning_args = (
             [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
@@ -709,6 +717,7 @@ class Qwen35Model(Module):
                 target_state_slot_mapping,
                 host_has_initial_state,
                 snapshot_slot_mapping,
+                spec_decoding_params=spec_decoding_params,
             )
             if present_kv is not None:
                 present_kvs.append(present_kv)
@@ -772,6 +781,7 @@ class Qwen35ForCausalLM(PretrainedModel):
         prompt_tasks: Tensor | None = None,
         prompt_vocab_size: Tensor | None = None,
         snapshot_slot_mapping: Tensor | None = None,
+        spec_decoding_params: SpecDecodingParams | None = None,
     ):
         del position_ids
         attention_params = Attention.fill_attention_params(self, attention_params)
@@ -795,6 +805,7 @@ class Qwen35ForCausalLM(PretrainedModel):
             prompt_tasks,
             prompt_vocab_size,
             snapshot_slot_mapping=snapshot_slot_mapping,
+            spec_decoding_params=spec_decoding_params,
         )
         if not self.gather_context_logits:
             hidden_states = gather_last_token_logits(
@@ -934,9 +945,12 @@ class Qwen35ForCausalLM(PretrainedModel):
         if max_beam_width != 1:
             raise ValueError("The initial Qwen3.5 implementation does not support beam search")
         if max_draft_len != 0 or speculative_decoding_draft_tokens_external:
-            raise ValueError(
-                "The initial Qwen3.5 implementation does not support speculative decoding"
-            )
+            if max_draft_len != 1 or not speculative_decoding_draft_tokens_external:
+                raise ValueError("Qwen3.5 target verification requires one external draft token")
+            if self.config.mapping.tp_size != 1:
+                raise ValueError("Qwen3.5 target verification currently requires TP=1")
+            if not use_cache:
+                raise ValueError("Qwen3.5 target verification requires use_cache=true")
         if spec_decoding_is_generation_length_variable:
             raise ValueError(
                 "The initial Qwen3.5 implementation does not support variable generation lengths"
@@ -969,6 +983,10 @@ class Qwen35ForCausalLM(PretrainedModel):
             opt_num_tokens=opt_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
             max_draft_len=max_draft_len,
+            # External tokens are verified in generation, using the attention
+            # plugin's positional offsets and causal packed mask. The legacy
+            # external-draft path would omit these inputs.
+            speculative_decoding_draft_tokens_external=False,
             gather_context_logits=gather_context_logits,
             opt_batch_size=opt_batch_size,
             num_hidden_layers=len(self.attention_layer_ids),

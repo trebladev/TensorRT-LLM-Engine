@@ -385,13 +385,15 @@ def _mamba_conv1d_paged_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="MambaConv1d plugin test requires CUDA")
-def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
+@pytest.mark.parametrize("verification", [False, True])
+def test_mamba_conv1d_paged_state_combined_record_stride(
+        verification: bool) -> None:
     torch.manual_seed(2468)
     device = "cuda"
     dim = 256
     dconv = 4
     num_slots = 8
-    sequence_lengths = (5, 9, 17)
+    sequence_lengths = (2, 2, 2) if verification else (5, 9, 17)
     num_requests = len(sequence_lengths)
     state_slot_mapping = torch.tensor([6, 3, 5],
                                       device=device,
@@ -399,7 +401,8 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
     target_state_slot_mapping = torch.tensor([1, 3, 7],
                                              device=device,
                                              dtype=torch.int32)
-    host_has_initial_state = torch.tensor([1, 0, 1], dtype=torch.int8)
+    host_has_initial_state = torch.tensor([1, int(verification), 1],
+                                          dtype=torch.int8)
 
     ssm_state_bytes = 4096
     conv_state_bytes = dim * (dconv - 1) * torch.bfloat16.itemsize
@@ -437,16 +440,26 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
                                   dtype=torch.int32)
     host_context_lengths = torch.tensor(sequence_lengths, dtype=torch.int32)
     prefill_inputs = {
-        "input": input_tensor,
-        "state": state_pointer,
-        "weight": plugin_weight,
-        "bias": bias,
-        "host_request_types": torch.zeros(num_requests, dtype=torch.int32),
-        "last_token_ids": last_token_ids,
-        "host_context_lengths": host_context_lengths,
-        "state_slot_mapping": state_slot_mapping,
-        "target_state_slot_mapping": target_state_slot_mapping,
-        "host_has_initial_state": host_has_initial_state,
+        "input":
+        input_tensor,
+        "state":
+        state_pointer,
+        "weight":
+        plugin_weight,
+        "bias":
+        bias,
+        "host_request_types":
+        torch.full((num_requests, ), int(verification), dtype=torch.int32),
+        "last_token_ids":
+        last_token_ids,
+        "host_context_lengths":
+        host_context_lengths,
+        "state_slot_mapping":
+        state_slot_mapping,
+        "target_state_slot_mapping":
+        target_state_slot_mapping,
+        "host_has_initial_state":
+        host_has_initial_state,
     }
     prefill_session = _build_paged_mamba_conv1d_session(
         {

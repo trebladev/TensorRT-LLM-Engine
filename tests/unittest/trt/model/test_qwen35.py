@@ -173,7 +173,13 @@ def qwen35_references(qwen35_checkpoint_dir: Path) -> _Qwen35ReferenceData:
     return _Qwen35ReferenceData(references, greedy_input_tokens, greedy_logits)
 
 
-def _build_qwen35_session(model_dir: Path) -> tuple[Session, Qwen35Config]:
+def _build_qwen35_session(
+    model_dir: Path,
+    *,
+    max_draft_len: int = 0,
+    max_input_len: int = _MAX_INPUT_LENGTH,
+    max_num_tokens: int = _MAX_NUM_TOKENS,
+) -> tuple[Session, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(model_dir, dtype="bfloat16")
     _truncate_trt_config(config)
     model = Qwen35ForCausalLM(config)
@@ -219,12 +225,14 @@ def _build_qwen35_session(model_dir: Path) -> tuple[Session, Qwen35Config]:
         network.set_named_parameters(model.named_parameters())
         inputs = model.prepare_inputs(
             max_batch_size=_MAX_BATCH_SIZE,
-            max_input_len=_MAX_INPUT_LENGTH,
+            max_input_len=max_input_len,
             max_seq_len=_MAX_SEQUENCE_LENGTH,
-            max_num_tokens=_MAX_NUM_TOKENS,
+            max_num_tokens=max_num_tokens,
             opt_batch_size=_OPT_BATCH_SIZE,
             opt_num_tokens=_OPT_NUM_TOKENS,
             use_cache=True,
+            max_draft_len=max_draft_len,
+            speculative_decoding_draft_tokens_external=max_draft_len > 0,
         )
         model(**inputs)
 
@@ -362,6 +370,8 @@ def _prefill_inputs(
             recurrent_shape, dtype=torch.float32, device="cuda"
         )
 
+    if "spec_decoding_use" in _engine_input_names(session):
+        candidates.update(_verification_attention_inputs(batch_size, 1))
     input_names = _engine_input_names(session)
     required_qwen35_inputs = {"mrope_rotary_cos_sin", "mrope_position_deltas"}
     if recurrent_layer_ids:
@@ -377,6 +387,23 @@ def _prefill_inputs(
     missing_inputs = input_names - candidates.keys()
     assert not missing_inputs, f"Missing Qwen3.5 engine inputs: {sorted(missing_inputs)}"
     return {name: candidates[name] for name in input_names}
+
+
+def _verification_attention_inputs(batch_size: int, num_tokens: int) -> dict[str, torch.Tensor]:
+    return {
+        "spec_decoding_use": torch.tensor([int(num_tokens > 1)], dtype=torch.int32),
+        "spec_decoding_generation_lengths": torch.full(
+            (batch_size,), num_tokens, dtype=torch.int32, device="cuda"
+        ),
+        "spec_decoding_position_offsets": torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+        .expand(batch_size, -1)
+        .contiguous(),
+        "spec_decoding_packed_mask": torch.tensor(
+            [(1 << (idx + 1)) - 1 for idx in range(num_tokens)], dtype=torch.int32, device="cuda"
+        )
+        .repeat(batch_size)
+        .view(-1, 1),
+    }
 
 
 def _generation_inputs(
@@ -442,6 +469,8 @@ def _generation_inputs(
             f"present_recurrent_state_{layer_idx}"
         ]
 
+    if "spec_decoding_use" in _engine_input_names(session):
+        candidates.update(_verification_attention_inputs(batch_size, 1))
     input_names = _engine_input_names(session)
     missing_inputs = input_names - candidates.keys()
     assert not missing_inputs, f"Missing Qwen3.5 generation inputs: {sorted(missing_inputs)}"
@@ -616,3 +645,124 @@ def test_qwen35_session_prefill_decode_matches_hugging_face(
         assert torch.quantile(absolute_error, 0.99).item() < 1.75
         assert absolute_error.max().item() < 3.0
         assert torch.equal(actual.argmax(dim=-1), reference.argmax(dim=-1))
+
+
+@pytest.fixture(scope="module")
+def qwen35_verification_session(qwen35_checkpoint_dir: Path):
+    session, config = _build_qwen35_session(
+        qwen35_checkpoint_dir, max_draft_len=1, max_input_len=128, max_num_tokens=512
+    )
+    return session, config, _mrope_cache(config)
+
+
+@pytest.mark.parametrize("lengths", [(17,), (63,), (17, 31)])
+@pytest.mark.parametrize("matching_draft", [True, False])
+def test_qwen35_external_draft_verification(
+    qwen35_verification_session: tuple[Session, Qwen35Config, torch.Tensor],
+    lengths: tuple[int, ...],
+    matching_draft: bool,
+) -> None:
+    """Two-token verification matches sequential decode, including tentative state.
+
+    The caller retains the prefix state. Acceptance and cache promotion are
+    intentionally outside this engine-level test.
+    """
+    session, config, mrope_cache = qwen35_verification_session
+    batch_size = len(lengths)
+    input_ids, _ = _make_input_ids(lengths)
+    prefix = run_session(session, _prefill_inputs(session, config, input_ids, lengths, mrope_cache))
+    token = prefix["logits"].argmax(dim=-1).to(torch.int32)
+    first = run_session(
+        session, _generation_inputs(session, config, token, lengths, 1, mrope_cache, prefix)
+    )
+    draft = first["logits"].argmax(dim=-1).to(torch.int32)
+    if not matching_draft:
+        draft = (draft + 1) % config.vocab_size
+    second = run_session(
+        session, _generation_inputs(session, config, draft, lengths, 2, mrope_cache, first)
+    )
+
+    verification_inputs = _generation_inputs(
+        session, config, token, lengths, 1, mrope_cache, prefix
+    )
+    verification_inputs.update(_verification_attention_inputs(batch_size, 2))
+    verification_inputs.update(
+        {
+            "input_ids": torch.stack([token, draft], dim=1).flatten(),
+            "last_token_ids": torch.arange(1, 2 * batch_size + 1, dtype=torch.int32, device="cuda"),
+            "sequence_length": torch.tensor(lengths, dtype=torch.int32, device="cuda") + 2,
+            "gated_delta_cu_seqlens": torch.arange(
+                0, 2 * batch_size + 1, 2, dtype=torch.int32, device="cuda"
+            ),
+        }
+    )
+    verified = run_session(session, verification_inputs)
+    expected_logits = torch.stack([first["logits"], second["logits"]], dim=1).flatten(0, 1)
+    assert verified["logits"].shape == (2 * batch_size, config.vocab_size)
+    torch.testing.assert_close(verified["logits"], expected_logits, atol=0.15, rtol=0.02)
+    assert torch.equal(verified["logits"].argmax(dim=-1), expected_logits.argmax(dim=-1))
+    for name in second:
+        if name != "logits":
+            # BF16 projections and chunk/decode reductions use different
+            # accumulation orders; KV differences can slightly exceed 0.02.
+            atol = 0.05 if name.startswith("present_key_value_") else 0.02
+            torch.testing.assert_close(verified[name], second[name], atol=atol, rtol=0.02, msg=name)
+
+    # A subsequent ordinary decode must also consume the tentative state correctly.
+    next_token = second["logits"].argmax(dim=-1).to(torch.int32)
+    continuations = [
+        run_session(
+            session, _generation_inputs(session, config, next_token, lengths, 3, mrope_cache, state)
+        )["logits"]
+        for state in (second, verified)
+    ]
+    torch.testing.assert_close(*continuations, atol=0.15, rtol=0.02)
+
+
+@pytest.mark.parametrize(
+    "draft_length,external,tp_size,use_cache,variable_length,error",
+    [
+        (0, True, 1, True, False, "one external draft token"),
+        (1, False, 1, True, False, "one external draft token"),
+        (2, True, 1, True, False, "one external draft token"),
+        (1, True, 2, True, False, "TP=1"),
+        (1, True, 1, False, False, "use_cache=true"),
+        (1, True, 1, True, True, "variable generation lengths"),
+    ],
+)
+def test_qwen35_verification_rejects_unsupported_settings(
+    draft_length: int,
+    external: bool,
+    tp_size: int,
+    use_cache: bool,
+    variable_length: bool,
+    error: str,
+) -> None:
+    config = Qwen35Config(
+        architecture="Qwen35ForCausalLM",
+        dtype="bfloat16",
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_size=64,
+        vocab_size=128,
+        max_position_embeddings=128,
+        rotary_embedding_dim=64,
+        mrope_section=[11, 11, 10],
+        decoder_layer_types=["linear_attention", "full_attention"],
+        mapping=Mapping(world_size=tp_size, rank=0, tp_size=tp_size),
+    )
+    model = Qwen35ForCausalLM(config)
+    with pytest.raises(ValueError, match=error):
+        model.prepare_inputs(
+            max_batch_size=1,
+            max_input_len=16,
+            max_seq_len=32,
+            max_num_tokens=16,
+            use_cache=use_cache,
+            max_draft_len=draft_length,
+            speculative_decoding_draft_tokens_external=external,
+            spec_decoding_is_generation_length_variable=variable_length,
+        )

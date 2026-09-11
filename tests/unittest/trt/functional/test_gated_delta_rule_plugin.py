@@ -778,12 +778,13 @@ def test_gated_delta_rule_paged_state_prefill_decode_continuity() -> None:
         torch.testing.assert_close(state_pool, expected_state_pool, atol=2e-3, rtol=2e-3)
 
 
-def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping() -> None:
+@pytest.mark.parametrize("verification", [False, True])
+def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping(verification: bool) -> None:
     torch.manual_seed(5678)
     device = "cuda"
     num_q_heads = 16
     num_v_heads = 16
-    sequence_lengths = (17, 33, 65)
+    sequence_lengths = (2, 2, 2) if verification else (17, 33, 65)
     num_requests = len(sequence_lengths)
     total_tokens = sum(sequence_lengths)
 
@@ -800,7 +801,7 @@ def test_gated_delta_rule_paged_state_non_contiguous_slot_mapping() -> None:
     state_slot_mapping = torch.tensor([6, 2, 5], device=device, dtype=torch.int32)
     target_state_slot_mapping = torch.tensor([1, 3, 7], device=device, dtype=torch.int32)
     host_has_initial_state = torch.ones(num_requests, dtype=torch.int8)
-    host_request_types = torch.zeros(num_requests, dtype=torch.int32)
+    host_request_types = torch.full((num_requests,), int(verification), dtype=torch.int32)
     cu_seqlens = torch.tensor(
         [0, *np.cumsum(sequence_lengths).tolist()], device=device, dtype=torch.int32
     )

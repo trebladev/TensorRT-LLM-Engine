@@ -585,6 +585,32 @@ int32_t GatedDeltaRulePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginT
     {
         return enqueuePrefill(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
+    auto const& queryDims = inputDesc[static_cast<int32_t>(InputIdx::kQuery)].dims;
+    int64_t const numTokens = static_cast<int64_t>(queryDims.d[0]) * queryDims.d[1];
+    if (numTokens != numRequests)
+    {
+        constexpr int32_t kVerificationTokens = 2;
+        if (!mRemoveInputPadding || queryDims.d[0] != 1 || numTokens != kVerificationTokens * numRequests)
+        {
+            TLLM_LOG_ERROR("GatedDeltaRule verification requires two packed tokens per request");
+            return -1;
+        }
+        auto const hasInitialStateIdx = getHostHasInitialStateIdx();
+        for (int32_t requestIdx = 0; requestIdx < numRequests; ++requestIdx)
+        {
+            auto const hasState = inputDesc[hasInitialStateIdx].type == DataType::kINT32
+                ? static_cast<int32_t const*>(inputs[hasInitialStateIdx])[requestIdx]
+                : static_cast<int8_t const*>(inputs[hasInitialStateIdx])[requestIdx];
+            if (hasState != 1)
+            {
+                TLLM_LOG_ERROR("GatedDeltaRule verification requires an initial state for every request");
+                return -1;
+            }
+        }
+        // Use the stateful chunk path as the correctness reference for K=1.
+        // The caller owns the resulting tentative state until acceptance.
+        return enqueuePrefill(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+    }
     return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream);
 }
 
