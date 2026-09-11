@@ -491,6 +491,15 @@ state snapshots at 256 tokens per snapshot. These numbers are a reference for
 this machine and configuration; use the aggregate output from the benchmark
 when comparing other GPUs, engine profiles, or cache capacities.
 
+### Nsight Systems full-input sweep
+
+An additional TP=1 development measurement profiles full-input TTFT from 8K
+through 96K without prefix-cache reuse. It separates kernels that can be
+identified as full-attention or linear-attention core work and records the
+long-context bottleneck transition. See
+[Qwen3.5 Long-Context Nsight Systems Analysis](NSYS_LONG_CONTEXT_ANALYSIS.md)
+for the configuration, measurements, classification boundaries, and findings.
+
 ## Validation
 
 Set `LLM_MODELS_ROOT` to a directory containing `Qwen3.5-2B`, then run:
