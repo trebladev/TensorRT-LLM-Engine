@@ -4,12 +4,14 @@
 import typing as tp
 from pathlib import Path
 
+import pytest
 import torch
-from bindings.binding_test_utils import *
+from bindings.binding_test_utils import prepare_model_tests
 from transformers import AutoTokenizer
-from utils.cpp_paths import *
+from utils.cpp_paths import *  # noqa: F403,F401
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm.inputs import MultimodalInput
 from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
 
 
@@ -96,3 +98,40 @@ def test_prepare_default_mrope_executor():
     for config in configs:
         torch.testing.assert_close(config.mrope_rotary_cos_sin,
                                    rotary_cos_sin[0])
+
+
+def test_prepare_multimodal_inputs_executor():
+    runner = object.__new__(ModelRunnerCpp)
+    multimodal_input = MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        multimodal_positions=[1],
+        multimodal_lengths=[2],
+    )
+
+    prepared = runner._prepare_multimodal_inputs_executor([[10, 11, 12, 13]],
+                                                          [multimodal_input])
+
+    assert len(prepared) == 1
+    assert prepared[0].multimodal_hashes == [[1, 2, 3, 4, 5, 6, 7, 8]]
+    assert prepared[0].multimodal_positions == [1]
+    assert prepared[0].multimodal_lengths == [2]
+
+
+def test_prepare_multimodal_inputs_executor_rejects_batch_mismatch():
+    runner = object.__new__(ModelRunnerCpp)
+
+    with pytest.raises(ValueError, match="must match the input batch size"):
+        runner._prepare_multimodal_inputs_executor([[1], [2]], [None])
+
+
+def test_prepare_multimodal_inputs_executor_rejects_out_of_range_span():
+    runner = object.__new__(ModelRunnerCpp)
+    multimodal_input = MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        multimodal_positions=[2],
+        multimodal_lengths=[2],
+    )
+
+    with pytest.raises(ValueError, match="span exceeds the request input"):
+        runner._prepare_multimodal_inputs_executor([[10, 11, 12]],
+                                                   [multimodal_input])

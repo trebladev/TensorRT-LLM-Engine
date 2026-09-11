@@ -30,6 +30,7 @@ from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
                                  OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
 from ..functional import RopeEmbeddingUtils
+from ..inputs.multimodal import MultimodalInput as PythonMultimodalInput
 from ..layers import MropeParams
 from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
@@ -51,6 +52,7 @@ _bindings_dtype_to_torch_dtype_dict = {
 }
 
 SamplingConfigType = Union[SamplingConfig, trtllm.SamplingConfig]
+MultimodalInputType = Union[PythonMultimodalInput, trtllm.MultimodalInput]
 
 
 def _world_config_to_mapping(world_config: WorldConfig):
@@ -572,6 +574,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             bad_words_list: list[list[int]] | None = None,
             stop_words_list: list[list[int]] | None = None,
             return_dict: bool = False,
+            output_context_logits: Optional[bool] = None,
             output_sequence_lengths: bool = False,
             output_generation_logits: bool = False,
             output_log_probs: bool = False,
@@ -579,6 +582,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             prompt_table: Optional[Union[str, torch.Tensor]] = None,
             prompt_tasks: Optional[str] = None,
             input_token_extra_ids: List[List[int]] = None,
+            multimodal_inputs: Optional[List[
+                Optional[MultimodalInputType]]] = None,
             return_all_generated_tokens: bool = False,
             language_adapter_uids: Optional[List[int]] = None,
             mm_embedding_offloading: bool = False,
@@ -609,6 +614,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The prompt tuning task ids for the input batch, in format of comma-separated list (e.g., 0,3,1,0).
             input_token_extra_ids (List[List[int]]):
                 Input token extra ids for using p-tuning and KV Cache reuse together
+            multimodal_inputs (List[MultimodalInput]):
+                Per-request multimodal hashes and prompt spans used to build
+                content-aware KV cache keys.
             lora_uids (list):
                 The uids of LoRA weights for the input batch. Use -1 to disable the LoRA module.
             streaming (bool):
@@ -619,6 +627,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Custom logits processor names.
             return_all_generated_tokens (bool):
                 Whether the full output is returned at each streaming step
+            output_context_logits (bool):
+                Whether to return context logits for this call. By default,
+                follows the engine's gather-context-logits setting.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -627,8 +638,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 If return_dict=False, the method returns generated output_ids.
                 If return_dict=True, the method returns a dict of output_ids,
                 sequence_lengths (if sampling_config.output_sequence_lengths=True),
-                context_logits and generation_logits (if self.gather_context_logits=True and
-                self.gather_generation_logits=True, respectively).
+                context_logits when requested from a compatible engine, and
+                generation_logits when enabled by the engine or call.
         """
         # TODO: Check if these can be supported now and support them
         if stopping_criteria is not None:
@@ -713,8 +724,15 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self._check_inputs(batch_input_ids_list, encoder_input_ids_list,
                            sampling_config, max_new_tokens)
 
+        if output_context_logits is None:
+            output_context_logits = self.gather_context_logits
+        elif output_context_logits and not self.gather_context_logits:
+            raise ValueError(
+                "Context logits were requested, but the engine was not built "
+                "with gather_context_logits enabled.")
+
         output_config = trtllm.OutputConfig(
-            return_context_logits=self.gather_context_logits,
+            return_context_logits=output_context_logits,
             return_generation_logits=self.gather_generation_logits
             or output_generation_logits,
             return_log_probs=output_log_probs,
@@ -726,6 +744,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             prompt_tasks,
             input_token_extra_ids,
             mm_embedding_offloading=mm_embedding_offloading)
+        multimodal_inputs = self._prepare_multimodal_inputs_executor(
+            batch_input_ids_list, multimodal_inputs)
         mrope_configs = self._prepare_mrope_executor(batch_input_ids_list,
                                                      mrope_params)
 
@@ -796,6 +816,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 streaming=streaming,
                 output_config=output_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_input=multimodal_input,
                 mrope_config=mrope_config,
                 lora_config=lora_config,
                 return_all_generated_tokens=return_all_generated_tokens,
@@ -805,13 +826,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 language_adapter_uid=language_adapter_uid,
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
-             mrope_config, lora_config, logits_post_processor_name,
-             external_draft_tokens_config, language_adapter_uid,
-             sampling_config_each_request) in enumerate(
+             multimodal_input, mrope_config, lora_config,
+             logits_post_processor_name, external_draft_tokens_config,
+             language_adapter_uid, sampling_config_each_request) in enumerate(
                  zip(batch_input_ids_list, stop_words_list, bad_words_list,
-                     prompt_tuning_configs, mrope_configs, lora_configs,
-                     logits_processor_names, external_draft_tokens_configs,
-                     language_adapter_uids, sampling_config_list))
+                     prompt_tuning_configs, multimodal_inputs, mrope_configs,
+                     lora_configs, logits_processor_names,
+                     external_draft_tokens_configs, language_adapter_uids,
+                     sampling_config_list))
         ]
 
         request_ids = self.session.enqueue_requests(requests)
@@ -820,6 +842,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 request_ids=request_ids,
                 end_id=end_id,
                 return_dict=return_dict,
+                output_context_logits=output_context_logits,
                 output_sequence_lengths=output_sequence_lengths,
                 output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
@@ -834,6 +857,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 request_ids=request_ids,
                 end_id=end_id,
                 return_dict=return_dict,
+                output_context_logits=output_context_logits,
                 output_sequence_lengths=output_sequence_lengths,
                 output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
@@ -897,7 +921,45 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 ]
         return prompt_tuning_configs
 
-    # TODO: add multimodal input for TRT engine backend
+    def _prepare_multimodal_inputs_executor(
+        self,
+        batch_input_ids_list: List[List[int]],
+        multimodal_inputs: Optional[List[Optional[MultimodalInputType]]],
+    ) -> List[Optional[trtllm.MultimodalInput]]:
+        batch_size = len(batch_input_ids_list)
+        if multimodal_inputs is None:
+            return [None] * batch_size
+        if len(multimodal_inputs) != batch_size:
+            raise ValueError(
+                "The number of multimodal inputs must match the input batch "
+                f"size, got {len(multimodal_inputs)} and {batch_size}.")
+
+        prepared_inputs = []
+        for request_index, (input_ids, multimodal_input) in enumerate(
+                zip(batch_input_ids_list, multimodal_inputs)):
+            if multimodal_input is None:
+                prepared_inputs.append(None)
+                continue
+            if isinstance(multimodal_input, PythonMultimodalInput):
+                binding_input = multimodal_input.to_binding(trtllm)
+            elif isinstance(multimodal_input, trtllm.MultimodalInput):
+                binding_input = multimodal_input
+            else:
+                raise TypeError(
+                    "multimodal_inputs entries must be MultimodalInput or "
+                    f"None, got {type(multimodal_input)} at index "
+                    f"{request_index}.")
+
+            prompt_length = len(input_ids)
+            for position, length in zip(binding_input.multimodal_positions,
+                                        binding_input.multimodal_lengths):
+                if position + length > prompt_length:
+                    raise ValueError(
+                        "Multimodal prompt span exceeds the request input: "
+                        f"request={request_index}, position={position}, "
+                        f"length={length}, prompt_length={prompt_length}.")
+            prepared_inputs.append(binding_input)
+        return prepared_inputs
 
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
@@ -956,6 +1018,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         request_ids,
         end_id,
         return_dict,
+        output_context_logits,
         output_sequence_lengths,
         output_generation_logits,
         output_log_probs,
@@ -984,6 +1047,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             output_ids=output_ids,
             end_id=end_id,
             return_dict=return_dict,
+            output_context_logits=output_context_logits,
             output_sequence_lengths=output_sequence_lengths,
             output_generation_logits=output_generation_logits,
             output_log_probs=output_log_probs,
@@ -1003,6 +1067,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         request_ids,
         end_id,
         return_dict,
+        output_context_logits,
         output_sequence_lengths,
         output_generation_logits,
         output_log_probs,
@@ -1033,6 +1098,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 output_ids=output_ids,
                 end_id=end_id,
                 return_dict=return_dict,
+                output_context_logits=output_context_logits,
                 output_sequence_lengths=output_sequence_lengths,
                 output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
@@ -1053,6 +1119,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         output_ids,
         end_id,
         return_dict,
+        output_context_logits,
         output_sequence_lengths,
         output_generation_logits,
         output_log_probs,
@@ -1121,7 +1188,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                                            dtype=torch.int32,
                                                            device=cuda_device)
 
-            if self.gather_context_logits:
+            if output_context_logits:
                 context_logits = None
                 max_input_len = input_lengths.max()
                 for response in responses:
