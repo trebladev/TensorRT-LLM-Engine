@@ -290,6 +290,10 @@ def _build_paged_mamba_conv1d_session(
             target_state_slot_mapping_tensor = Tensor(
                 "target_state_slot_mapping", trt.int32,
                 input_shapes["target_state_slot_mapping"])
+        snapshot_tensor = None
+        if "snapshot_slot_mapping" in input_shapes:
+            snapshot_tensor = Tensor("snapshot_slot_mapping", trt.int32,
+                                     input_shapes["snapshot_slot_mapping"])
         host_has_initial_state_tensor = Tensor(
             "host_has_initial_state",
             trt.int8,
@@ -313,6 +317,7 @@ def _build_paged_mamba_conv1d_session(
             state_channel_stride_bytes=(dconv - 1) * torch.bfloat16.itemsize,
             state_history_stride_bytes=torch.bfloat16.itemsize,
             target_slot_mapping=target_state_slot_mapping_tensor,
+            snapshot_slot_mapping=snapshot_tensor,
         )
         output_tensor.mark_output("output")
 
@@ -540,3 +545,78 @@ def test_mamba_conv1d_paged_state_combined_record_stride() -> None:
         record_pool.index_select(0, unused_slots),
         record_before_decode.index_select(0, unused_slots),
     )
+
+
+@pytest.mark.parametrize("has_initial", [False, True])
+def test_mamba_conv1d_multiple_snapshots(has_initial: bool) -> None:
+    torch.manual_seed(743)
+    dim, width, length = 256, 4, 4096
+    boundaries = [1, 2, 32, *range(256, length + 1, 256)]
+    num_slots = len(boundaries) + 2
+    ssm_bytes = 4096
+    stride = ssm_bytes + dim * (width - 1) * 2
+    records = torch.full((num_slots, stride),
+                         0xA5,
+                         dtype=torch.uint8,
+                         device="cuda")
+    states = torch.as_strided(records.view(torch.bfloat16),
+                              (num_slots, dim, width - 1),
+                              (stride // 2, width - 1, 1),
+                              storage_offset=ssm_bytes // 2)
+    states.copy_(0.1 * torch.randn_like(states))
+    original = records.clone()
+    initial = states.clone()
+    x = torch.randn(length, dim, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(dim, 1, width, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(dim, dtype=torch.bfloat16, device="cuda")
+    mapping = torch.full((length, ), -1, dtype=torch.int32, device="cuda")
+    slots = list(reversed(range(1, len(boundaries) + 1)))
+    for boundary, slot in zip(boundaries, slots):
+        mapping[boundary - 1] = slot
+    inputs = {
+        "input":
+        x,
+        "state":
+        torch.tensor([states.data_ptr()], dtype=torch.int64),
+        "weight":
+        weight.permute(1, 2, 0).contiguous(),
+        "bias":
+        bias,
+        "host_request_types":
+        torch.zeros(1, dtype=torch.int32),
+        "last_token_ids":
+        torch.tensor([length], dtype=torch.int32, device="cuda"),
+        "host_context_lengths":
+        torch.tensor([length], dtype=torch.int32),
+        "state_slot_mapping":
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        "target_state_slot_mapping":
+        torch.tensor([slots[-1]], dtype=torch.int32, device="cuda"),
+        "host_has_initial_state":
+        torch.tensor([has_initial], dtype=torch.int8),
+        "snapshot_slot_mapping":
+        mapping,
+    }
+    session = _build_paged_mamba_conv1d_session(
+        {
+            name: tuple(t.shape)
+            for name, t in inputs.items()
+        }, dim, width, stride)
+    output = _run_paged_mamba_conv1d_session(session, inputs)
+    expected, _ = _mamba_conv1d_paged_reference(
+        x, (length, ), initial, weight, bias, inputs["state_slot_mapping"],
+        inputs["host_has_initial_state"], inputs["target_state_slot_mapping"])
+    torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+    history = initial[0] if has_initial else torch.zeros_like(initial[0])
+    extended = torch.cat((history.T, x))
+    for boundary, slot in zip(boundaries, slots):
+        torch.testing.assert_close(states[slot],
+                                   extended[boundary:boundary + width - 1].T,
+                                   rtol=0,
+                                   atol=0)
+    torch.testing.assert_close(records[:, :ssm_bytes],
+                               original[:, :ssm_bytes],
+                               rtol=0,
+                               atol=0)
+    torch.testing.assert_close(records[0], original[0], rtol=0, atol=0)
+    torch.testing.assert_close(records[-1], original[-1], rtol=0, atol=0)

@@ -41,6 +41,7 @@ struct MambaConv1dParamsBase
     int const* __restrict__ source_state_slot_mapping_ptr;
     int const* __restrict__ target_state_slot_mapping_ptr;
     int8_t const* __restrict__ has_initial_state_ptr;
+    int32_t const* snapshot_slot_mapping_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

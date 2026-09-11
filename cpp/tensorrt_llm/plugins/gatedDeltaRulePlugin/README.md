@@ -65,12 +65,25 @@ checked-in decode and prefill cubin archives included. The repository
 `--skip-python-env-check` only for the direct CMake path that does not package a
 wheel.
 
-The Qwen3.5 TensorRT graph now passes the combined-record stride to the plugin
-and declares recurrent-state pointers, convolution-state pointers, and
-`host_has_initial_state` as host inputs. Remaining end-to-end runtime work
-includes populating `state_slot_mapping` with KVCacheManager physical block
-indices, binding both state pointers to the unified state pool, and teaching
-MambaConv1d the same combined-record stride and initial-state semantics. Padded
+The Qwen3.5 TensorRT runtime binds separate source and target physical state
+slots into the unified recurrent/convolution pool. New paged-state engines also
+expose `state_snapshot_slot_mapping`, an int32 array with one entry per packed
+token: a non-negative entry names the physical slot to write after that token;
+`-1` means no snapshot. Both GatedDeltaRule and MambaConv1d receive this mapping.
+The GDN AOT state kernel stores FP32 snapshots, including boundaries inside its
+64-token compute chunks, and Conv stores the matching input history.
+
+The runtime detects this engine input and allows one prefill execution to cross
+multiple snapshot boundaries (for example, 4096 tokens with snapshots every
+256 tokens). Scheduling still respects the token budget and ends non-final
+chunks at an allocated snapshot so the next execution has a valid initial
+state. Periodic, visual-boundary, and last-full-block snapshot policies retain
+their existing allocation and prefix-reuse behavior. Old engines without this
+input continue to stop at each snapshot boundary. Rebuild the Qwen3.5 paged-state
+engine to enable this behavior; increasing a runtime token limit alone does not
+upgrade an old engine.
+
+Padded
 prefill tensors with a Q/K/V batch dimension greater than one, mixed
 prefill/decode batches, non-SM89 cubins, and additional head configurations are
 not currently supported.
@@ -95,7 +108,7 @@ python3 cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/aot/compile_prefill.py --a
 
 The scripts write deterministic `.cubin.tar.zst` archives to
 `cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/cubin/`. A complete SM89 set
-contains four decode archives and 31 prefill archives.
+contains four decode archives and 35 prefill archives.
 
 The Triton 3.6 AOT ABI appends `global_scratch` and `profile_scratch` launch
 arguments. If the Triton version or a kernel signature changes, verify the

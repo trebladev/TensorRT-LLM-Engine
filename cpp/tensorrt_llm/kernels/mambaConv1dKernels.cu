@@ -787,7 +787,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     TLLM_CHECK_WITH_INFO(K == 4, "Only dconv == 4 is supported.");
     bool const compactState = params.state_slot_stride == static_cast<int64_t>(K - 1) * D
         && params.state_channel_stride == 1 && params.state_history_stride == D;
-    if (!compactState || params.has_initial_state_ptr != nullptr)
+    if (!compactState || params.has_initial_state_ptr != nullptr || params.snapshot_slot_mapping_ptr != nullptr)
     {
         int constexpr threads = 256;
         dim3 const blocks((D + threads - 1) / threads, B);
@@ -1281,6 +1281,21 @@ __global__ void mamba_conv1d_strided_context_kernel(MambaConv1dParamsBase params
             history[historyIdx] = history[historyIdx + 1];
         }
         history[DCONV - 2] = current;
+        if (params.snapshot_slot_mapping_ptr != nullptr)
+        {
+            auto const slot = params.snapshot_slot_mapping_ptr[tokenOffset + tokenIdx];
+            if (slot >= 0)
+            {
+                auto const base = static_cast<int64_t>(slot) * params.state_slot_stride
+                    + static_cast<int64_t>(channel) * params.state_channel_stride;
+#pragma unroll
+                for (int historyIdx = 0; historyIdx < DCONV - 1; ++historyIdx)
+                {
+                    stateOut[base + static_cast<int64_t>(historyIdx) * params.state_history_stride]
+                        = tensorrt_llm::common::cuda_cast<input_t, float>(history[historyIdx]);
+                }
+            }
+        }
     }
 
 #pragma unroll

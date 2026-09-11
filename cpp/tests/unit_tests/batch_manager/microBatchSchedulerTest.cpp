@@ -2512,3 +2512,30 @@ TEST_F(ForceChunkTest, FullSchedulerWithGeneration)
     // Budget remaining = 15 - 1 (gen) = 14; chunk = min(30, 10) = 10
     EXPECT_EQ(contextRequests[0]->getContextChunkSize(), 10);
 }
+
+TEST_F(MicroBatchSchedulerTest, EngineSnapshotsAllowLongPrefill)
+{
+    batch_scheduler::ContextChunkingConfig config{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, 32};
+    config.stateSnapshotInterval = 256;
+    config.lastSnapshotTokensPerBlock = 32;
+    config.snapshotsInEngine = true;
+    auto scheduler = MicroBatchScheduler{config};
+    RequestVector requests{createRequest(/*promptLen=*/4096, /*maxNewTokens=*/1, /*reqId=*/0)};
+    auto const [contexts, generations] = scheduler(requests, {}, 1, 4096);
+    ASSERT_EQ(contexts.size(), 1);
+    EXPECT_EQ(contexts.front()->getContextChunkSize(), 4096);
+}
+
+TEST_F(MicroBatchSchedulerTest, EngineSnapshotsRespectBudgetAndPrefix)
+{
+    batch_scheduler::ContextChunkingConfig config{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, 32};
+    config.stateSnapshotInterval = 256;
+    config.lastSnapshotTokensPerBlock = 32;
+    config.snapshotsInEngine = true;
+    auto scheduler = MicroBatchScheduler{config};
+    RequestVector requests{createRequest(/*promptLen=*/4097, /*maxNewTokens=*/1, /*reqId=*/0)};
+    requests.front()->setContextCurrentPosition(512);
+    auto const [contexts, generations] = scheduler(requests, {}, 1, 800);
+    ASSERT_EQ(contexts.size(), 1);
+    EXPECT_EQ(contexts.front()->getContextChunkSize(), 768);
+}

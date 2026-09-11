@@ -32,6 +32,7 @@ enum class GatedDeltaRulePrefillKernel : int32_t
     kKktSolve,
     kRecompute,
     kState,
+    kStateSnapshots,
     kOutput
 };
 

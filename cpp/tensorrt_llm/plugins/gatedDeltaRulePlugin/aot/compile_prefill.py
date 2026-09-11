@@ -21,7 +21,7 @@ import importlib.util
 import subprocess
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -374,6 +374,22 @@ def _kernel_specs(kernels: dict[str, triton.runtime.JITFunction]) -> list[Kernel
                 ),
             ]
         )
+    # The snapshot variant adds one device pointer to the existing state ABI.
+    for spec in list(specs):
+        if spec.name == "state":
+            specs.append(
+                replace(
+                    spec,
+                    name="state_snapshots",
+                    argument_types=spec.argument_types + ("*i32:16", "1"),
+                )
+            )
+    specs = [
+        replace(spec, argument_types=spec.argument_types + ("0", "0"))
+        if spec.name == "state"
+        else spec
+        for spec in specs
+    ]
     return specs
 
 

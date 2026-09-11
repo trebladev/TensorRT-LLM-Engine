@@ -89,6 +89,11 @@ def _build_gated_delta_rule_session(
                 trt.int32,
                 input_shapes["target_state_slot_mapping"],
             )
+        snapshot_tensor = None
+        if "snapshot_slot_mapping" in input_shapes:
+            snapshot_tensor = Tensor(
+                "snapshot_slot_mapping", trt.int32, input_shapes["snapshot_slot_mapping"]
+            )
         host_has_initial_state_tensor = Tensor(
             "host_has_initial_state",
             trt.int8,
@@ -119,6 +124,7 @@ def _build_gated_delta_rule_session(
             state_slot_mapping_tensor,
             host_has_initial_state_tensor,
             target_state_slot_mapping=target_state_slot_mapping_tensor,
+            snapshot_slot_mapping=snapshot_tensor,
         )
         output_tensor.mark_output("output")
         final_state_tensor.mark_output("final_state")
@@ -357,6 +363,7 @@ def _gated_delta_rule_prefill_reference(
     state_slot_mapping: torch.Tensor,
     has_initial_state: torch.Tensor,
     target_state_slot_mapping: torch.Tensor | None = None,
+    snapshot_slot_mapping: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     activation_dtype = value.dtype
     query = query.squeeze(0).float()
@@ -371,6 +378,9 @@ def _gated_delta_rule_prefill_reference(
     query = query.repeat_interleave(heads_ratio, dim=1)
     key = key.repeat_interleave(heads_ratio, dim=1)
 
+    snapshot_slots = (
+        snapshot_slot_mapping.cpu().tolist() if snapshot_slot_mapping is not None else None
+    )
     output = torch.empty_like(value_fp32)
     final_state = state.clone().float()
     sequence_offsets = cu_seqlens.cpu().tolist()
@@ -396,6 +406,8 @@ def _gated_delta_rule_prefill_reference(
             )
             value_residual *= beta[token_idx, :, None]
             recurrent_state += torch.einsum("hv,hk->hvk", value_residual, key[token_idx])
+            if snapshot_slots is not None and snapshot_slots[token_idx] >= 0:
+                final_state[snapshot_slots[token_idx]] = recurrent_state
             output[token_idx] = torch.einsum(
                 "hvk,hk->hv", recurrent_state, query[token_idx] * scale
             )
@@ -1207,3 +1219,173 @@ def test_gated_delta_rule_dynamic_context_and_generation_profiles() -> None:
         )
         torch.testing.assert_close(output.float(), output_ref.float(), atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(final_state, final_state_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("sequence_length,has_initial", [(4096, False), (609, True)])
+def test_gated_delta_rule_prefill_multiple_snapshots(
+    sequence_length: int, has_initial: bool
+) -> None:
+    """One engine execution must produce reusable FP32 states at every boundary."""
+    torch.manual_seed(741)
+    heads = 8
+    boundaries = list(range(256, sequence_length + 1, 256))
+    # Include a boundary inside the 64-token compute chunk and a partial tail.
+    boundaries = sorted(set(boundaries + [32, sequence_length // 32 * 32, sequence_length]))
+    slots = list(reversed(range(1, len(boundaries) + 1)))
+    state_bytes = heads * HEAD_V_DIM * HEAD_K_DIM * 4
+    conv_bytes = 3 * (3 * heads * HEAD_K_DIM) * 2
+    stride_bytes = state_bytes + conv_bytes
+    records = torch.full((len(slots) + 2, stride_bytes), 0xA5, dtype=torch.uint8, device="cuda")
+    pool = torch.as_strided(
+        records.view(torch.float32),
+        (len(slots) + 2, heads, HEAD_V_DIM, HEAD_K_DIM),
+        (stride_bytes // 4, HEAD_V_DIM * HEAD_K_DIM, HEAD_K_DIM, 1),
+    )
+    pool.copy_(0.02 * torch.randn_like(pool))
+    original = records.clone()
+    initial = pool[0:1].clone()
+    q = torch.randn(1, sequence_length, heads, HEAD_K_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = -0.1 * torch.rand(1, sequence_length, heads, device="cuda")
+    beta = torch.sigmoid(torch.randn_like(g))
+    mapping = torch.full((sequence_length,), -1, dtype=torch.int32, device="cuda")
+    for boundary, slot in zip(boundaries, slots):
+        mapping[boundary - 1] = slot
+    inputs = {
+        "query": q,
+        "key": k,
+        "value": v,
+        "log_decay": g,
+        "beta": beta,
+        "state": torch.tensor([pool.data_ptr()], dtype=torch.int64),
+        "host_request_types": torch.zeros(1, dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, sequence_length], dtype=torch.int32, device="cuda"),
+        "state_slot_mapping": torch.tensor(
+            [0 if has_initial else slots[-1]], dtype=torch.int32, device="cuda"
+        ),
+        "target_state_slot_mapping": torch.tensor([slots[-1]], dtype=torch.int32, device="cuda"),
+        "host_has_initial_state": torch.tensor([has_initial], dtype=torch.int8),
+        "snapshot_slot_mapping": mapping,
+    }
+    session = _build_gated_delta_rule_session(
+        {name: tuple(t.shape) for name, t in inputs.items()},
+        heads,
+        heads,
+        paged_state=True,
+        remove_input_padding=True,
+        state_slot_stride_bytes=stride_bytes,
+    )
+    output, _ = _run_gated_delta_rule_session(session, inputs)
+    ref_pool = pool.clone()
+    ref_pool[0] = initial[0]
+    ref_output, ref_state = _gated_delta_rule_prefill_reference(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ref_pool,
+        inputs["cu_seqlens"],
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        inputs["host_has_initial_state"],
+        inputs["target_state_slot_mapping"],
+        mapping,
+    )
+    for boundary, slot in zip(boundaries, slots):
+        torch.testing.assert_close(
+            pool[slot],
+            ref_state[slot],
+            atol=0.02,
+            rtol=0.02,
+            msg=lambda msg: f"Snapshot at {boundary}: {msg}",
+        )
+    torch.testing.assert_close(output.float(), ref_output.float(), atol=0.02, rtol=0.02)
+    # Snapshot stores must neither overwrite the source nor the adjacent Conv subsection.
+    torch.testing.assert_close(records[0], original[0], rtol=0, atol=0)
+    torch.testing.assert_close(records[-1], original[-1], rtol=0, atol=0)
+    torch.testing.assert_close(records[:, state_bytes:], original[:, state_bytes:], rtol=0, atol=0)
+
+    # Resume with the legacy single-target plugin: published snapshots must be
+    # sufficient to continue, without recomputing the skipped prefix.
+    resume_at = 256 if sequence_length == 4096 else 32
+    resumed_inputs = {
+        name: tensor for name, tensor in inputs.items() if name != "snapshot_slot_mapping"
+    }
+    for name in ("query", "key", "value", "log_decay", "beta"):
+        resumed_inputs[name] = inputs[name][:, resume_at:].contiguous()
+    resumed_inputs["state_slot_mapping"] = torch.tensor(
+        [slots[boundaries.index(resume_at)]], dtype=torch.int32, device="cuda"
+    )
+    resumed_inputs["target_state_slot_mapping"] = torch.tensor(
+        [len(slots) + 1], dtype=torch.int32, device="cuda"
+    )
+    resumed_inputs["host_has_initial_state"] = torch.ones(1, dtype=torch.int8)
+    resumed_inputs["cu_seqlens"] = torch.tensor(
+        [0, sequence_length - resume_at], dtype=torch.int32, device="cuda"
+    )
+    resumed_session = _build_gated_delta_rule_session(
+        {name: tuple(t.shape) for name, t in resumed_inputs.items()},
+        heads,
+        heads,
+        paged_state=True,
+        remove_input_padding=True,
+        state_slot_stride_bytes=stride_bytes,
+    )
+    resumed_output, resumed_state = _run_gated_delta_rule_session(resumed_session, resumed_inputs)
+    torch.testing.assert_close(
+        resumed_output.float(), output[:, resume_at:].float(), atol=0.02, rtol=0.02
+    )
+    torch.testing.assert_close(resumed_state[0], pool[slots[-1]], atol=0.02, rtol=0.02)
+
+
+def test_gated_delta_rule_ragged_snapshots() -> None:
+    """Packed offsets and source slots must remain independent across requests."""
+    torch.manual_seed(749)
+    lengths = (65, 289)
+    total = sum(lengths)
+    q_heads, v_heads = 16, 32
+    pool = 0.02 * torch.randn(9, v_heads, HEAD_V_DIM, HEAD_K_DIM, device="cuda")
+    initial = pool.clone()
+    q = torch.randn(1, total, q_heads, HEAD_K_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(1, total, v_heads, HEAD_V_DIM, dtype=torch.bfloat16, device="cuda")
+    mapping = torch.full((total,), -1, dtype=torch.int32, device="cuda")
+    for token, slot in [(31, 5), (63, 3), (64, 6), (65 + 31, 4), (65 + 255, 2), (total - 1, 7)]:
+        mapping[token] = slot
+    inputs = {
+        "query": q,
+        "key": torch.randn_like(q),
+        "value": v,
+        "log_decay": -0.1 * torch.rand(1, total, v_heads, device="cuda"),
+        "beta": torch.sigmoid(torch.randn(1, total, v_heads, device="cuda")),
+        "state": torch.tensor([pool.data_ptr()], dtype=torch.int64),
+        "host_request_types": torch.zeros(2, dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, lengths[0], total], dtype=torch.int32, device="cuda"),
+        "state_slot_mapping": torch.tensor([0, 7], dtype=torch.int32, device="cuda"),
+        "target_state_slot_mapping": torch.tensor([6, 7], dtype=torch.int32, device="cuda"),
+        "host_has_initial_state": torch.tensor([1, 0], dtype=torch.int8),
+        "snapshot_slot_mapping": mapping,
+    }
+    session = _build_gated_delta_rule_session(
+        {name: tuple(t.shape) for name, t in inputs.items()},
+        q_heads,
+        v_heads,
+        paged_state=True,
+        remove_input_padding=True,
+    )
+    output, _ = _run_gated_delta_rule_session(session, inputs)
+    expected_output, expected_pool = _gated_delta_rule_prefill_reference(
+        q,
+        inputs["key"],
+        v,
+        inputs["log_decay"],
+        inputs["beta"],
+        initial,
+        inputs["cu_seqlens"],
+        inputs["state_slot_mapping"],
+        inputs["host_has_initial_state"],
+        inputs["target_state_slot_mapping"],
+        mapping,
+    )
+    torch.testing.assert_close(output.float(), expected_output.float(), rtol=0.02, atol=0.02)
+    torch.testing.assert_close(pool, expected_pool, rtol=0.02, atol=0.02)

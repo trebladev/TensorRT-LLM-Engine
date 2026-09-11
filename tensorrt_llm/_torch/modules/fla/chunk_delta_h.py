@@ -62,6 +62,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    snapshot_slot_mapping=None,
+    SAVE_SNAPSHOTS: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -85,6 +87,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     if K > 192:
         b_h4 = tl.zeros([64, BV], dtype=tl.float32)
 
+    snapshot_pool = ht
     # calculate offset
     h += (boh * H + i_h) * K * V
     v += (bos * H + i_h) * V
@@ -186,6 +189,76 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                      b_v_new.to(p_v_new.dtype.element_ty),
                      boundary_check=(0, 1))
 
+        if SAVE_SNAPSHOTS:
+            # A snapshot may fall inside a 64-token compute chunk (e.g. a last
+            # full KV block of 32 tokens). Mask the chunk update at that token.
+            offsets = tl.arange(0, BT)
+            last_offset = tl.minimum(BT, T - i_t * BT) - 1
+            slots = tl.load(snapshot_slot_mapping + bos + i_t * BT + offsets,
+                            mask=offsets < last_offset,
+                            other=-1)
+            snapshot_offset = tl.min(tl.where(slots >= 0, offsets, BT), 0)
+            while snapshot_offset < BT:
+                slot = tl.load(snapshot_slot_mapping + bos + i_t * BT +
+                               snapshot_offset).to(tl.int64)
+                snapshot_g = tl.load(g +
+                                     (bos + i_t * BT + snapshot_offset) * H +
+                                     i_h)
+                chunk_g = tl.load(g + (bos + i_t * BT + offsets) * H + i_h,
+                                  mask=offsets <= snapshot_offset,
+                                  other=0)
+                snapshot_v = tl.where(
+                    (offsets <= snapshot_offset)[:, None],
+                    b_v_new * safe_exp(snapshot_g - chunk_g)[:, None],
+                    0).to(k.dtype.element_ty)
+                snapshot_base = snapshot_pool + slot * stride_h0 + i_h * K * V
+                snapshot_k_ptr = tl.make_block_ptr(k, (K, T), (1, stride_k),
+                                                   (0, i_t * BT), (64, BT),
+                                                   (0, 1))
+                snapshot_k = tl.load(snapshot_k_ptr, boundary_check=(0, 1))
+                snapshot_h = b_h1 * exp(snapshot_g) + tl.dot(
+                    snapshot_k, snapshot_v)
+                snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V), (1, K),
+                                                 (0, i_v * BV), (64, BV),
+                                                 (0, 1))
+                tl.store(snapshot_ptr, snapshot_h, boundary_check=(0, 1))
+                if K > 64:
+                    snapshot_k_ptr = tl.make_block_ptr(k, (K, T), (1, stride_k),
+                                                       (64, i_t * BT), (64, BT),
+                                                       (0, 1))
+                    snapshot_k = tl.load(snapshot_k_ptr, boundary_check=(0, 1))
+                    snapshot_h = b_h2 * exp(snapshot_g) + tl.dot(
+                        snapshot_k, snapshot_v)
+                    snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V),
+                                                     (1, K), (64, i_v * BV),
+                                                     (64, BV), (0, 1))
+                    tl.store(snapshot_ptr, snapshot_h, boundary_check=(0, 1))
+                if K > 128:
+                    snapshot_k_ptr = tl.make_block_ptr(k, (K, T), (1, stride_k),
+                                                       (128, i_t * BT),
+                                                       (64, BT), (0, 1))
+                    snapshot_k = tl.load(snapshot_k_ptr, boundary_check=(0, 1))
+                    snapshot_h = b_h3 * exp(snapshot_g) + tl.dot(
+                        snapshot_k, snapshot_v)
+                    snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V),
+                                                     (1, K), (128, i_v * BV),
+                                                     (64, BV), (0, 1))
+                    tl.store(snapshot_ptr, snapshot_h, boundary_check=(0, 1))
+                if K > 192:
+                    snapshot_k_ptr = tl.make_block_ptr(k, (K, T), (1, stride_k),
+                                                       (192, i_t * BT),
+                                                       (64, BT), (0, 1))
+                    snapshot_k = tl.load(snapshot_k_ptr, boundary_check=(0, 1))
+                    snapshot_h = b_h4 * exp(snapshot_g) + tl.dot(
+                        snapshot_k, snapshot_v)
+                    snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V),
+                                                     (1, K), (192, i_v * BV),
+                                                     (64, BV), (0, 1))
+                    tl.store(snapshot_ptr, snapshot_h, boundary_check=(0, 1))
+                snapshot_offset = tl.min(
+                    tl.where((slots >= 0) & (offsets > snapshot_offset),
+                             offsets, BT), 0)
+
         if USE_G:
             last_idx = min((i_t + 1) * BT, T) - 1
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
@@ -221,6 +294,31 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                                     (64, BT), (0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(b_k, b_v_new)
+
+        if SAVE_SNAPSHOTS:
+            end = tl.minimum((i_t + 1) * BT, T) - 1
+            slot = tl.load(snapshot_slot_mapping + bos + end).to(tl.int64)
+            if slot >= 0:
+                snapshot_base = snapshot_pool + slot * stride_h0 + i_h * K * V
+                snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V), (1, K),
+                                                 (0, i_v * BV), (64, BV),
+                                                 (0, 1))
+                tl.store(snapshot_ptr, b_h1, boundary_check=(0, 1))
+                if K > 64:
+                    snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V),
+                                                     (1, K), (64, i_v * BV),
+                                                     (64, BV), (0, 1))
+                    tl.store(snapshot_ptr, b_h2, boundary_check=(0, 1))
+                if K > 128:
+                    snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V),
+                                                     (1, K), (128, i_v * BV),
+                                                     (64, BV), (0, 1))
+                    tl.store(snapshot_ptr, b_h3, boundary_check=(0, 1))
+                if K > 192:
+                    snapshot_ptr = tl.make_block_ptr(snapshot_base, (K, V),
+                                                     (1, K), (192, i_v * BV),
+                                                     (64, BV), (0, 1))
+                    tl.store(snapshot_ptr, b_h4, boundary_check=(0, 1))
 
     # epilogue — write final state back to pool-layout [slots, HV, V, K].
     if STORE_FINAL_STATE or USE_INDEXED_STATE:

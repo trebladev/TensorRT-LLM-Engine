@@ -117,6 +117,7 @@ GatedDeltaRulePrefillRunner::GatedDeltaRulePrefillRunner(
     mKktSolve = load(GatedDeltaRulePrefillKernel::kKktSolve, numVHeads);
     mRecompute = load(GatedDeltaRulePrefillKernel::kRecompute, numVHeads);
     mState = load(GatedDeltaRulePrefillKernel::kState, numVHeads);
+    mStateSnapshots = load(GatedDeltaRulePrefillKernel::kStateSnapshots, numVHeads);
     mOutput = load(GatedDeltaRulePrefillKernel::kOutput, numVHeads);
 #endif
 }
@@ -289,8 +290,20 @@ void GatedDeltaRulePrefillRunner::run(GatedDeltaRulePrefillParams const& params,
     void* stateParams[]{&normalizedKey, &u, &w, &u, &gCumsum, &h, &state, &sourceStateSlotMapping, &state,
         &targetStateSlotMapping, &cuSeqLens, &chunkOffsets, &totalTokens, &stateStride, &globalScratch,
         &profileScratch};
-    launch(mState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kStateBlockV)),
-        static_cast<unsigned int>(numRequests * mNumVHeads), 1, stateParams);
+    if (params.snapshotSlotMapping != nullptr)
+    {
+        CUdeviceptr snapshotSlots = reinterpret_cast<CUdeviceptr>(params.snapshotSlotMapping);
+        void* snapshotParams[]{&normalizedKey, &u, &w, &u, &gCumsum, &h, &state, &sourceStateSlotMapping, &state,
+            &targetStateSlotMapping, &cuSeqLens, &chunkOffsets, &totalTokens, &stateStride, &snapshotSlots,
+            &globalScratch, &profileScratch};
+        launch(mStateSnapshots, static_cast<unsigned int>(ceilDiv(mHeadVDim, kStateBlockV)),
+            static_cast<unsigned int>(numRequests * mNumVHeads), 1, snapshotParams);
+    }
+    else
+    {
+        launch(mState, static_cast<unsigned int>(ceilDiv(mHeadVDim, kStateBlockV)),
+            static_cast<unsigned int>(numRequests * mNumVHeads), 1, stateParams);
+    }
 
     void* outputParams[]{&normalizedQuery, &normalizedKey, &u, &h, &gCumsum, &output, &cuSeqLens, &chunkIndices, &scale,
         &totalTokens, &globalScratch, &profileScratch};

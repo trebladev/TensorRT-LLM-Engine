@@ -8628,9 +8628,17 @@ TEST_F(KVCacheManagerTest, LinearAttentionBuffersSelectStateSlotForCurrentToken)
         tensorrt_llm::common::TllmException);
 
     tr::BufferManager bufferManager{stream};
-    LinearAttentionBuffers buffers{/*maxBatchSize=*/1, bufferManager};
+    LinearAttentionBuffers buffers{/*maxBatchSize=*/1, bufferManager, /*maxSnapshotTokens=*/32};
     buffers.reshape(/*numSequences=*/1);
 
+    request->setContextChunkSize(13);
+    buffers.fill(RequestVector{request}, {}, kvCacheManager);
+    auto const* snapshots = tr::bufferCast<SizeType32>(*buffers.snapshotSlotMappingHost);
+    for (SizeType32 token = 0; token < 13; ++token)
+    {
+        EXPECT_EQ(snapshots[token], token == 7 ? snapshotSlot : -1);
+    }
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.targetStateSlotMappingHost)[0], finalSlot);
     request->setContextChunkSize(8);
     buffers.fill(RequestVector{request}, {}, kvCacheManager);
     EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.sourceStateSlotMappingHost)[0], snapshotSlot);
@@ -8643,6 +8651,10 @@ TEST_F(KVCacheManagerTest, LinearAttentionBuffersSelectStateSlotForCurrentToken)
     EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.sourceStateSlotMappingHost)[0], snapshotSlot);
     EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.targetStateSlotMappingHost)[0], finalSlot);
     EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.hostHasInitialState)[0], 1);
+    for (SizeType32 token = 0; token < 5; ++token)
+    {
+        EXPECT_EQ(tr::bufferCast<SizeType32>(*buffers.snapshotSlotMappingHost)[token], -1);
+    }
 
     request->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
     buffers.fill({}, RequestVector{request}, kvCacheManager);

@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
+#include <algorithm>
 #include <cstdint>
 
 using namespace tensorrt_llm::runtime;
@@ -30,8 +31,15 @@ using namespace tensorrt_llm::runtime;
 namespace tensorrt_llm::batch_manager
 {
 
-LinearAttentionBuffers::LinearAttentionBuffers(SizeType32 maxBatchSize, BufferManager const& manager)
+LinearAttentionBuffers::LinearAttentionBuffers(
+    SizeType32 maxBatchSize, BufferManager const& manager, SizeType32 maxSnapshotTokens)
 {
+    if (maxSnapshotTokens > 0)
+    {
+        auto const shape = ITensor::makeShape({maxSnapshotTokens});
+        snapshotSlotMappingHost = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+        snapshotSlotMappingDevice = manager.gpu(shape, nvinfer1::DataType::kINT32);
+    }
     auto const maxBatchShape = ITensor::makeShape({maxBatchSize});
     auto const maxCuSeqlensShape = ITensor::makeShape({maxBatchSize + 1});
 
@@ -67,6 +75,20 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
     auto* cuSeqlens = bufferCast<SizeType32>(*cuSeqlensHost);
     auto* hasInitialState = bufferCast<SizeType32>(*hostHasInitialState);
 
+    SizeType32* snapshotSlots = nullptr;
+    if (snapshotSlotMappingHost)
+    {
+        SizeType32 numTokens = static_cast<SizeType32>(generationRequests.size());
+        for (auto const& request : contextRequests)
+        {
+            numTokens += request->getContextChunkSize();
+        }
+        snapshotSlotMappingHost->reshape(ITensor::makeShape({numTokens}));
+        snapshotSlotMappingDevice->reshape(ITensor::makeShape({numTokens}));
+        snapshotSlots = bufferCast<SizeType32>(*snapshotSlotMappingHost);
+        std::fill_n(snapshotSlots, numTokens, -1);
+    }
+
     SizeType32 sequenceIdx = 0;
     SizeType32 cumulativeLength = 0;
     cuSeqlens[0] = 0;
@@ -82,6 +104,24 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
             = kvCacheManager.getRecurrentStateSlotPair(request->mRequestId, sourceTokenIdx, contextEnd - 1);
         sourceStateSlotMapping[sequenceIdx] = slots.sourceSlot.value_or(slots.targetSlot);
         targetStateSlotMapping[sequenceIdx] = slots.targetSlot;
+        if (snapshotSlots && kvCacheManager.isEnableBlockReuse())
+        {
+            // Iterate the actual allocated blocks, including visual/last-full snapshots.
+            // Placeholder positions have no GPU state and must never be published as snapshots.
+            auto const window = kv_cache_manager::LinearAttentionMetadata::kRecurrentStates;
+            auto const& ids = kvCacheManager.getCacheBlockIds(request->mRequestId, window).at(0);
+            auto const tokensPerBlock = kvCacheManager.getTokensPerBlock();
+            for (auto end = (contextStart / tokensPerBlock + 1) * tokensPerBlock; end <= contextEnd;
+                 end += tokensPerBlock)
+            {
+                auto const block
+                    = kvCacheManager.getBlockManager().getBlockById(ids.at(end / tokensPerBlock - 1), window);
+                if (!block->isPlaceholder())
+                {
+                    snapshotSlots[cumulativeLength + end - contextStart - 1] = block->getMemoryPoolBlockIndex();
+                }
+            }
+        }
         cumulativeLength += request->getContextChunkSize();
         cuSeqlens[sequenceIdx + 1] = cumulativeLength;
         hasInitialState[sequenceIdx] = slots.sourceSlot.has_value() ? 1 : 0;
@@ -115,10 +155,18 @@ void LinearAttentionBuffers::copyToDevice(BufferManager const& manager)
     manager.copy(*sourceStateSlotMappingHost, *sourceStateSlotMappingDevice);
     manager.copy(*targetStateSlotMappingHost, *targetStateSlotMappingDevice);
     manager.copy(*cuSeqlensHost, *cuSeqlensDevice);
+    if (snapshotSlotMappingHost)
+    {
+        manager.copy(*snapshotSlotMappingHost, *snapshotSlotMappingDevice);
+    }
 }
 
 void LinearAttentionBuffers::getBuffers(TensorMap& inputBuffers) const
 {
+    if (snapshotSlotMappingDevice)
+    {
+        inputBuffers.insert_or_assign("state_snapshot_slot_mapping", snapshotSlotMappingDevice);
+    }
     inputBuffers.insert_or_assign("source_state_slot_mapping", sourceStateSlotMappingDevice);
     inputBuffers.insert_or_assign("target_state_slot_mapping", targetStateSlotMappingDevice);
     inputBuffers.insert_or_assign("gated_delta_cu_seqlens", cuSeqlensDevice);

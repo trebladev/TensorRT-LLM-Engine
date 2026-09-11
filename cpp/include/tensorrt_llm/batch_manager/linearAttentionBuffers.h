@@ -47,8 +47,12 @@ public:
     TensorPtr cuSeqlensHost;
     TensorPtr cuSeqlensDevice;
     TensorPtr hostHasInitialState;
+    // Packed-token mapping: slot to snapshot after this token, or -1.
+    TensorPtr snapshotSlotMappingHost;
+    TensorPtr snapshotSlotMappingDevice;
 
-    LinearAttentionBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager);
+    LinearAttentionBuffers(
+        SizeType32 maxBatchSize, runtime::BufferManager const& manager, SizeType32 maxSnapshotTokens = 0);
 
     void reshape(SizeType32 numSequences);
 

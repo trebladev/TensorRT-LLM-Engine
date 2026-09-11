@@ -90,7 +90,10 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     }
     if (modelConfig.isAttentionLinearHybrid())
     {
-        linearAttentionBuffers = std::make_unique<LinearAttentionBuffers>(maxBatchSize, runtime.getBufferManager());
+        linearAttentionBuffers = std::make_unique<LinearAttentionBuffers>(maxBatchSize, runtime.getBufferManager(),
+            engine.getTensorIOMode("state_snapshot_slot_mapping") == nvinfer1::TensorIOMode::kINPUT
+                ? modelConfig.getMaxNumTokens().value()
+                : 0);
     }
 
     if (modelConfig.isRnnBased())

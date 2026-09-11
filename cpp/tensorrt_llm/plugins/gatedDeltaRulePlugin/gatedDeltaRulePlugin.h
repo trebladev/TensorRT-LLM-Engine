@@ -42,6 +42,8 @@ class GatedDeltaRulePrefillRunner;
 //   8. source_state_slot_mapping: [N], int32.
 //   9. target_state_slot_mapping: [N], int32, optional when separate state-slot mapping is enabled.
 //   9/10. host_has_initial_state: [N], int8 or int32 on the host.
+// Optional trailing input: snapshot_slot_mapping [T], int32 on GPU; -1 skips a token,
+// otherwise write the state after that packed token to the specified physical slot.
 // Outputs:
 //   0. output: same shape and type as value.
 //   1. final_state: [N, Hv, V, K], float32. In paged mode it is valid for context requests and ignored for
@@ -52,7 +54,7 @@ public:
     GatedDeltaRulePlugin() = delete;
     GatedDeltaRulePlugin(int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim, int32_t chunkSize,
         nvinfer1::DataType type, nvinfer1::DataType stateType, int64_t stateSlotStrideBytes, bool removeInputPadding,
-        bool pagedState, bool useQkL2norm, bool useSeparateStateSlotMapping);
+        bool pagedState, bool useQkL2norm, bool useSeparateStateSlotMapping, bool useStateSnapshots = false);
     GatedDeltaRulePlugin(GatedDeltaRulePlugin const& plugin) = default;
 
     // IPluginV3 methods
@@ -135,6 +137,7 @@ private:
     bool mPagedState;
     bool mUseQkL2norm;
     bool mUseSeparateStateSlotMapping;
+    bool mUseStateSnapshots;
 
     std::shared_ptr<GatedDeltaRuleDecodeRunner> mDecodeRunner;
     std::shared_ptr<GatedDeltaRulePrefillRunner> mPrefillRunner;

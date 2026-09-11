@@ -476,6 +476,7 @@ class Qwen35LinearAttention(Module):
         source_state_slot_mapping: Tensor,
         target_state_slot_mapping: Tensor,
         host_has_initial_state: Tensor,
+        snapshot_slot_mapping: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         paged_state = default_net().plugin_config.paged_state
         self.conv1d.state_slot_stride_bytes = self.state_slot_stride_bytes if paged_state else 0
@@ -499,6 +500,7 @@ class Qwen35LinearAttention(Module):
             slot_mapping=source_state_slot_mapping,
             target_slot_mapping=target_state_slot_mapping,
             host_has_initial_state=host_has_initial_state,
+            snapshot_slot_mapping=snapshot_slot_mapping,
         )
         query, key, value = split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         num_tokens = shape(hidden_states, 0)
@@ -525,6 +527,7 @@ class Qwen35LinearAttention(Module):
             source_state_slot_mapping,
             host_has_initial_state,
             target_state_slot_mapping=target_state_slot_mapping,
+            snapshot_slot_mapping=snapshot_slot_mapping,
         )
         output = output.view(concat([num_tokens * self.num_v_heads, self.head_v_dim]))
         gate = gate.view(concat([num_tokens * self.num_v_heads, self.head_v_dim]))
@@ -576,6 +579,7 @@ class Qwen35DecoderLayer(Module):
         source_state_slot_mapping=None,
         target_state_slot_mapping=None,
         host_has_initial_state=None,
+        snapshot_slot_mapping: Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -606,6 +610,7 @@ class Qwen35DecoderLayer(Module):
                 source_state_slot_mapping,
                 target_state_slot_mapping,
                 host_has_initial_state,
+                snapshot_slot_mapping,
             )
             present_kv = None
 
@@ -649,6 +654,7 @@ class Qwen35Model(Module):
         prompt_embedding_table: Tensor | None = None,
         prompt_tasks: Tensor | None = None,
         prompt_vocab_size: Tensor | None = None,
+        snapshot_slot_mapping: Tensor | None = None,
     ):
         prompt_tuning_args = (
             [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
@@ -702,6 +708,7 @@ class Qwen35Model(Module):
                 source_state_slot_mapping,
                 target_state_slot_mapping,
                 host_has_initial_state,
+                snapshot_slot_mapping,
             )
             if present_kv is not None:
                 present_kvs.append(present_kv)
@@ -764,6 +771,7 @@ class Qwen35ForCausalLM(PretrainedModel):
         prompt_embedding_table: Tensor | None = None,
         prompt_tasks: Tensor | None = None,
         prompt_vocab_size: Tensor | None = None,
+        snapshot_slot_mapping: Tensor | None = None,
     ):
         del position_ids
         attention_params = Attention.fill_attention_params(self, attention_params)
@@ -786,6 +794,7 @@ class Qwen35ForCausalLM(PretrainedModel):
             prompt_embedding_table,
             prompt_tasks,
             prompt_vocab_size,
+            snapshot_slot_mapping=snapshot_slot_mapping,
         )
         if not self.gather_context_logits:
             hidden_states = gather_last_token_logits(
@@ -996,6 +1005,13 @@ class Qwen35ForCausalLM(PretrainedModel):
             )
         recurrent_inputs = self._prepare_recurrent_inputs(num_profiles, ranges["bb_range"])
         result.update(recurrent_inputs)
+        if default_net().plugin_config.paged_state:
+            result["snapshot_slot_mapping"] = Tensor(
+                name="state_snapshot_slot_mapping",
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([("num_tokens", ranges["num_tokens_range"])]),
+            )
         result["host_request_types"] = result["attention_params"].host_request_types
         return result
 

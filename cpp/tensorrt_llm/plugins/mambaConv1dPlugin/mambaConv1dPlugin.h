@@ -41,6 +41,8 @@ namespace tensorrt_llm::plugins
 //     7.  source_state_slot_mapping [batch_size] int32, optional
 //     8.  target_state_slot_mapping [batch_size] int32, optional when separate state-slot mapping is enabled
 //     8/9.  host_has_initial_state [batch_size] int8 or int32, optional host input
+// Optional trailing input: snapshot_slot_mapping [T], int32 on GPU; -1 skips a token,
+// otherwise write the state after that packed token to the specified physical slot.
 // outputs
 //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     1. conv_state [batch_size, dconv - 1, dim]
@@ -50,7 +52,8 @@ class MambaConv1dPlugin : public BasePlugin
 public:
     MambaConv1dPlugin(int dim, int dconv, int preStride, int postStride, nvinfer1::DataType type, bool removePadding,
         bool pagedState, bool applySilu, int64_t stateSlotStrideBytes, int64_t stateChannelStrideBytes,
-        int64_t stateHistoryStrideBytes, bool useInitialStateMask, bool useSeparateStateSlotMapping);
+        int64_t stateHistoryStrideBytes, bool useInitialStateMask, bool useSeparateStateSlotMapping,
+        bool useStateSnapshots = false);
 
     MambaConv1dPlugin(void const* data, size_t length);
 
@@ -170,6 +173,7 @@ private:
     int64_t mStateHistoryStrideBytes = 0;
     bool mUseInitialStateMask = false;
     bool mUseSeparateStateSlotMapping = false;
+    bool mUseStateSnapshots = false;
 };
 
 class MambaConv1dPluginCreator : public BaseCreator

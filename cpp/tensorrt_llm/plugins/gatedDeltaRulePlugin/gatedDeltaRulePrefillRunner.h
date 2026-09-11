@@ -49,6 +49,7 @@ struct GatedDeltaRulePrefillParams
     int32_t totalTokens;
     int32_t numRequests;
     bool pagedState;
+    int32_t const* snapshotSlotMapping = nullptr;
 };
 
 class GatedDeltaRulePrefillRunner
@@ -90,6 +91,7 @@ private:
     Kernel mKktSolve;
     Kernel mRecompute;
     Kernel mState;
+    Kernel mStateSnapshots;
     Kernel mOutput;
 };
 

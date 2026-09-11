@@ -6903,7 +6903,8 @@ def mamba_conv1d(input: Tensor,
                  state_slot_stride_bytes: int = 0,
                  state_channel_stride_bytes: int = 0,
                  state_history_stride_bytes: int = 0,
-                 target_slot_mapping: Optional[Tensor] = None):
+                 target_slot_mapping: Optional[Tensor] = None,
+                 snapshot_slot_mapping: Optional[Tensor] = None):
     '''
     Parameters:
         input : Tensor (On GPU)
@@ -7030,7 +7031,11 @@ def mamba_conv1d(input: Tensor,
         int64_field("state_slot_stride_bytes", state_slot_stride_bytes),
         int64_field("state_channel_stride_bytes", state_channel_stride_bytes),
         int64_field("state_history_stride_bytes", state_history_stride_bytes),
-        use_initial_state_mask_field, use_separate_state_slot_mapping_field
+        use_initial_state_mask_field, use_separate_state_slot_mapping_field,
+        trt.PluginField(
+            "use_state_snapshots",
+            np.array([snapshot_slot_mapping is not None], dtype=np.int8),
+            trt.PluginFieldType.INT8)
     ])
     mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
         "mamba_conv1d", pfc)
@@ -7046,6 +7051,10 @@ def mamba_conv1d(input: Tensor,
             plug_inputs += [target_slot_mapping]
     if use_initial_state_mask:
         plug_inputs += [host_has_initial_state]
+    if snapshot_slot_mapping is not None:
+        if not default_net().plugin_config.paged_state:
+            raise ValueError("Conv snapshots require paged state")
+        plug_inputs.append(snapshot_slot_mapping)
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, mamba_conv1d_plug)
@@ -7744,28 +7753,29 @@ def cp_split_plugin(
 
 
 def gated_delta_rule(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    log_decay: Tensor,
-    beta: Tensor,
-    state: Tensor,
-    host_request_types: Tensor,
-    cu_seqlens: Tensor,
-    state_slot_mapping: Tensor,
-    host_has_initial_state: Tensor,
-    num_q_heads: int,
-    num_v_heads: int,
-    head_k_dim: int,
-    head_v_dim: int,
-    chunk_size: int,
-    dtype: Union[str, trt.DataType],
-    state_dtype: Union[str, trt.DataType] = 'float32',
-    state_slot_stride_bytes: int = 0,
-    remove_input_padding: Optional[bool] = None,
-    paged_state: Optional[bool] = None,
-    use_qk_l2norm: bool = True,
-    target_state_slot_mapping: Optional[Tensor] = None
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        log_decay: Tensor,
+        beta: Tensor,
+        state: Tensor,
+        host_request_types: Tensor,
+        cu_seqlens: Tensor,
+        state_slot_mapping: Tensor,
+        host_has_initial_state: Tensor,
+        num_q_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        chunk_size: int,
+        dtype: Union[str, trt.DataType],
+        state_dtype: Union[str, trt.DataType] = 'float32',
+        state_slot_stride_bytes: int = 0,
+        remove_input_padding: Optional[bool] = None,
+        paged_state: Optional[bool] = None,
+        use_qk_l2norm: bool = True,
+        target_state_slot_mapping: Optional[Tensor] = None,
+        snapshot_slot_mapping: Optional[Tensor] = None
 ) -> Tuple[Tensor, Tensor]:
     """Add a Gated Delta Rule operation implemented by an IPluginV3 layer."""
     plg_creator = trt.get_plugin_registry().get_creator(
@@ -7809,6 +7819,7 @@ def gated_delta_rule(
         int8_field('remove_input_padding', remove_input_padding),
         int8_field('paged_state', paged_state),
         int8_field('use_qk_l2norm', use_qk_l2norm),
+        int8_field('use_state_snapshots', snapshot_slot_mapping is not None),
         int8_field('use_separate_state_slot_mapping',
                    use_separate_state_slot_mapping),
     ])
@@ -7823,6 +7834,8 @@ def gated_delta_rule(
     if use_separate_state_slot_mapping:
         plug_inputs.append(target_state_slot_mapping)
     plug_inputs.append(host_has_initial_state)
+    if snapshot_slot_mapping is not None:
+        plug_inputs.append(snapshot_slot_mapping)
     layer = default_trtnet().add_plugin_v3(
         [tensor.trt_tensor for tensor in plug_inputs], [], plugin)
     _add_plugin_info(layer, plg_creator, 'gated_delta_rule', pfc)

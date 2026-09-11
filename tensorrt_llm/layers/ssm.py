@@ -60,7 +60,8 @@ class MambaConv1d(Module):
                 slot_mapping: Optional[Tensor] = None,
                 conv_indices: Optional[Tensor] = None,
                 host_has_initial_state: Optional[Tensor] = None,
-                target_slot_mapping: Optional[Tensor] = None):
+                target_slot_mapping: Optional[Tensor] = None,
+                snapshot_slot_mapping: Optional[Tensor] = None):
         '''
         Parameters:
             x: [B, L, D] or [T, D]
@@ -95,7 +96,8 @@ class MambaConv1d(Module):
                 self.state_slot_stride_bytes,
                 self.state_channel_stride_bytes,
                 self.state_history_stride_bytes,
-                target_slot_mapping=target_slot_mapping)
+                target_slot_mapping=target_slot_mapping,
+                snapshot_slot_mapping=snapshot_slot_mapping)
         else:
             assert not default_net().plugin_config.paged_state
             assert len(

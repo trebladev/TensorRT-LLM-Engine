@@ -488,6 +488,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
                 ctxChunkConfig = batch_scheduler::ContextChunkingConfig{
                     executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, mKvCacheManager->getTokensPerBlock()};
             }
+            ctxChunkConfig->snapshotsInEngine = mRuntime->getEngine().getTensorIOMode("state_snapshot_slot_mapping")
+                == nvinfer1::TensorIOMode::kINPUT;
             ctxChunkConfig->stateSnapshotInterval = linearAttentionMetadata->statesSnapshotInterval;
             ctxChunkConfig->lastSnapshotTokensPerBlock
                 = linearAttentionMetadata->saveLastSnapshot ? mKvCacheManager->getTokensPerBlock() : 0;

@@ -38,6 +38,7 @@ DECLARE_CUBIN(gated_delta_rule_prefill_prepare_chunks_bf16_h16_k128_v128_sm89);
     DECLARE_CUBIN(gated_delta_rule_prefill_kkt_solve_bf16_h##h##_hv##hv##_k128_v128_sm89);                             \
     DECLARE_CUBIN(gated_delta_rule_prefill_recompute_bf16_h##h##_hv##hv##_k128_v128_sm89);                             \
     DECLARE_CUBIN(gated_delta_rule_prefill_state_bf16_h##h##_hv##hv##_k128_v128_sm89);                                 \
+    DECLARE_CUBIN(gated_delta_rule_prefill_state_snapshots_bf16_h##h##_hv##hv##_k128_v128_sm89);                       \
     DECLARE_CUBIN(gated_delta_rule_prefill_output_bf16_h##h##_hv##hv##_k128_v128_sm89)
 DECLARE_HV_CUBINS(8, 8);
 DECLARE_HV_CUBINS(16, 16);
@@ -73,6 +74,8 @@ namespace
             "recompute_w_u_fwd_kernel", 32768, 4),                                                                     \
         CUBIN_ENTRY(gated_delta_rule_prefill_state_bf16_h##h##_hv##hv##_k128_v128_sm89, kState, hv,                    \
             "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", 86536, 4),                                               \
+        CUBIN_ENTRY(gated_delta_rule_prefill_state_snapshots_bf16_h##h##_hv##hv##_k128_v128_sm89, kStateSnapshots, hv, \
+            "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", 16384, 4),                                               \
         CUBIN_ENTRY(gated_delta_rule_prefill_output_bf16_h##h##_hv##hv##_k128_v128_sm89, kOutput, hv,                  \
             "chunk_fwd_kernel_o", 49152, 4)
 #endif
@@ -80,7 +83,7 @@ namespace
 auto const& getCubins()
 {
 #if !defined(_WIN32) && !defined(EXCLUDE_SM_89)
-    static std::array<GatedDeltaRulePrefillCubin, 31> const cubins{{
+    static std::array<GatedDeltaRulePrefillCubin, 35> const cubins{{
         CUBIN_ENTRY(gated_delta_rule_prefill_l2norm_bf16_h16_k128_v128_sm89, kL2Norm, 0, "l2norm_fwd_kernel", 0, 8),
         CUBIN_ENTRY(gated_delta_rule_prefill_init_chunks_bf16_h16_k128_v128_sm89, kInitChunks, 0,
             "init_chunk_indices_kernel", 0, 1),
