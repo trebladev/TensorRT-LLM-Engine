@@ -4,33 +4,18 @@
 
 set -euo pipefail
 
-if [[ $# -lt 2 ]]; then
-    printf 'Usage: %s LLM_ENGINE_DIR VISION_ENGINE_DIR [DEMO_ARGS...]\n' "$0" >&2
-    exit 1
-fi
-
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../../.." && pwd)"
 
-model_dir="${QWEN35_MODEL_DIR:-/root/code_x/Qwen3.5-2B}"
-video="${QWEN35_VIDEO:-/root/code_x/zara.mp4}"
-llm_engine_dir="$1"
-vision_engine_dir="$2"
-shift 2
-
 python_bin="${QWEN35_PYTHON:-python}"
+checkpoint_dir="${1:-/tmp/qwen35_bf16_tp1}"
+engine_dir="${2:-/tmp/qwen35_decode_engine}"
+extra_args=("${@:3}")
 plugin_lib="${QWEN35_PLUGIN_LIB:-${repo_root}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so}"
+build_py="${repo_root}/tensorrt_llm/commands/build.py"
 
-if [[ ! -d "${model_dir}" ]]; then
-    printf 'Qwen3.5 model directory does not exist: %s\n' "${model_dir}" >&2
-    exit 1
-fi
-if [[ ! -f "${video}" ]]; then
-    printf 'Video does not exist: %s\n' "${video}" >&2
-    exit 1
-fi
-if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-    printf 'ffmpeg and ffprobe are required for the Qwen3.5 video demo.\n' >&2
+if [[ ! -f "${checkpoint_dir}/config.json" ]]; then
+    printf 'TensorRT-LLM checkpoint config does not exist: %s/config.json\n' "${checkpoint_dir}" >&2
     exit 1
 fi
 if [[ ! -f "${plugin_lib}" ]]; then
@@ -38,13 +23,19 @@ if [[ ! -f "${plugin_lib}" ]]; then
     printf 'Build it with: cmake --build cpp/build --target bindings --parallel 8\n' >&2
     exit 1
 fi
+if [[ ! -f "${build_py}" ]]; then
+    printf 'TensorRT-LLM build.py does not exist: %s\n' "${build_py}" >&2
+    exit 1
+fi
 
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
 torch_lib_dir="$("${python_bin}" -c 'from pathlib import Path; import torch; print(Path(torch.__file__).parent / "lib")')"
 export LD_LIBRARY_PATH="${torch_lib_dir}:${repo_root}/cpp/build/tensorrt_llm:${repo_root}/cpp/build/tensorrt_llm/kernels/decoderMaskedMultiheadAttention${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export TRT_LLM_NO_LIB_INIT=1
+export QWEN35_BUILD_PY="${build_py}"
 export QWEN35_PLUGIN_LIB="${plugin_lib}"
-export QWEN35_EXIT_WITHOUT_RUNTIME_CLEANUP=1
+
 cd "${repo_root}"
 
 "${python_bin}" -c '
@@ -53,7 +44,6 @@ import os
 import runpy
 import sys
 import traceback
-import torch
 
 # Load the Python TensorRT runtime before resolving plugin dependencies.
 import tensorrt
@@ -66,10 +56,9 @@ if not plugin.initTrtLlmPlugins(None, b"tensorrt_llm"):
 
 exit_code = 0
 try:
-    runpy.run_path(
-        "examples/models/core/qwen3_5/multimodal_demo.py",
-        run_name="__main__",
-    )
+    runpy.run_path(os.environ["QWEN35_BUILD_PY"], run_name="__main__")
+except SystemExit as error:
+    exit_code = error.code if isinstance(error.code, int) else 1
 except BaseException:
     traceback.print_exc()
     exit_code = 1
@@ -78,14 +67,20 @@ finally:
     sys.stderr.flush()
     os._exit(exit_code)
 ' \
-    --model_dir "${model_dir}" \
-    --llm_engine_dir "${llm_engine_dir}" \
-    --vision_engine_dir "${vision_engine_dir}" \
-    --video "${video}" \
-    --prompt "总结一下这段视频" \
-    --video_num_frames 64 \
-    --enable_chunked_context \
-    --kv_cache_free_gpu_memory_fraction 0.3 \
-    --kv_cache_enable_block_reuse \
-    --incremental_video_frames \
-    "$@"
+    --checkpoint_dir "${checkpoint_dir}" \
+    --output_dir "${engine_dir}" \
+    --max_batch_size 1 \
+    --max_input_len 16384 \
+    --max_seq_len 16384 \
+    --max_num_tokens 4096 \
+    --opt_num_tokens 4096 \
+    --max_beam_width 1 \
+    --max_prompt_embedding_table_size 16384 \
+    --kv_cache_type paged \
+    --gpt_attention_plugin bfloat16 \
+    --gemm_plugin bfloat16 \
+    --mamba_conv1d_plugin bfloat16 \
+    --context_fmha enable \
+    --use_paged_context_fmha enable \
+    --remove_input_padding enable \
+    "${extra_args[@]}"
