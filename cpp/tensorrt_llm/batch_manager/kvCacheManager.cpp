@@ -1470,8 +1470,7 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     }
     summary.firstNewBlock = reuseMatches.firstNewBlock;
 
-    TLLM_LOG_DEBUG(
-        "%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, reusableTokens=%d, hasNewBlock=%d",
+    TLLM_LOG_DEBUG("%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, reusableTokens=%d, hasNewBlock=%d",
         mLogPrefix.c_str(), summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.reusableTokens,
         summary.firstNewBlock.has_value());
     return summary;
@@ -1794,6 +1793,11 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     std::set<KVCacheBlock::IdType> reusedBlockIds;
     auto blockItr = claimResult.blockKeys.begin();
     SizeType32 bi = 0;
+    auto const snapshotBoundaries
+        = isRecurrentState() && isEnableBlockReuse && mLinearAttentionMetadata->visualBoundarySnapshots
+        ? getRecurrentStateSnapshotBoundaries(
+            llmRequest, mTokensPerBlock, mLinearAttentionMetadata->statesSnapshotInterval)
+        : std::vector<SizeType32>{};
 
     // Process claimed (matched) blocks: onboard + addBlockToAllBeams
     for (auto& claimed : claimResult.claimedBlocks)
@@ -1883,7 +1887,11 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
             if (isEnableBlockReuse)
             {
                 shouldAllocate = mLinearAttentionMetadata->shouldAllocateRecurrentStates(
-                    /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, llmRequest.getPromptLen(), mTokensPerBlock);
+                                     /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, llmRequest.getPromptLen(),
+                                     mTokensPerBlock,
+                                     /*enableIntervalSnapshots=*/!mLinearAttentionMetadata->visualBoundarySnapshots)
+                    || std::binary_search(
+                        snapshotBoundaries.begin(), snapshotBoundaries.end(), (bi + 1) * mTokensPerBlock);
             }
             else
             {
@@ -3492,15 +3500,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         auto const maxDraftTokensToAdd = std::min(req.getNumDraftTokens(), req.mMaxNewTokens);
-        auto const promptInputLen
-            = (isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd;
+        auto const promptInputLen = (isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd;
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
         {
-            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
-                promptInputLen, getTokensPerBlock(), mEnableBlockReuse);
+            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(promptInputLen,
+                getTokensPerBlock(), mEnableBlockReuse,
+                mBlockManager.getLinearAttentionMetadata()->visualBoundarySnapshots
+                    ? std::make_optional(getRecurrentStateSnapshotBoundaries(
+                        req, getTokensPerBlock(), mBlockManager.getLinearAttentionMetadata()->statesSnapshotInterval))
+                    : std::nullopt);
         }
-        auto const promptCacheLen
-            = std::min(promptInputLen, windowSize + mChunkSize) + mSinkBubbleLength;
+        auto const promptCacheLen = std::min(promptInputLen, windowSize + mChunkSize) + mSinkBubbleLength;
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
@@ -3602,8 +3612,12 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             {
                 return 0;
             }
-            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
-                req.mPromptLen, getTokensPerBlock(), mEnableBlockReuse);
+            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(req.mPromptLen,
+                getTokensPerBlock(), mEnableBlockReuse,
+                mBlockManager.getLinearAttentionMetadata()->visualBoundarySnapshots
+                    ? std::make_optional(getRecurrentStateSnapshotBoundaries(
+                        req, getTokensPerBlock(), mBlockManager.getLinearAttentionMetadata()->statesSnapshotInterval))
+                    : std::nullopt);
         }
     }
 

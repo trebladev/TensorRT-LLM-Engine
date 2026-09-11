@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -126,6 +126,11 @@ size_t RnnCacheTransBufferManager::computeTransferBufferSizeFromPool(
         // Number of interval snapshots + end-of-prompt block + saveLastSnapshot.
         maxRealBlocksPerSeq
             = maxTokenNum / linearMeta->statesSnapshotInterval + 1 + (linearMeta->saveLastSnapshot ? 1 : 0);
+        if (linearMeta->visualBoundarySnapshots)
+        {
+            // In the worst case every full KV block ends a visual item.
+            maxRealBlocksPerSeq = maxTokenNum / kvCacheManager->getTokensPerBlock() + 2;
+        }
     }
 
     size_t bufferSize = static_cast<size_t>(maxRealBlocksPerSeq) * bufferSizePerBlock;

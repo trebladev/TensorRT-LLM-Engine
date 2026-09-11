@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from time import perf_counter
 
 import tensorrt as trt
 import torch
@@ -63,9 +64,7 @@ class CacheObservation:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run an image or video through the Qwen3.5 TensorRT vision and LLM engines."
-        )
+        description=("Run an image or video through the Qwen3.5 TensorRT vision and LLM engines.")
     )
     parser.add_argument("--model_dir", type=Path, required=True)
     parser.add_argument("--llm_engine_dir", type=Path, required=True)
@@ -101,6 +100,43 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Split long prompts across multiple context-phase executor iterations.",
     )
+    parser.add_argument(
+        "--incremental_video_frames",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Encode all decoded frames once as independent video items, then issue "
+            "cumulative 1-frame, 2-frame, ... LLM requests to inspect prefix-cache reuse."
+        ),
+    )
+    parser.add_argument(
+        "--gdn_visual_boundary_snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Shift periodic GDN snapshots inside visual spans to block-aligned visual ends "
+            "without adding image-only snapshots; retain text and final-full-block snapshots."
+        ),
+    )
+    parser.add_argument(
+        "--incremental_results_path",
+        type=Path,
+        help="Write per-frame generated token IDs, latency and cache observations as JSON.",
+    )
+    parser.add_argument(
+        "--incremental_isolate_requests",
+        action="store_true",
+        help=(
+            "Diagnostic: use request-specific visual cache keys while preserving "
+            "the snapshot policy, embeddings and tokens."
+        ),
+    )
+    parser.add_argument(
+        "--incremental_frame_max_new_tokens",
+        type=int,
+        default=1,
+        help="Tokens generated for each intermediate incremental-frame request.",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +163,16 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise ValueError("prefix_cache_requests must be positive")
     if args.kv_cache_enable_block_reuse and args.prefix_cache_requests < 2:
         raise ValueError("prefix_cache_requests must be at least 2 when block reuse is enabled")
+    if args.incremental_video_frames and args.video is None:
+        raise ValueError("--incremental_video_frames requires --video")
+    if not args.incremental_video_frames and (
+        args.incremental_isolate_requests or args.incremental_results_path is not None
+    ):
+        raise ValueError("Incremental diagnostics require --incremental_video_frames")
+    if args.incremental_frame_max_new_tokens <= 0:
+        raise ValueError("incremental_frame_max_new_tokens must be positive")
+    if args.gdn_visual_boundary_snapshots and not args.kv_cache_enable_block_reuse:
+        raise ValueError("--gdn_visual_boundary_snapshots requires --kv_cache_enable_block_reuse")
 
 
 def _validate_processor_inputs(
@@ -343,6 +389,114 @@ def _prepare_video_processor_inputs(
     )
 
 
+def _frame_video_metadata(video: DecodedVideo, frame_offset: int) -> VideoMetadata:
+    return VideoMetadata(
+        total_num_frames=video.metadata.total_num_frames,
+        fps=video.metadata.fps,
+        width=video.metadata.width,
+        height=video.metadata.height,
+        duration=video.metadata.duration,
+        video_backend=video.metadata.video_backend,
+        frames_indices=[video.metadata.frames_indices[frame_offset]],
+    )
+
+
+def _prepare_incremental_video_processor_inputs(
+    processor: AutoProcessor,
+    video: DecodedVideo,
+    prompt: str,
+    min_pixels: int,
+    max_pixels: int,
+) -> dict[str, torch.Tensor]:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                *[
+                    {"type": "video", "video": video.frames[index : index + 1]}
+                    for index in range(video.frames.shape[0])
+                ],
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs={
+            "do_sample_frames": False,
+            "size": {
+                "shortest_edge": min_pixels,
+                "longest_edge": max_pixels,
+            },
+            "video_metadata": [
+                _frame_video_metadata(video, index) for index in range(video.frames.shape[0])
+            ],
+        },
+    )
+    return _validate_processor_inputs(
+        inputs,
+        {
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+            "pixel_values_videos",
+            "video_grid_thw",
+        },
+        "incremental video",
+    )
+
+
+def _incremental_video_max_pixels(
+    args: argparse.Namespace,
+    config: Qwen35Config,
+    frame_count: int,
+) -> int:
+    metadata_path = args.vision_engine_dir / _VISION_CONFIG_NAME
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"Vision engine metadata is missing: {metadata_path}. "
+            "Build the vision engine before using incremental video frames."
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    maximum_vision_tokens = int(metadata["max_vision_tokens"])
+    patch_pixels = config.vision_patch_size**2
+    maximum_patch_tokens_per_frame = maximum_vision_tokens // frame_count
+    minimum_patch_tokens_per_frame = (args.min_pixels + patch_pixels - 1) // patch_pixels
+    if maximum_patch_tokens_per_frame < minimum_patch_tokens_per_frame:
+        raise ValueError(
+            f"The vision engine profile cannot fit {frame_count} independent frames at "
+            f"min_pixels={args.min_pixels}; sample fewer frames with --video_num_frames."
+        )
+    maximum_pixels = min(
+        args.max_pixels,
+        maximum_patch_tokens_per_frame * patch_pixels,
+    )
+    if maximum_pixels < args.max_pixels:
+        print(
+            "Incremental-frame pixel budget: "
+            f"max_pixels_per_frame={maximum_pixels} to keep {frame_count} frames within "
+            f"the vision engine's {maximum_vision_tokens}-patch-token profile"
+        )
+    return maximum_pixels
+
+
+def _video_frame_data_for_hash(video: DecodedVideo, frame_offset: int) -> VideoData:
+    metadata = _frame_video_metadata(video, frame_offset)
+    return VideoData(
+        frames=[video.frames[frame_offset]],
+        metadata={
+            "total_num_frames": metadata.total_num_frames,
+            "fps": metadata.fps,
+            "duration": metadata.duration,
+            "frames_indices": list(metadata.frames_indices),
+        },
+    )
+
+
 def _video_data_for_hash(video: DecodedVideo) -> VideoData:
     metadata = {
         "total_num_frames": video.metadata.total_num_frames,
@@ -356,6 +510,11 @@ def _video_data_for_hash(video: DecodedVideo) -> VideoData:
 def _hash_multimodal_content(modality: str, content: object) -> list[int]:
     hashes, _ = apply_mm_hashes({modality: [content]})
     return hexdigest_to_int32(hashes[modality][0])
+
+
+def _hash_multimodal_contents(modality: str, contents: list[object]) -> list[list[int]]:
+    hashes, _ = apply_mm_hashes({modality: contents})
+    return [hexdigest_to_int32(content_hash) for content_hash in hashes[modality]]
 
 
 def _collect_cache_observation(runner: ModelRunnerCpp) -> CacheObservation:
@@ -388,6 +547,74 @@ def _collect_cache_observation(runner: ModelRunnerCpp) -> CacheObservation:
         cumulative_hit_rate=cumulative_hit_rate,
         tokens_per_block=tokens_per_block,
     )
+
+
+def _active_request_tensor(
+    processor_inputs: dict[str, torch.Tensor],
+    name: str,
+) -> torch.Tensor:
+    active_mask = processor_inputs["attention_mask"][0].to(dtype=torch.bool)
+    return processor_inputs[name][0][active_mask]
+
+
+def _incremental_video_item_ends(
+    input_ids: torch.Tensor,
+    config: Qwen35Config,
+) -> list[int]:
+    if config.vision_start_token_id is None or config.vision_end_token_id is None:
+        raise ValueError("Incremental video requires vision start and end token IDs")
+    if config.video_token_id is None:
+        raise ValueError("Incremental video requires a video token ID")
+
+    request_ids = input_ids.cpu().tolist()
+    item_ends = []
+    token_index = 0
+    while token_index < len(request_ids):
+        if request_ids[token_index] != config.vision_start_token_id:
+            token_index += 1
+            continue
+        video_start = token_index + 1
+        video_end = video_start
+        while video_end < len(request_ids) and request_ids[video_end] == config.video_token_id:
+            video_end += 1
+        if video_end == video_start:
+            token_index += 1
+            continue
+        if video_end >= len(request_ids) or request_ids[video_end] != config.vision_end_token_id:
+            raise ValueError("Each incremental video item must end with vision_end_token_id")
+        item_ends.append(video_end + 1)
+        token_index = video_end + 1
+    return item_ends
+
+
+def _slice_incremental_video_request(
+    processor_inputs: dict[str, torch.Tensor],
+    item_ends: list[int],
+    frame_count: int,
+) -> dict[str, torch.Tensor]:
+    if not 1 <= frame_count <= len(item_ends):
+        raise ValueError(f"frame_count must be in [1, {len(item_ends)}], got {frame_count}")
+    prefix_end = item_ends[frame_count - 1]
+    suffix_start = item_ends[-1]
+    request_inputs = {}
+    for name in ("input_ids", "mm_token_type_ids"):
+        full_tensor = _active_request_tensor(processor_inputs, name)
+        request_inputs[name] = torch.cat(
+            (full_tensor[:prefix_end], full_tensor[suffix_start:]),
+        ).unsqueeze(0)
+    request_inputs["attention_mask"] = torch.ones_like(request_inputs["input_ids"])
+    request_inputs["video_grid_thw"] = processor_inputs["video_grid_thw"][:frame_count]
+    return request_inputs
+
+
+def _common_prefix_length(first: torch.Tensor | None, second: torch.Tensor) -> int:
+    if first is None:
+        return 0
+    maximum_length = min(first.numel(), second.numel())
+    for token_index in range(maximum_length):
+        if first[token_index].item() != second[token_index].item():
+            return token_index
+    return maximum_length
 
 
 def _vision_profile(
@@ -629,18 +856,283 @@ def _run_vision_engine(
     return outputs["pooled_output"], session
 
 
+def _run_incremental_video_requests(
+    args: argparse.Namespace,
+    processor: AutoProcessor,
+    processor_inputs: dict[str, torch.Tensor],
+    trt_visual_features: torch.Tensor,
+    config: Qwen35Config,
+    frame_hashes: list[list[int]],
+    frame_indices: list[int],
+    frame_rate: float,
+) -> ModelRunnerCpp:
+    full_input_ids = _active_request_tensor(processor_inputs, "input_ids")
+    item_ends = _incremental_video_item_ends(full_input_ids, config)
+    frame_count = len(frame_hashes)
+    if len(item_ends) != frame_count or len(frame_indices) != frame_count:
+        raise ValueError(
+            "Incremental video item counts disagree: "
+            f"prompt_spans={len(item_ends)}, hashes={frame_count}, "
+            f"frame_indices={len(frame_indices)}"
+        )
+    if processor_inputs["video_grid_thw"].shape[0] != frame_count:
+        raise ValueError(
+            "Incremental video requires one video grid per decoded frame, got "
+            f"{processor_inputs['video_grid_thw'].shape[0]} grids and {frame_count} frames"
+        )
+    if config.video_token_id is None:
+        raise ValueError("Incremental video requires a video token ID")
+
+    total_visual_tokens = int((full_input_ids == config.video_token_id).sum().item())
+    if trt_visual_features.shape[0] != total_visual_tokens:
+        raise ValueError(
+            "Incremental video embeddings and prompt tokens disagree: "
+            f"features={trt_visual_features.shape[0]}, tokens={total_visual_tokens}"
+        )
+
+    maximum_input_length = full_input_ids.numel()
+    maximum_output_length = max(args.max_new_tokens, args.incremental_frame_max_new_tokens)
+    runner = ModelRunnerCpp.from_dir(
+        engine_dir=str(args.llm_engine_dir),
+        max_batch_size=1,
+        max_input_len=maximum_input_length,
+        max_output_len=maximum_output_length,
+        max_beam_width=1,
+        kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+        kv_cache_free_gpu_memory_fraction=args.kv_cache_free_gpu_memory_fraction,
+        enable_chunked_context=args.enable_chunked_context,
+        use_runtime_defaults=False,
+    )
+    if runner.max_prompt_embedding_table_size < total_visual_tokens:
+        raise RuntimeError(
+            "The LLM engine prompt table is too small: "
+            f"capacity={runner.max_prompt_embedding_table_size}, required={total_visual_tokens}. "
+            "Rebuild with a larger --max_prompt_embedding_table_size."
+        )
+
+    tokenizer = processor.tokenizer
+    end_id = tokenizer.eos_token_id
+    if end_id is None:
+        raise ValueError("The tokenizer does not define eos_token_id")
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else end_id
+
+    print("\n=== Incremental video prefix-cache validation ===")
+    print(f"Vision embeddings prepared once for {frame_count} independent frames")
+    print(
+        "Each request appends one frame to the preceding visual prefix; "
+        "intermediate requests generate only "
+        f"{args.incremental_frame_max_new_tokens} token(s)."
+    )
+
+    previous_input_ids = None
+    previous_observation = _collect_cache_observation(runner)
+    final_outputs = None
+    final_input_length = 0
+    total_reused_blocks = 0
+    first_reuse_frame = None
+    frame_results = []
+    with torch.inference_mode():
+        for frame_offset in range(frame_count):
+            current_frame_count = frame_offset + 1
+            request_inputs = _slice_incremental_video_request(
+                processor_inputs,
+                item_ends,
+                current_frame_count,
+            )
+            visual_token_count = int(
+                (request_inputs["input_ids"] == config.video_token_id).sum().item()
+            )
+            mrope_inputs = prepare_qwen35_mrope_inputs(
+                request_inputs["input_ids"],
+                config,
+                attention_mask=request_inputs["attention_mask"],
+                mm_token_type_ids=request_inputs["mm_token_type_ids"],
+                video_grid_thw=request_inputs["video_grid_thw"],
+            )
+            executor_inputs = prepare_qwen35_executor_prompt_inputs(
+                request_inputs["input_ids"],
+                request_inputs["attention_mask"],
+                config,
+                video_features=trt_visual_features[:visual_token_count],
+            )
+            request_hashes = frame_hashes[:current_frame_count]
+            if args.incremental_isolate_requests:
+                # Namespace cache keys per request without changing model inputs.
+                request_hashes = [
+                    [item_hash[0] ^ current_frame_count, *item_hash[1:]]
+                    for item_hash in request_hashes
+                ]
+            multimodal_cache_input = prepare_qwen35_multimodal_cache_input(
+                request_inputs["input_ids"],
+                request_inputs["attention_mask"],
+                config,
+                "video",
+                content_hashes=request_hashes,
+            )
+            mrope_params = MropeParams(
+                mrope_rotary_cos_sin=mrope_inputs.mrope_rotary_cos_sin,
+                mrope_position_deltas=mrope_inputs.mrope_position_deltas,
+            )
+            request_input_ids = executor_inputs.batch_input_ids[0]
+            common_prefix_tokens = _common_prefix_length(previous_input_ids, request_input_ids)
+            request_max_new_tokens = (
+                args.max_new_tokens
+                if current_frame_count == frame_count
+                else args.incremental_frame_max_new_tokens
+            )
+
+            torch.cuda.synchronize()
+            start_time = perf_counter()
+            request_outputs = runner.generate(
+                executor_inputs.batch_input_ids,
+                prompt_table=executor_inputs.prompt_table,
+                prompt_tasks=executor_inputs.prompt_tasks,
+                multimodal_inputs=[multimodal_cache_input],
+                mrope_params=mrope_params,
+                max_new_tokens=request_max_new_tokens,
+                end_id=end_id,
+                pad_id=pad_id,
+                temperature=1.0,
+                top_k=1,
+                top_p=0.0,
+                num_beams=1,
+                return_dict=True,
+                output_sequence_lengths=True,
+            )
+            torch.cuda.synchronize()
+            latency = perf_counter() - start_time
+            observation = _collect_cache_observation(runner)
+            cumulative_reuse_delta = max(
+                0,
+                observation.cumulative_reused_blocks
+                - previous_observation.cumulative_reused_blocks,
+            )
+            observed_reused_blocks = max(
+                observation.request_reused_blocks,
+                cumulative_reuse_delta,
+            )
+            total_reused_blocks += cumulative_reuse_delta
+            if observed_reused_blocks > 0 and first_reuse_frame is None:
+                first_reuse_frame = current_frame_count
+
+            if observation.tokens_per_block > 0 and common_prefix_tokens > 0:
+                common_prefix_full_blocks = common_prefix_tokens // observation.tokens_per_block
+            else:
+                common_prefix_full_blocks = 0
+            source_frame_index = frame_indices[frame_offset]
+            timestamp = source_frame_index / frame_rate
+            print(
+                f"Frame {current_frame_count:03d}/{frame_count}: "
+                f"source_index={source_frame_index}, timestamp={timestamp:.3f}s, "
+                f"input_tokens={request_input_ids.numel()}, visual_tokens={visual_token_count}, "
+                f"common_prefix={common_prefix_tokens}, "
+                f"common_prefix_full_blocks={common_prefix_full_blocks}, "
+                f"reused_blocks={observed_reused_blocks}, "
+                f"request_hit_rate={observation.request_hit_rate:.2%}, "
+                f"cumulative_reuse_delta={cumulative_reuse_delta}, latency={latency:.3f}s"
+            )
+
+            if args.incremental_results_path is not None:
+                sequence_length = int(request_outputs["sequence_lengths"][0, 0].item())
+                frame_results.append(
+                    {
+                        "frames": current_frame_count,
+                        "input_tokens": request_input_ids.numel(),
+                        "common_prefix_tokens": common_prefix_tokens,
+                        "generated_token_ids": request_outputs["output_ids"][
+                            0, 0, request_input_ids.numel() : sequence_length
+                        ]
+                        .cpu()
+                        .tolist(),
+                        "latency_seconds": latency,
+                        "aggregate_reused_blocks": observed_reused_blocks,
+                    }
+                )
+            previous_input_ids = request_input_ids.clone()
+            previous_observation = observation
+            if current_frame_count == frame_count:
+                final_outputs = request_outputs
+                final_input_length = request_input_ids.numel()
+
+    if final_outputs is None:
+        raise RuntimeError("The incremental video runner returned no outputs")
+    print("\n=== Incremental prefix-cache summary ===")
+    print(f"Frames submitted: {frame_count}")
+    print(f"First request with observed reuse: {first_reuse_frame}")
+    print(f"Cumulative reused-block deltas: {total_reused_blocks}")
+    print(f"KV tokens per block: {previous_observation.tokens_per_block}")
+    print(f"Final cumulative cache hit rate: {previous_observation.cumulative_hit_rate:.2%}")
+    if args.incremental_results_path is not None:
+        args.incremental_results_path.write_text(
+            json.dumps(
+                {
+                    "block_reuse": args.kv_cache_enable_block_reuse,
+                    "visual_boundary_snapshots": args.gdn_visual_boundary_snapshots,
+                    "visual_snapshot_policy": (
+                        "shift_periodic" if args.gdn_visual_boundary_snapshots else "fixed"
+                    ),
+                    "isolated_requests": args.incremental_isolate_requests,
+                    "frames": frame_results,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if args.incremental_isolate_requests:
+        print(
+            "Request-specific visual cache keys enabled: cross-request reuse is intentionally disabled."
+        )
+    elif first_reuse_frame is None and args.kv_cache_enable_block_reuse:
+        print(
+            "WARNING: no reused cache blocks were observed. Check the recurrent-state "
+            "snapshot boundary, paged KV cache, and block-reuse configuration."
+        )
+    elif first_reuse_frame is not None:
+        print("Qwen3.5 incremental video prefix-cache reuse observed (not a correctness check)")
+
+    sequence_length = int(final_outputs["sequence_lengths"][0, 0].item())
+    output_ids = (
+        final_outputs["output_ids"][0, 0, final_input_length:sequence_length].cpu().tolist()
+    )
+    generated_text = tokenizer.decode(
+        output_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    print(f"Final-frame TensorRT generated text:\n{generated_text}")
+    return runner
+
+
 def main() -> None:
     args = parse_arguments()
     _validate_arguments(args)
+    if args.gdn_visual_boundary_snapshots:
+        from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata
+
+        if not hasattr(LinearAttentionMetadata, "visual_boundary_snapshots"):
+            raise RuntimeError("Rebuild native bindings to use --gdn_visual_boundary_snapshots")
+    os.environ["TRTLLM_GDN_VISUAL_BOUNDARY_SNAPSHOTS"] = (
+        "1" if args.gdn_visual_boundary_snapshots else "0"
+    )
+    print(f"GDN visual-boundary snapshots: {args.gdn_visual_boundary_snapshots}")
     if not torch.cuda.is_available():
         raise RuntimeError("The Qwen3.5 multimodal demo requires an NVIDIA GPU")
 
-    processor = AutoProcessor.from_pretrained(
-        args.model_dir,
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-    )
+    hf_config = AutoConfig.from_pretrained(args.model_dir)
+    config = Qwen35Config.from_hugging_face(hf_config)
+    if not config.has_vision:
+        raise ValueError("The supplied Qwen3.5 model does not contain a vision tower")
+
+    incremental_frame_hashes = None
+    incremental_frame_indices = None
+    incremental_frame_rate = None
     if args.image is not None:
+        processor = AutoProcessor.from_pretrained(
+            args.model_dir,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+        )
         prompt = args.prompt or "Describe this image in detail."
         with Image.open(args.image) as image_file:
             image = image_file.convert("RGB")
@@ -655,22 +1147,49 @@ def main() -> None:
     else:
         prompt = args.prompt or "总结一下这段视频"
         decoded_video = _decode_video_with_ffmpeg(args.video, args.video_num_frames)
-        processor_inputs = _prepare_video_processor_inputs(processor, decoded_video, prompt)
-        visual_content_hash = (
-            _hash_multimodal_content("video", _video_data_for_hash(decoded_video))
-            if args.kv_cache_enable_block_reuse
-            else None
+        processor_max_pixels = args.max_pixels
+        if args.incremental_video_frames:
+            processor_max_pixels = _incremental_video_max_pixels(
+                args,
+                config,
+                decoded_video.frames.shape[0],
+            )
+        processor = AutoProcessor.from_pretrained(
+            args.model_dir,
+            min_pixels=args.min_pixels,
+            max_pixels=processor_max_pixels,
         )
+        if args.incremental_video_frames:
+            processor_inputs = _prepare_incremental_video_processor_inputs(
+                processor,
+                decoded_video,
+                prompt,
+                args.min_pixels,
+                processor_max_pixels,
+            )
+            incremental_frame_hashes = _hash_multimodal_contents(
+                "video",
+                [
+                    _video_frame_data_for_hash(decoded_video, index)
+                    for index in range(decoded_video.frames.shape[0])
+                ],
+            )
+            incremental_frame_indices = list(decoded_video.metadata.frames_indices)
+            incremental_frame_rate = float(decoded_video.metadata.fps)
+            visual_content_hash = None
+            modality_name = "Incremental video"
+        else:
+            processor_inputs = _prepare_video_processor_inputs(processor, decoded_video, prompt)
+            visual_content_hash = (
+                _hash_multimodal_content("video", _video_data_for_hash(decoded_video))
+                if args.kv_cache_enable_block_reuse
+                else None
+            )
+            modality_name = "Video"
         modality = "video"
-        modality_name = "Video"
         pixel_values_name = "pixel_values_videos"
         grid_name = "video_grid_thw"
         del decoded_video
-
-    hf_config = AutoConfig.from_pretrained(args.model_dir)
-    config = Qwen35Config.from_hugging_face(hf_config)
-    if not config.has_vision:
-        raise ValueError("The supplied Qwen3.5 model does not contain a vision tower")
 
     multimodal_cache_input = None
     if visual_content_hash is not None:
@@ -695,11 +1214,19 @@ def main() -> None:
             f"Processor pixel values and {modality_name.lower()} grid disagree: "
             f"{pixel_values.shape[0]} and {actual_patch_tokens}"
         )
-    print(f"{modality_name} grid (T, H, W): {grid_thw.tolist()}")
+    if args.incremental_video_frames:
+        print(
+            f"{modality_name} grids: count={grid_thw.shape[0]}, "
+            f"first={grid_thw[0].tolist()}, last={grid_thw[-1].tolist()}"
+        )
+    else:
+        print(f"{modality_name} grid (T, H, W): {grid_thw.tolist()}")
     print(f"Vision patch tokens: {actual_patch_tokens}")
 
     # MRoPE must be prepared while the original visual placeholder IDs are still present.
-    if args.image is not None:
+    if args.incremental_video_frames:
+        mrope_inputs = None
+    elif args.image is not None:
         mrope_inputs = prepare_qwen35_mrope_inputs(
             processor_inputs["input_ids"],
             config,
@@ -731,6 +1258,32 @@ def main() -> None:
 
     del vision_session
 
+    if args.incremental_video_frames:
+        if (
+            incremental_frame_hashes is None
+            or incremental_frame_indices is None
+            or incremental_frame_rate is None
+        ):
+            raise RuntimeError("Incremental video metadata was not prepared")
+        incremental_runner = _run_incremental_video_requests(
+            args,
+            processor,
+            processor_inputs,
+            trt_visual_features,
+            config,
+            incremental_frame_hashes,
+            incremental_frame_indices,
+            incremental_frame_rate,
+        )
+        if os.environ.get("QWEN35_EXIT_WITHOUT_RUNTIME_CLEANUP") == "1":
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        incremental_runner.session.shutdown()
+        return
+
+    if mrope_inputs is None:
+        raise RuntimeError("MRoPE inputs were not prepared")
     if args.image is not None:
         executor_inputs = prepare_qwen35_executor_prompt_inputs(
             processor_inputs["input_ids"],

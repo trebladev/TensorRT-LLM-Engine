@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace tensorrt_llm::batch_manager
@@ -63,6 +64,84 @@ bool hasValidMultimodalCacheMetadata(LlmRequest const& request)
 }
 
 } // namespace
+
+std::vector<runtime::SizeType32> getMultimodalSnapshotBoundaries(
+    LlmRequest const& request, runtime::SizeType32 tokensPerBlock)
+{
+    TLLM_CHECK(tokensPerBlock > 0);
+    std::vector<runtime::SizeType32> boundaries;
+    if (!hasValidMultimodalCacheMetadata(request))
+    {
+        return boundaries;
+    }
+    // Sparse layouts need explicit logical-item ends; embedding counts are not spans.
+    if (request.getMultimodalItemRunCuOffsets() || request.getMultimodalRunPositions()
+        || request.getMultimodalRunLengths())
+    {
+        return boundaries;
+    }
+    auto const& positions = **request.getMultimodalPositions();
+    auto const& lengths = **request.getMultimodalLengths();
+    for (size_t i = 0; i < positions.size(); ++i)
+    {
+        auto const end = static_cast<int64_t>(positions[i]) + lengths[i];
+        auto const boundary = static_cast<runtime::SizeType32>(end / tokensPerBlock * tokensPerBlock);
+        if (boundary > 0 && boundary < request.getPromptLen())
+        {
+            boundaries.push_back(boundary);
+        }
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    return boundaries;
+}
+
+std::vector<runtime::SizeType32> getRecurrentStateSnapshotBoundaries(
+    LlmRequest const& request, runtime::SizeType32 tokensPerBlock, runtime::SizeType32 snapshotInterval)
+{
+    TLLM_CHECK(tokensPerBlock > 0 && snapshotInterval > 0 && snapshotInterval % tokensPerBlock == 0);
+    auto const visualBoundaries = getMultimodalSnapshotBoundaries(request, tokensPerBlock);
+    std::vector<runtime::SizeType32> boundaries;
+    runtime::SizeType32 previousBoundary = 0;
+    // Invalid, absent and sparse multimodal metadata conservatively retain the periodic policy.
+    auto const positions = request.getMultimodalPositions();
+    auto const lengths = request.getMultimodalLengths();
+    for (int64_t periodicBoundary = snapshotInterval; periodicBoundary < request.getPromptLen();
+         periodicBoundary += snapshotInterval)
+    {
+        auto const boundary = static_cast<runtime::SizeType32>(periodicBoundary);
+        if (boundary <= previousBoundary)
+        {
+            continue; // A preceding periodic point was already moved past this point.
+        }
+        auto selectedBoundary = boundary;
+        if (!visualBoundaries.empty())
+        {
+            for (size_t item = 0; item < (**positions).size(); ++item)
+            {
+                auto const start = (**positions)[item];
+                auto const end = static_cast<int64_t>(start) + (**lengths)[item];
+                if (start < boundary && boundary < end)
+                {
+                    auto const visualEnd = end / tokensPerBlock * tokensPerBlock;
+                    // Shift only an existing periodic point, never add an image-only snapshot.
+                    // Bound the extension by one interval so large images retain internal states.
+                    if (visualEnd < request.getPromptLen() && visualEnd - boundary <= snapshotInterval
+                        && visualEnd - previousBoundary <= 2 * static_cast<int64_t>(snapshotInterval))
+                    {
+                        selectedBoundary = static_cast<runtime::SizeType32>(visualEnd);
+                    }
+                    break;
+                }
+            }
+        }
+        boundaries.push_back(selectedBoundary);
+        previousBoundary = selectedBoundary;
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    return boundaries;
+}
 
 template <typename TTensor, typename TStream>
 runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)

@@ -51,6 +51,15 @@ MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextC
     , mNoScheduleUntilState(noScheduleUntilState)
     , mNoScheduleAfterState(noScheduleAfterState)
 {
+    if (mCtxChunkConfig && mCtxChunkConfig->visualSnapshotTokensPerBlock > 0 && mCtxChunkConfig->stateSnapshotInterval)
+    {
+        auto const maxSnapshotGap = 2 * static_cast<int64_t>(*mCtxChunkConfig->stateSnapshotInterval);
+        TLLM_CHECK_WITH_INFO(!mMaxContextLength || *mMaxContextLength >= maxSnapshotGap,
+            "Shifted visual snapshots require a max context chunk length of at least %ld tokens.", maxSnapshotGap);
+        TLLM_CHECK_WITH_INFO(mCtxChunkConfig->chunkingPolicy != ContextChunkingPolicy::kFORCE_CHUNK
+                || mCtxChunkConfig->chunkUnitSize >= maxSnapshotGap,
+            "Shifted visual snapshots require a forced chunk size of at least %ld tokens.", maxSnapshotGap);
+    }
 }
 
 void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
@@ -104,8 +113,9 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
     }
 }
 
-void MicroBatchScheduler::alignToStateSnapshotBoundaries(
-    RequestVector& contextsToBeChunked, SizeType32 const stateSnapshotInterval)
+void MicroBatchScheduler::alignToStateSnapshotBoundaries(RequestVector& contextsToBeChunked,
+    SizeType32 const stateSnapshotInterval, SizeType32 const visualSnapshotTokensPerBlock,
+    SizeType32 const lastSnapshotTokensPerBlock)
 {
     TLLM_CHECK_WITH_INFO(stateSnapshotInterval > 0, "The recurrent-state snapshot interval (%d) must be positive.",
         stateSnapshotInterval);
@@ -127,8 +137,24 @@ void MicroBatchScheduler::alignToStateSnapshotBoundaries(
             "The recurrent-state snapshot start (%d) must be smaller than the prompt length (%d) for request %lu.",
             snapshotStart, promptLength, static_cast<unsigned long>(llmReq->mRequestId));
 
-        auto const nextSnapshotBoundary
+        auto nextSnapshotBoundary
             = std::min(promptLength, (snapshotStart / stateSnapshotInterval + 1) * stateSnapshotInterval);
+        if (visualSnapshotTokensPerBlock > 0)
+        {
+            auto const boundaries
+                = getRecurrentStateSnapshotBoundaries(*llmReq, visualSnapshotTokensPerBlock, stateSnapshotInterval);
+            auto const next = std::upper_bound(boundaries.begin(), boundaries.end(), snapshotStart);
+            nextSnapshotBoundary = next != boundaries.end() ? *next : promptLength;
+        }
+        if (lastSnapshotTokensPerBlock > 0)
+        {
+            auto const lastFullBoundary = promptLength / lastSnapshotTokensPerBlock * lastSnapshotTokensPerBlock;
+            if (lastFullBoundary > snapshotStart)
+            {
+                // Allocation alone is insufficient: the model must write the state at this boundary.
+                nextSnapshotBoundary = std::min(nextSnapshotBoundary, lastFullBoundary);
+            }
+        }
         auto const requiredChunkSize = nextSnapshotBoundary - snapshotStart;
 
         // Do not execute a partial chunk that cannot reach a state snapshot.
@@ -309,7 +335,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChunked,
     ContextChunkingPolicy const ctxChunkPolicy, std::optional<SizeType32> ctxTokensCapacity,
     SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextLength,
-    std::optional<SizeType32> const stateSnapshotInterval)
+    std::optional<SizeType32> const stateSnapshotInterval, SizeType32 const visualSnapshotTokensPerBlock,
+    SizeType32 const lastSnapshotTokensPerBlock)
 {
     for (auto& llmReq : contextsToBeChunked)
     {
@@ -334,7 +361,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChu
 
     if (stateSnapshotInterval)
     {
-        alignToStateSnapshotBoundaries(contextsToBeChunked, stateSnapshotInterval.value());
+        alignToStateSnapshotBoundaries(contextsToBeChunked, stateSnapshotInterval.value(), visualSnapshotTokensPerBlock,
+            lastSnapshotTokensPerBlock);
     }
 
     // After scheduling chunk sizes, discard draft tokens that won't fit.
@@ -487,11 +515,13 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         auto const ctxTokensCapacity
             = maxNumTokensRuntime ? std::make_optional(maxNumTokensRuntime.value() - batchNumTokens) : std::nullopt;
         setCtxRequestsChunkSize(contextsToBeChunked, mCtxChunkConfig.value().chunkingPolicy, ctxTokensCapacity,
-            mCtxChunkConfig.value().chunkUnitSize, mMaxContextLength, mCtxChunkConfig.value().stateSnapshotInterval);
+            mCtxChunkConfig.value().chunkUnitSize, mMaxContextLength, mCtxChunkConfig.value().stateSnapshotInterval,
+            mCtxChunkConfig->visualSnapshotTokensPerBlock, mCtxChunkConfig->lastSnapshotTokensPerBlock);
     }
     else if (mCtxChunkConfig && mCtxChunkConfig->stateSnapshotInterval)
     {
-        alignToStateSnapshotBoundaries(contextsToBeChunked, mCtxChunkConfig->stateSnapshotInterval.value());
+        alignToStateSnapshotBoundaries(contextsToBeChunked, mCtxChunkConfig->stateSnapshotInterval.value(),
+            mCtxChunkConfig->visualSnapshotTokensPerBlock, mCtxChunkConfig->lastSnapshotTokensPerBlock);
         fitDraftTokens(contextsToBeChunked, std::nullopt, mCtxChunkConfig->chunkUnitSize, mMaxContextLength);
     }
     for (auto const& llmReq : contextsToBeChunked)

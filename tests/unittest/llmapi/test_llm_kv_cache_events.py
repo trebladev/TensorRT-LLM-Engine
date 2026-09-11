@@ -493,6 +493,16 @@ def test_apply_mm_hashes_videodata_vs_framelist_distinguished():
     assert h_video["video"][0] != h_list["video"][0]
 
 
+def test_apply_mm_hashes_image_vs_single_frame_video_distinguished():
+    image = Image.new("RGB", (2, 2), (10, 20, 30))
+    video = _make_video([image], audio_samples=None)
+
+    h_image, _ = apply_mm_hashes({"image": [image]})
+    h_video, _ = apply_mm_hashes({"video": [video]})
+
+    assert h_image["image"][0] != h_video["video"][0]
+
+
 def test_apply_mm_hashes_identical_inputs_match():
     img = Image.new("RGBA", (8, 12), (1, 2, 3, 4))
     img_copy = Image.new("RGBA", (8, 12), (1, 2, 3, 4))

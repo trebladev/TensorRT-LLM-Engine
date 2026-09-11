@@ -32,6 +32,7 @@ from tensorrt_llm.models.qwen35.model import Qwen35ForCausalLM, Qwen35Model
 from tensorrt_llm.models.qwen35.vision_utils import (
     prepare_qwen35_executor_prompt_inputs,
     prepare_qwen35_mrope_inputs,
+    prepare_qwen35_multimodal_cache_input,
     prepare_qwen35_prompt_tuning_inputs,
 )
 from tensorrt_llm.module import Module, ModuleList
@@ -74,6 +75,7 @@ def _small_qwen35_config(*, with_vision: bool = False) -> Qwen35Config:
         decoder_layer_types=["full_attention"],
         image_token_id=120,
         video_token_id=121,
+        vision_start_token_id=119,
         **vision_kwargs,
     )
 
@@ -422,6 +424,104 @@ def test_prepare_qwen35_executor_prompt_inputs_rejects_unused_features() -> None
             attention_mask,
             config,
             image_features=image_features,
+        )
+
+
+def test_prepare_qwen35_multimodal_cache_input_image_span() -> None:
+    config = _small_qwen35_config()
+    input_ids = torch.tensor(
+        [[0, 7, config.vision_start_token_id, config.image_token_id, config.image_token_id, 8]]
+    )
+    attention_mask = torch.tensor([[0, 1, 1, 1, 1, 1]])
+    content_hash = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    multimodal_input = prepare_qwen35_multimodal_cache_input(
+        input_ids,
+        attention_mask,
+        config,
+        "image",
+        content_hash,
+    )
+
+    assert multimodal_input.multimodal_hashes == [content_hash]
+    assert multimodal_input.multimodal_positions == [1]
+    assert multimodal_input.multimodal_lengths == [3]
+
+
+def test_prepare_qwen35_multimodal_cache_input_duplicates_video_hash() -> None:
+    config = _small_qwen35_config()
+    input_ids = torch.tensor(
+        [
+            [
+                7,
+                config.vision_start_token_id,
+                config.video_token_id,
+                config.video_token_id,
+                8,
+                config.vision_start_token_id,
+                config.video_token_id,
+                9,
+            ]
+        ]
+    )
+    attention_mask = torch.ones_like(input_ids)
+    content_hash = [8, 7, 6, 5, 4, 3, 2, 1]
+
+    multimodal_input = prepare_qwen35_multimodal_cache_input(
+        input_ids,
+        attention_mask,
+        config,
+        "video",
+        content_hash,
+    )
+
+    assert multimodal_input.multimodal_hashes == [content_hash, content_hash]
+    assert multimodal_input.multimodal_positions == [1, 5]
+    assert multimodal_input.multimodal_lengths == [3, 2]
+
+
+def test_prepare_qwen35_multimodal_cache_input_maps_per_span_hashes() -> None:
+    config = _small_qwen35_config()
+    input_ids = torch.tensor(
+        [
+            [
+                config.vision_start_token_id,
+                config.video_token_id,
+                7,
+                config.vision_start_token_id,
+                config.video_token_id,
+            ]
+        ]
+    )
+    content_hashes = [
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        [8, 7, 6, 5, 4, 3, 2, 1],
+    ]
+
+    multimodal_input = prepare_qwen35_multimodal_cache_input(
+        input_ids,
+        torch.ones_like(input_ids),
+        config,
+        "video",
+        content_hashes=content_hashes,
+    )
+
+    assert multimodal_input.multimodal_hashes == content_hashes
+    assert multimodal_input.multimodal_positions == [0, 3]
+    assert multimodal_input.multimodal_lengths == [2, 2]
+
+
+def test_prepare_qwen35_multimodal_cache_input_rejects_unmapped_tokens() -> None:
+    config = _small_qwen35_config()
+    input_ids = torch.tensor([[7, config.image_token_id, 8]])
+
+    with pytest.raises(ValueError, match="Could not map every"):
+        prepare_qwen35_multimodal_cache_input(
+            input_ids,
+            torch.ones_like(input_ids),
+            config,
+            "image",
+            [1, 2, 3, 4, 5, 6, 7, 8],
         )
 
 

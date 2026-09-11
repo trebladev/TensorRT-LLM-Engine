@@ -489,6 +489,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
                     executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, mKvCacheManager->getTokensPerBlock()};
             }
             ctxChunkConfig->stateSnapshotInterval = linearAttentionMetadata->statesSnapshotInterval;
+            ctxChunkConfig->lastSnapshotTokensPerBlock
+                = linearAttentionMetadata->saveLastSnapshot ? mKvCacheManager->getTokensPerBlock() : 0;
+            ctxChunkConfig->visualSnapshotTokensPerBlock
+                = linearAttentionMetadata->visualBoundarySnapshots ? mKvCacheManager->getTokensPerBlock() : 0;
         }
     }
 
@@ -784,6 +788,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         constexpr SizeType32 kRecurrentStateSnapshotInterval = 256;
         metadata.statesSnapshotInterval = kvCacheConfig.getEnableBlockReuse() ? kRecurrentStateSnapshotInterval : 0;
         metadata.saveLastSnapshot = kvCacheConfig.getEnableBlockReuse();
+        metadata.visualBoundarySnapshots
+            = kvCacheConfig.getEnableBlockReuse() && tc::getBoolEnv("TRTLLM_GDN_VISUAL_BOUNDARY_SNAPSHOTS");
 
         SizeType32 localAttentionIdx = 0;
         for (SizeType32 localLayerIdx = 0; localLayerIdx < numLocalDecoderLayers; ++localLayerIdx)

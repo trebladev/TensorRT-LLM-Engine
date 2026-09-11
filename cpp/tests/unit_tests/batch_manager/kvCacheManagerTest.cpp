@@ -8331,79 +8331,97 @@ TEST_F(KVCacheManagerTest, LinearAttentionBlockCountIncludesOptionalLastFullSnap
 
 TEST_F(KVCacheManagerTest, HybridPrefixReuseStopsAtLatestRecurrentStateSnapshot)
 {
-    auto constexpr numKvHeads = 2;
-    auto constexpr sizePerHead = 8;
-    auto constexpr tokensPerBlock = 4;
-    auto constexpr maxNumSequences = 4;
-    auto constexpr maxAttentionWindow = 32;
-    auto constexpr stateSlotBytes = 64;
-    auto constexpr beamWidth = 1;
-    auto constexpr maxNewTokens = 1;
-    auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
-
-    auto const stream = std::make_shared<tr::CudaStream>();
-    LinearAttentionMetadata const linearAttentionMetadata{
-        .linearLayerIndices = {0},
-        .cacheType = linearWindowSize,
-        .allRecurrentStatesBytes = stateSlotBytes,
-        .statesSnapshotInterval = 8,
-        .saveLastSnapshot = false,
-        .numPlaceholderBlocks = 16,
-    };
-    BlocksPerWindow const blocksPerWindow{
-        {maxAttentionWindow, {16, 0}},
-        {linearWindowSize, {8, 0}},
-    };
-    std::vector<SizeType32> const numKvHeadsPerLayer{0, numKvHeads};
-    std::vector<SizeType32> const layerWindows{linearWindowSize, maxAttentionWindow};
-    std::vector<PoolConfiguration> const poolConfigurations{
-        {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kBF16},
-        {linearWindowSize, 1, nvinfer1::DataType::kUINT8},
-    };
-
-    KVCacheManager kvCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, layerWindows, nvinfer1::DataType::kBF16, /*sinkTokenLength=*/0, stream, maxAttentionWindow,
-        /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt, nullptr,
-        /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
-        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
-        linearAttentionMetadata, poolConfigurations);
-    kvCacheManager.allocatePools(false);
-
-    auto inputTokens = std::make_shared<VecTokens>();
-    for (SizeType32 token = 0; token < 13; ++token)
+    for (auto const visualSnapshots : {false, true})
     {
-        inputTokens->push_back(token);
+        auto constexpr numKvHeads = 2;
+        auto constexpr sizePerHead = 8;
+        auto constexpr tokensPerBlock = 4;
+        auto constexpr maxNumSequences = 4;
+        auto constexpr maxAttentionWindow = 32;
+        auto constexpr stateSlotBytes = 64;
+        auto constexpr beamWidth = 1;
+        auto constexpr maxNewTokens = 1;
+        auto constexpr linearWindowSize = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+        auto const stream = std::make_shared<tr::CudaStream>();
+        LinearAttentionMetadata const linearAttentionMetadata{
+            .linearLayerIndices = {0},
+            .cacheType = linearWindowSize,
+            .allRecurrentStatesBytes = stateSlotBytes,
+            .statesSnapshotInterval = 8,
+            .saveLastSnapshot = false,
+            .visualBoundarySnapshots = visualSnapshots,
+            .numPlaceholderBlocks = 16,
+        };
+        BlocksPerWindow const blocksPerWindow{
+            {maxAttentionWindow, {16, 0}},
+            {linearWindowSize, {8, 0}},
+        };
+        std::vector<SizeType32> const numKvHeadsPerLayer{0, numKvHeads};
+        std::vector<SizeType32> const layerWindows{linearWindowSize, maxAttentionWindow};
+        std::vector<PoolConfiguration> const poolConfigurations{
+            {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kBF16},
+            {linearWindowSize, 1, nvinfer1::DataType::kUINT8},
+        };
+
+        KVCacheManager kvCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+            beamWidth, layerWindows, nvinfer1::DataType::kBF16, /*sinkTokenLength=*/0, stream, maxAttentionWindow,
+            /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt, nullptr,
+            /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr, /*enableIndexerKCache=*/false,
+            /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+            linearAttentionMetadata, poolConfigurations);
+        kvCacheManager.allocatePools(false);
+
+        VecTokens inputTokens;
+        for (SizeType32 token = 0; token < 13; ++token)
+        {
+            inputTokens.push_back(token);
+        }
+        tensorrt_llm::executor::Request execRequest(inputTokens, maxNewTokens);
+        execRequest.setMultimodalInput(tensorrt_llm::executor::MultimodalInput(
+            std::vector<std::vector<int32_t>>(2, std::vector<int32_t>(8, 1)), {0, 5}, {4, 7}));
+        auto cachedRequest = std::make_shared<LlmRequest>(20, execRequest);
+        kvCacheManager.addSequenceBatch(
+            {{{cachedRequest->mRequestId, cachedRequest->mPromptLen, beamWidth}}}, {std::ref(*cachedRequest)});
+        if (visualSnapshots)
+        {
+            EXPECT_ANY_THROW(
+                static_cast<void>(kvCacheManager.getRecurrentStateSlotForToken(cachedRequest->mRequestId, 7)));
+            EXPECT_ANY_THROW(
+                static_cast<void>(kvCacheManager.getRecurrentStateSlotForToken(cachedRequest->mRequestId, 3)));
+        }
+        else
+        {
+            EXPECT_NO_THROW(
+                static_cast<void>(kvCacheManager.getRecurrentStateSlotForToken(cachedRequest->mRequestId, 7)));
+        }
+        kvCacheManager.storeContextBlocks(*cachedRequest);
+
+        auto probeRequest = std::make_shared<LlmRequest>(21, execRequest);
+        auto const& uniqueTokens = probeRequest->getUniqueTokens(/*beamIdx=*/0);
+        auto const fullAttentionSummary = kvCacheManager.getBlockManager()
+                                              .getWindowBlockManager(maxAttentionWindow)
+                                              .analyzePrefixReuse(uniqueTokens, *probeRequest);
+        auto const recurrentStateSummary = kvCacheManager.getBlockManager()
+                                               .getWindowBlockManager(linearWindowSize)
+                                               .analyzePrefixReuse(uniqueTokens, *probeRequest);
+        auto const hybridSummary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *probeRequest);
+
+        EXPECT_EQ(fullAttentionSummary.reusableTokens, 12);
+        auto const expectedReusable = visualSnapshots ? 12 : 8;
+        EXPECT_EQ(recurrentStateSummary.reusableTokens, expectedReusable);
+        EXPECT_EQ(hybridSummary.reusableTokens, expectedReusable);
+        EXPECT_EQ(hybridSummary.reusableBlocksAllocated, 0);
+        EXPECT_EQ(hybridSummary.reusableBlocksAll, 0);
+        EXPECT_FALSE(hybridSummary.firstNewBlock.has_value());
+
+        static_cast<void>(kvCacheManager.getNeededBlocksOneStep(
+            *probeRequest, /*twoStepsLookAhead=*/false, linearWindowSize, hybridSummary));
+        EXPECT_EQ(probeRequest->getEstimatedReusableTokens(), expectedReusable);
+        static_cast<void>(kvCacheManager.getNeededBlocksOneStep(
+            *probeRequest, /*twoStepsLookAhead=*/false, maxAttentionWindow, hybridSummary));
+        EXPECT_EQ(probeRequest->getEstimatedReusableTokens(), expectedReusable);
     }
-    auto cachedRequest = std::make_shared<LlmRequest>(
-        /*requestId=*/20, maxNewTokens, inputTokens, tr::SamplingConfig{beamWidth}, /*isStreaming=*/false);
-    kvCacheManager.addSequenceBatch(
-        {{{cachedRequest->mRequestId, cachedRequest->mPromptLen, beamWidth}}}, {std::ref(*cachedRequest)});
-    kvCacheManager.storeContextBlocks(*cachedRequest);
-
-    auto probeRequest = std::make_shared<LlmRequest>(
-        /*requestId=*/21, maxNewTokens, inputTokens, tr::SamplingConfig{beamWidth}, /*isStreaming=*/false);
-    auto const& uniqueTokens = probeRequest->getUniqueTokens(/*beamIdx=*/0);
-    auto const fullAttentionSummary
-        = kvCacheManager.getBlockManager().getWindowBlockManager(maxAttentionWindow).analyzePrefixReuse(
-            uniqueTokens, *probeRequest);
-    auto const recurrentStateSummary
-        = kvCacheManager.getBlockManager().getWindowBlockManager(linearWindowSize).analyzePrefixReuse(
-            uniqueTokens, *probeRequest);
-    auto const hybridSummary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *probeRequest);
-
-    EXPECT_EQ(fullAttentionSummary.reusableTokens, 12);
-    EXPECT_EQ(recurrentStateSummary.reusableTokens, 8);
-    EXPECT_EQ(hybridSummary.reusableTokens, 8);
-    EXPECT_EQ(hybridSummary.reusableBlocksAllocated, 0);
-    EXPECT_EQ(hybridSummary.reusableBlocksAll, 0);
-    EXPECT_FALSE(hybridSummary.firstNewBlock.has_value());
-
-    static_cast<void>(kvCacheManager.getNeededBlocksOneStep(
-        *probeRequest, /*twoStepsLookAhead=*/false, linearWindowSize, hybridSummary));
-    EXPECT_EQ(probeRequest->getEstimatedReusableTokens(), 8);
-    static_cast<void>(kvCacheManager.getNeededBlocksOneStep(
-        *probeRequest, /*twoStepsLookAhead=*/false, maxAttentionWindow, hybridSummary));
-    EXPECT_EQ(probeRequest->getEstimatedReusableTokens(), 8);
 }
 
 TEST_F(KVCacheManagerTest, LinearAttentionBuffersUsePhysicalStateSlots)

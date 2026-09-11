@@ -13,7 +13,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../../.." && pwd)"
 
 model_dir="${QWEN35_MODEL_DIR:-/root/code_x/Qwen3.5-2B}"
-video="${QWEN35_VIDEO:-/root/code_x/women.gif}"
+video="${QWEN35_VIDEO:-/root/code_x/zara.mp4}"
 llm_engine_dir="$1"
 vision_engine_dir="$2"
 shift 2
@@ -80,6 +80,9 @@ finally:
     --vision_engine_dir "${vision_engine_dir}" \
     --video "${video}" \
     --prompt "总结一下这段视频" \
-    --video_num_frames 0 \
+    --video_num_frames 64 \
     --enable_chunked_context \
+    --kv_cache_free_gpu_memory_fraction 0.3 \
+    --kv_cache_enable_block_reuse \
+    --incremental_video_frames \
     "$@"

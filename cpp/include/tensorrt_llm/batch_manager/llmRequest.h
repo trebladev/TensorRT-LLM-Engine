@@ -2524,4 +2524,14 @@ public:
     void removeLoraTensors();
 };
 
+//! Return sorted, unique block-aligned ends of contiguous multimodal items.
+//! Positions count consumed tokens and exclude the final writable prompt block.
+[[nodiscard]] std::vector<runtime::SizeType32> getMultimodalSnapshotBoundaries(
+    LlmRequest const& request, runtime::SizeType32 tokensPerBlock);
+
+//! Shift visual-internal periodic snapshots to block-aligned visual ends; do not add image-only snapshots.
+//! Exclude the final prompt state and bound gaps by twice the periodic interval.
+[[nodiscard]] std::vector<runtime::SizeType32> getRecurrentStateSnapshotBoundaries(
+    LlmRequest const& request, runtime::SizeType32 tokensPerBlock, runtime::SizeType32 snapshotInterval);
+
 } // namespace tensorrt_llm::batch_manager

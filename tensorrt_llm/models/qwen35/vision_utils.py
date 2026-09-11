@@ -18,10 +18,12 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
 from ..._utils import str_dtype_to_torch
+from ...inputs.multimodal import MultimodalInput
 from .config import Qwen35Config
 
 
@@ -484,6 +486,103 @@ def prepare_qwen35_prompt_tuning_inputs(
             dtype=torch.int32,
             device=prompt_device,
         ),
+    )
+
+
+def prepare_qwen35_multimodal_cache_input(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    config: Qwen35Config,
+    modality: Literal["image", "video"],
+    content_hash: list[int] | None = None,
+    *,
+    content_hashes: list[list[int]] | None = None,
+) -> MultimodalInput:
+    """Build content-aware cache metadata for a batch-1 visual prompt.
+
+    A single image or video hash is duplicated across all of its prompt spans.
+    Callers that represent each span as an independent visual item can instead
+    provide one hash per span through ``content_hashes``.
+    """
+    if input_ids.shape[0] != 1 or attention_mask.shape != input_ids.shape:
+        raise ValueError(
+            "Qwen3.5 multimodal prefix caching currently requires batch size 1 "
+            "and an attention mask matching input_ids."
+        )
+    if (content_hash is None) == (content_hashes is None):
+        raise ValueError("Provide exactly one of content_hash or content_hashes")
+    if config.vision_start_token_id is None:
+        raise ValueError("Qwen3.5 multimodal prefix caching requires vision_start_token_id")
+    if modality == "image":
+        multimodal_token_id = config.image_token_id
+        other_multimodal_token_id = config.video_token_id
+    elif modality == "video":
+        multimodal_token_id = config.video_token_id
+        other_multimodal_token_id = config.image_token_id
+    else:
+        raise ValueError(f"Unsupported Qwen3.5 multimodal cache modality: {modality}")
+    if multimodal_token_id is None:
+        raise ValueError(f"Qwen3.5 configuration does not define a {modality}_token_id")
+
+    active_mask = attention_mask[0].to(dtype=torch.bool, device=input_ids.device)
+    request_ids = input_ids[0][active_mask].cpu().tolist()
+    if other_multimodal_token_id is not None and other_multimodal_token_id in request_ids:
+        raise ValueError("Qwen3.5 multimodal cache metadata supports one modality per request.")
+
+    positions = []
+    lengths = []
+    token_index = 0
+    while token_index < len(request_ids):
+        if request_ids[token_index] != config.vision_start_token_id:
+            token_index += 1
+            continue
+        span_start = token_index
+        token_index += 1
+        span_end = token_index
+        while span_end < len(request_ids) and request_ids[span_end] == multimodal_token_id:
+            span_end += 1
+        if span_end == token_index:
+            continue
+        positions.append(span_start)
+        lengths.append(span_end - span_start)
+        token_index = span_end
+
+    expected_visual_positions = {
+        index for index, token_id in enumerate(request_ids) if token_id == multimodal_token_id
+    }
+    covered_visual_positions = {
+        index
+        for position, length in zip(positions, lengths)
+        for index in range(position + 1, position + length)
+    }
+    if not positions or covered_visual_positions != expected_visual_positions:
+        raise ValueError(
+            f"Could not map every Qwen3.5 visual placeholder token to a {modality} cache span."
+        )
+
+    if content_hashes is None:
+        if content_hash is None:
+            raise ValueError("content_hash must be provided when content_hashes is None")
+        span_hashes = [content_hash.copy() for _ in positions]
+    else:
+        if len(content_hashes) != len(positions):
+            raise ValueError(
+                "content_hashes must contain one hash per Qwen3.5 visual prompt span, "
+                f"got {len(content_hashes)} hashes and {len(positions)} spans"
+            )
+        span_hashes = [item_hash.copy() for item_hash in content_hashes]
+    for item_hash in span_hashes:
+        if (
+            len(item_hash) != 8
+            or not all(isinstance(value, int) for value in item_hash)
+            or any(value < -(2**31) or value >= 2**31 for value in item_hash)
+        ):
+            raise ValueError("Each content hash must contain exactly eight signed int32 values")
+
+    return MultimodalInput.from_components(
+        mm_hashes=span_hashes,
+        mm_positions=positions,
+        mm_lengths=lengths,
     )
 
 

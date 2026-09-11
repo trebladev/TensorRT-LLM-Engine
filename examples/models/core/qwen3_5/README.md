@@ -277,6 +277,111 @@ It exits without normal Python runtime cleanup after printing the result to
 avoid an ABI-specific destructor failure when the source bindings and installed
 TensorRT Python package use different minor versions.
 
+### Incremental frames and visual-boundary GDN snapshots
+
+The wrapper enables incremental frames and prefix reuse: encode all frames once
+as independent video items, then submit `frame1 + prompt`,
+`frame1 + frame2 + prompt`, and so on. Intermediate requests generate one token;
+the final request uses `--max_new_tokens`. Use `--no-incremental_video_frames`
+to process the video as a single item instead.
+
+The experimental `--gdn_visual_boundary_snapshots` switch is **off by default**.
+It uses snapshots at the nearest full KV block boundary at or before each
+contiguous visual metadata span's end, replacing redundant 256-token snapshots
+inside visual spans instead of simply adding more snapshots. Periodic snapshots
+in text and the final-full-block snapshot are unchanged. A visual-internal
+periodic snapshot is retained if removing it would leave a gap exceeding the
+256-token interval between checkpoints, protecting large images and long text
+prefixes from producing unschedulable chunks.
+For this demo, the span includes `vision_start` and visual placeholders but not
+`vision_end`. With 32-token KV blocks, at most 31 tokens of that span remain
+after its visual boundary. No padding or partial KV blocks are introduced.
+Sparse/run-layout metadata falls back to the regular snapshot policy.
+
+The scheduler, physical recurrent-state allocation, and capacity budget use the
+same sorted, deduplicated boundaries. Extra snapshots cost memory and can add
+prefill iterations; this is intended for repeated, growing visual prefixes,
+not as a general throughput optimization. For the full 115-frame example, start
+with `--kv_cache_free_gpu_memory_fraction 0.5`; the needed fraction depends on
+available GPU memory. The final-full-block snapshot is also now a mandatory
+chunk end when allocated, including with the new switch off, so it contains an
+executed state rather than just an allocated slot. Identical pixels alone are insufficient:
+the preceding tokens, item hashes, embeddings, and positional encoding must also
+remain consistent. A different tail prompt can follow the reusable prefix.
+
+Rebuild native bindings (existing engines do not need rebuilding), then run:
+
+```bash
+cmake --build cpp/build --target bindings --parallel 8
+bash examples/models/core/qwen3_5/run_video_demo.sh \
+    /tmp/qwen35_decode_engine /tmp/qwen35_full_video_vision_engine \
+    --max_new_tokens 512 --gdn_visual_boundary_snapshots \
+    --kv_cache_free_gpu_memory_fraction 0.5 \
+    --incremental_results_path /tmp/qwen35_visual_snapshots.json
+```
+
+The Python extension loaded from `tensorrt_llm/` must also be the rebuilt version;
+the demo rejects stale bindings when enabling the switch. Internally, this demo
+sets `TRTLLM_GDN_VISUAL_BOUNDARY_SNAPSHOTS` before creating the native executor.
+
+For a cache-restoration correctness baseline, keep the same snapshot switch,
+frame sampling and prompt, add `--incremental_isolate_requests`, and choose a
+different `--incremental_results_path`. This changes only the visual cache keys
+per request, preserving embeddings, token IDs, positions and chunk boundaries.
+Compare `generated_token_ids` for every frame. A separate fully cache-disabled
+baseline uses `--no-gdn_visual_boundary_snapshots --no-kv_cache_enable_block_reuse`;
+its different prefill segmentation can change floating-point rounding and greedy
+outputs. Compare with reuse enabled but the new switch disabled to measure the
+incremental benefit. Reported block counters aggregate attention
+and recurrent pools: multiplying them by the KV block size does **not** give
+the exact reused token count. Observed reuse is not itself a correctness check.
+
+The following measurements describe the **earlier additive prototype**, before
+the replacement policy above. Development validation used the 115-frame
+`women.gif` with the two engines above,
+84 embedding tokens per frame, 32-token KV blocks, one output token on intermediate
+requests, and `--max_new_tokens 512` on the final request:
+
+| Metric | Fixed interval + final full block | Additional visual boundaries |
+| --- | ---: | ---: |
+| First request with a nonzero hybrid reusable prefix | Frame 4 | Frame 2 |
+| Frame 2 reusable prefix (tokens) | 0 | 64 |
+| Frame 115 reusable prefix (tokens) | 10,304 | 10,464 |
+| Total tokens requiring prefill across 115 requests | 17,829 | 13,925 |
+
+The extra visual snapshots reduced prefill token work by 21.9% in this run.
+These figures use the first scheduled chunk's reusable prefix, not aggregate
+block counters. Set `TLLM_LOG_LEVEL_BY_MODULE=debug:batchmgr` to inspect the
+`context request scheduled` lines (`reusable N`; absent means zero).
+That additive policy matched the isolated-request control on all 115 requests and
+all 195 generated tokens, including 81 final-response tokens. The token-work
+reduction is not a claim of the same percentage wall-clock speedup.
+Validation also passed 65 scheduler tests, five selected GDN/KV tests, and
+18 Qwen3.5 embedding/input tests.
+
+Replacement-policy validation on the same 115-frame input:
+
+| Metric | Switch off | Earlier additive policy | Replacement policy |
+| --- | ---: | ---: | ---: |
+| Full GDN snapshots in the final request's prefix | 104 | 143 | 120 |
+| Snapshot writes across all 115 requests | 148 | 187 | 164 |
+| Total tokens requiring prefill | 17,829 | 13,925 | 13,925 |
+
+One snapshot here includes all 18 GDN layers; counts exclude the live decode
+state. The final-prefix counts include inherited snapshots from previous
+requests, not just the boundaries planned for a cold request. The replacement
+policy removed 23 snapshots and 23 writes relative to the additive prototype
+without reducing the total reusable token prefix. Aggregate block hit rates
+can change because there are fewer recurrent blocks, even with unchanged token
+reuse. The pool capacity remained 205 state slots in all three modes.
+
+The replacement policy matched the same-segmentation, isolated-cache control
+on all 115 requests and all 200 generated tokens (86 on the final request).
+It also passed 68 scheduler tests, five selected GDN/KV tests, and 18 embedding
+tests. The scheduler tests cover text-only inputs, sparse-metadata fallback,
+removed periodic state slots, large-image chunk-size safety, and allocation
+budget consistency across image lengths and block alignments.
+
 Image preprocessing defaults to `min_pixels=3,136` and
 `max_pixels=200,704` so that the Hugging Face eager-attention reference fits on
 a typical development GPU. Pass `--min_pixels` and `--max_pixels` to change the

@@ -41,6 +41,10 @@ struct ContextChunkingConfig
     /// If set, context chunks must end at a recurrent-state snapshot boundary
     /// or at the end of the prompt.
     std::optional<tensorrt_llm::runtime::SizeType32> stateSnapshotInterval = std::nullopt;
+    /// Actual KV block size for visual snapshots; zero disables the policy.
+    tensorrt_llm::runtime::SizeType32 visualSnapshotTokensPerBlock{0};
+    /// Actual KV block size when the final full block is allocated as a snapshot.
+    tensorrt_llm::runtime::SizeType32 lastSnapshotTokensPerBlock{0};
 };
 
 } // namespace batch_scheduler
@@ -65,7 +69,8 @@ public:
     static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
         std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
         std::optional<SizeType32> const& maxContextLength,
-        std::optional<SizeType32> stateSnapshotInterval = std::nullopt);
+        std::optional<SizeType32> stateSnapshotInterval = std::nullopt, SizeType32 visualSnapshotTokensPerBlock = 0,
+        SizeType32 lastSnapshotTokensPerBlock = 0);
 
 private:
     template <ContextChunkingPolicy tPolicy>
@@ -79,7 +84,8 @@ private:
 
     /// Adjust context chunks so that every non-final chunk produces a reusable
     /// recurrent-state snapshot.
-    static void alignToStateSnapshotBoundaries(RequestVector& contextsToBeChunked, SizeType32 stateSnapshotInterval);
+    static void alignToStateSnapshotBoundaries(RequestVector& contextsToBeChunked, SizeType32 stateSnapshotInterval,
+        SizeType32 visualSnapshotTokensPerBlock, SizeType32 lastSnapshotTokensPerBlock);
 
     /// The maximum length of the context. If the context exceeds this length,
     /// it must be chunked, otherwise it cannot be processed. Therefore, it

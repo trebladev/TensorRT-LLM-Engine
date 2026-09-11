@@ -143,6 +143,7 @@ struct LinearAttentionMetadata
     SizeType32 allRecurrentStatesBytes; // Sum of all states like ssm_state and conv_state (1 layer)
     SizeType32 statesSnapshotInterval;  // Only used for kRecurrentStates
     bool saveLastSnapshot;              // Take additional snapshot of recurrent states at the end of the input sequence
+    bool visualBoundarySnapshots{false}; // Prefer visual-end snapshots over visual-internal periodic snapshots.
 
     // Optional: explicit number of placeholder blocks for this kRecurrentStates manager.
     // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
@@ -160,8 +161,8 @@ struct LinearAttentionMetadata
     SizeType32 rnnSsmDtypeSize{0};  // SSM state dtype size in bytes (e.g., 2 for fp16, 4 for fp32)
     SizeType32 rnnConvDtypeSize{0}; // Conv state dtype size in bytes (e.g., 2 for bf16, 1 for fp8)
 
-    [[nodiscard]] bool shouldAllocateRecurrentStates(
-        SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
+    [[nodiscard]] bool shouldAllocateRecurrentStates(SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen,
+        SizeType32 tokensPerBlock, bool enableIntervalSnapshots = true) const
     {
         // Allocate the last full block for maximum reuse opportunity.
         if (saveLastSnapshot && (currentBlockEndTokenIdx / tokensPerBlock == promptLen / tokensPerBlock))
@@ -181,7 +182,8 @@ struct LinearAttentionMetadata
 
         // We have checked statesSnapshotInterval is multiple of mTokensPerBlock during WindowBlockManager
         // initialization.
-        if ((statesSnapshotInterval > 0) && (currentBlockEndTokenIdx % statesSnapshotInterval == 0))
+        if (enableIntervalSnapshots && (statesSnapshotInterval > 0)
+            && (currentBlockEndTokenIdx % statesSnapshotInterval == 0))
         {
             TLLM_LOG_DEBUG("Allocating recurrent states for block %d, reason: statesSnapshotInterval",
                 (currentBlockEndTokenIdx / tokensPerBlock - 1));
@@ -190,8 +192,8 @@ struct LinearAttentionMetadata
         return false;
     }
 
-    [[nodiscard]] SizeType32 calcNumBlocksNeededForReq(
-        SizeType32 promptLen, SizeType32 tokensPerBlock, bool enableReuse) const
+    [[nodiscard]] SizeType32 calcNumBlocksNeededForReq(SizeType32 promptLen, SizeType32 tokensPerBlock,
+        bool enableReuse, std::optional<std::vector<SizeType32>> const& snapshotBoundaries = std::nullopt) const
     {
         if (!enableReuse)
         {
@@ -204,6 +206,24 @@ struct LinearAttentionMetadata
         TLLM_CHECK_WITH_INFO(statesSnapshotInterval == 0 || statesSnapshotInterval % tokensPerBlock == 0,
             "The recurrent-state snapshot interval (%d) must be a multiple of tokens per block (%d).",
             statesSnapshotInterval, tokensPerBlock);
+
+        if (visualBoundarySnapshots && snapshotBoundaries)
+        {
+            // The complete, sorted and unique non-final snapshot plan replaces the periodic count.
+            auto const& boundaries = snapshotBoundaries.value();
+            auto count = static_cast<SizeType32>(boundaries.size()) + 1;
+            auto const lastFullBoundary = promptLen / tokensPerBlock * tokensPerBlock;
+            if (saveLastSnapshot && lastFullBoundary > 0 && lastFullBoundary < promptLen
+                && !std::binary_search(boundaries.begin(), boundaries.end(), lastFullBoundary))
+            {
+                ++count;
+            }
+            if (promptLen % tokensPerBlock == 0)
+            {
+                ++count; // Reserve the separate live decode block for a block-aligned prompt.
+            }
+            return count;
+        }
 
         auto const finalBlockEndTokenIdx = ((promptLen - 1) / tokensPerBlock + 1) * tokensPerBlock;
         SizeType32 count = 1; // The block containing the final prompt state is always writable.

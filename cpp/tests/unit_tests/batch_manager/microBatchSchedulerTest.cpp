@@ -1054,6 +1054,238 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensChunkShiftNonLastChunk)
     EXPECT_EQ(req1->getContextChunkSize(), 0) << "req1: no budget remaining";
 }
 
+TEST_F(MicroBatchSchedulerTest, LastFullSnapshotBoundaryMustBeExecuted)
+{
+    batch_scheduler::ContextChunkingConfig config{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, 32};
+    config.stateSnapshotInterval = 256;
+    config.lastSnapshotTokensPerBlock = 32;
+    MicroBatchScheduler scheduler(config);
+    for (auto const start : {512, 672})
+    {
+        for (auto const budget : {128, 1000})
+        {
+            auto request = createRequest(700, 1, 0);
+            request->setContextCurrentPosition(start);
+            RequestVector requests{request};
+            auto const [contexts, generations] = scheduler(requests, {}, 1, budget);
+            auto const needed = start == 512 ? 160 : 28;
+            EXPECT_EQ(request->getContextChunkSize(), needed <= budget ? needed : 0);
+        }
+    }
+    auto aligned = createRequest(512, 1, 0);
+    aligned->setContextCurrentPosition(256);
+    RequestVector requests{aligned};
+    auto const [contexts, generations] = scheduler(requests, {}, 1, 1000);
+    EXPECT_EQ(aligned->getContextChunkSize(), 256);
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualSnapshotsReplaceInternalPeriodicBoundaries)
+{
+    Request execRequest(std::vector<int32_t>(700, 1), 1);
+    execRequest.setMultimodalInput(MultimodalInput(
+        std::vector<std::vector<int32_t>>(3, std::vector<int32_t>(8, 1)), {0, 188, 376}, {180, 180, 180}));
+    LlmRequest request(0, execRequest);
+    auto const plan = getRecurrentStateSnapshotBoundaries(request, 32, 256);
+    EXPECT_EQ(plan, (std::vector<int32_t>{352, 544}));
+    kv_cache_manager::LinearAttentionMetadata metadata{};
+    metadata.statesSnapshotInterval = 256;
+    metadata.saveLastSnapshot = true;
+    metadata.visualBoundarySnapshots = true;
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(700, 32, true, plan), 4);
+    int allocated = 0;
+    for (int end = 32; end <= 704; end += 32)
+    {
+        allocated += metadata.shouldAllocateRecurrentStates(end, 700, 32, false)
+            || std::binary_search(plan.begin(), plan.end(), end);
+    }
+    EXPECT_EQ(allocated, 4);
+    for (auto const policy : {ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, ContextChunkingPolicy::kEQUAL_PROGRESS})
+    {
+        batch_scheduler::ContextChunkingConfig config{policy, 32};
+        config.stateSnapshotInterval = 256;
+        config.visualSnapshotTokensPerBlock = 32;
+        config.lastSnapshotTokensPerBlock = 32;
+        MicroBatchScheduler scheduler(config);
+        std::vector<int32_t> const ends{0, 352, 544, 672, 700};
+        for (size_t i = 0; i + 1 < ends.size(); ++i)
+        {
+            for (auto const budget : {128, 1000})
+            {
+                auto probe = std::make_shared<LlmRequest>(0, execRequest);
+                probe->setEstimatedReusableTokens(ends[i]);
+                RequestVector requests{probe};
+                auto const [contexts, generations] = scheduler(requests, {}, 1, budget);
+                auto const needed = ends[i + 1] - ends[i];
+                EXPECT_EQ(probe->getContextChunkSize(), needed <= budget ? needed : 0);
+            }
+        }
+    }
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualShiftDoesNotAddSnapshotsAndDeduplicates)
+{
+    Request execRequest(std::vector<int32_t>(700, 1), 1);
+    execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {0}, {180}));
+    LlmRequest containedImage(0, execRequest);
+    EXPECT_EQ(getRecurrentStateSnapshotBoundaries(containedImage, 32, 256), (std::vector<int32_t>{256, 512}));
+    execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {1}, {511}));
+    LlmRequest spanningImage(1, execRequest);
+    EXPECT_EQ(getRecurrentStateSnapshotBoundaries(spanningImage, 32, 256), (std::vector<int32_t>{512}));
+    execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {256}, {100}));
+    LlmRequest startsAtBoundary(2, execRequest);
+    EXPECT_EQ(getRecurrentStateSnapshotBoundaries(startsAtBoundary, 32, 256), (std::vector<int32_t>{256, 512}));
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualShiftRejectsInsufficientStaticChunkLimits)
+{
+    batch_scheduler::ContextChunkingConfig config{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, 32};
+    config.stateSnapshotInterval = 256;
+    config.visualSnapshotTokensPerBlock = 32;
+    EXPECT_ANY_THROW(MicroBatchScheduler(config, 256));
+    EXPECT_NO_THROW(MicroBatchScheduler(config, 512));
+    config.chunkingPolicy = ContextChunkingPolicy::kFORCE_CHUNK;
+    config.chunkUnitSize = 256;
+    EXPECT_ANY_THROW(static_cast<void>(MicroBatchScheduler{config}));
+    config.chunkUnitSize = 512;
+    EXPECT_NO_THROW(static_cast<void>(MicroBatchScheduler{config}));
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualSnapshotReplacementPreservesTextAndLargeImageSafety)
+{
+    EXPECT_EQ(getRecurrentStateSnapshotBoundaries(*createRequest(1500, 1, 0), 32, 256),
+        (std::vector<int32_t>{256, 512, 768, 1024, 1280}));
+    Request execRequest(std::vector<int32_t>(1500, 1), 1);
+    execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {100}, {1100}));
+    LlmRequest largeImage(0, execRequest);
+    EXPECT_EQ(
+        getRecurrentStateSnapshotBoundaries(largeImage, 32, 256), (std::vector<int32_t>{256, 512, 768, 1184, 1280}));
+    execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {500}, {200}));
+    LlmRequest textThenImage(1, execRequest);
+    EXPECT_EQ(
+        getRecurrentStateSnapshotBoundaries(textThenImage, 32, 256), (std::vector<int32_t>{256, 672, 768, 1024, 1280}));
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualReplacementPlanMatchesAllocationAcrossAlignments)
+{
+    for (int start = 0; start < 512; start += 31)
+    {
+        for (auto const length : {1, 31, 84, 180, 256, 257, 800})
+        {
+            auto const promptLen = start + length + 300;
+            Request execRequest(std::vector<int32_t>(promptLen, 1), 1);
+            execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {start}, {length}));
+            LlmRequest request(0, execRequest);
+            auto const plan = getRecurrentStateSnapshotBoundaries(request, 32, 256);
+            int previous = 0;
+            EXPECT_LE(plan.size(), (promptLen - 1) / 256);
+            for (auto const boundary : plan)
+            {
+                EXPECT_GT(boundary, previous);
+                EXPECT_LE(boundary - previous, 512);
+                EXPECT_EQ(boundary % 32, 0);
+                previous = boundary;
+            }
+            EXPECT_LE(promptLen - previous, 512);
+            kv_cache_manager::LinearAttentionMetadata metadata{};
+            metadata.statesSnapshotInterval = 256;
+            metadata.saveLastSnapshot = true;
+            metadata.visualBoundarySnapshots = true;
+            int allocated = promptLen % 32 == 0 ? 1 : 0;
+            for (int end = 32; end < promptLen + 32; end += 32)
+            {
+                allocated += metadata.shouldAllocateRecurrentStates(end, promptLen, 32, false)
+                    || std::binary_search(plan.begin(), plan.end(), end);
+            }
+            EXPECT_EQ(metadata.calcNumBlocksNeededForReq(promptLen, 32, true, plan), allocated);
+        }
+    }
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualSnapshotBoundariesAndCapacity)
+{
+    Request execRequest(std::vector<int32_t>(700, 1), 1);
+    execRequest.setMultimodalInput(MultimodalInput(std::vector<std::vector<int32_t>>(4, std::vector<int32_t>(8, 1)),
+        /*multimodalPositions=*/{1, 99, 105, 260}, /*multimodalLengths=*/{98, 5, 155, 290}));
+    auto request = std::make_shared<LlmRequest>(0, execRequest);
+    EXPECT_EQ(getMultimodalSnapshotBoundaries(*request, 32), (std::vector<int32_t>{96, 256, 544}));
+    auto const boundaries = getRecurrentStateSnapshotBoundaries(*request, 32, 256);
+    EXPECT_EQ(boundaries, (std::vector<int32_t>{256, 544}));
+
+    kv_cache_manager::LinearAttentionMetadata metadata{};
+    metadata.statesSnapshotInterval = 256;
+    metadata.saveLastSnapshot = true;
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(700, 32, true, boundaries), 4);
+    metadata.visualBoundarySnapshots = true;
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(700, 32, true, boundaries), 4);
+    // The last full snapshot and periodic snapshots must not be counted twice.
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(700, 32, true, std::vector<int32_t>{256, 544, 672}), 4);
+    EXPECT_EQ(metadata.calcNumBlocksNeededForReq(700, 32, false, boundaries), 1);
+
+    for (auto const policy : {ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, ContextChunkingPolicy::kEQUAL_PROGRESS})
+    {
+        for (auto const budget : {64, 128, 1000})
+        {
+            for (auto const start : {0, 96, 256, 512, 544})
+            {
+                for (auto const enabled : {false, true})
+                {
+                    batch_scheduler::ContextChunkingConfig chunkConfig{policy, 32};
+                    chunkConfig.stateSnapshotInterval = 256;
+                    chunkConfig.visualSnapshotTokensPerBlock = enabled ? 32 : 0;
+                    auto scheduler = MicroBatchScheduler{chunkConfig};
+                    auto probe = std::make_shared<LlmRequest>(0, execRequest);
+                    probe->setEstimatedReusableTokens(start);
+                    RequestVector activeRequests{probe};
+                    auto const [contexts, generations] = scheduler(activeRequests, {}, 1, budget);
+                    auto end = std::min(700, (start / 256 + 1) * 256);
+                    if (enabled)
+                    {
+                        end = 700;
+                        for (auto const boundary : boundaries)
+                        {
+                            if (boundary > start)
+                            {
+                                end = boundary;
+                                break;
+                            }
+                        }
+                    }
+                    auto const expected = end - start <= budget ? end - start : 0;
+                    EXPECT_EQ(probe->getContextChunkSize(), expected)
+                        << "start=" << start << " budget=" << budget << " enabled=" << enabled;
+                    EXPECT_EQ(contexts.size(), expected > 0 ? 1 : 0);
+                    EXPECT_TRUE(generations.empty());
+                }
+            }
+        }
+    }
+}
+
+TEST_F(MicroBatchSchedulerTest, VisualSnapshotBoundariesIgnoreMissingAndInvalidMetadata)
+{
+    EXPECT_TRUE(getMultimodalSnapshotBoundaries(*createRequest(100, 1, 0), 32).empty());
+    for (auto const position : {-1, 90})
+    {
+        Request execRequest(std::vector<int32_t>(100, 1), 1);
+        execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {position}, {20}));
+        LlmRequest request(0, execRequest);
+        EXPECT_TRUE(getMultimodalSnapshotBoundaries(request, 32).empty());
+    }
+    Request execRequest(std::vector<int32_t>(96, 1), 1);
+    execRequest.setMultimodalInput(
+        MultimodalInput(std::vector<std::vector<int32_t>>(2, std::vector<int32_t>(8, 1)), {0, 32}, {10, 64}));
+    LlmRequest request(0, execRequest);
+    // Neither the zero boundary nor the final writable prompt block is reusable.
+    EXPECT_TRUE(getMultimodalSnapshotBoundaries(request, 32).empty());
+    execRequest.setMultimodalInput(MultimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}}, {0}, {40},
+        /*multimodalUuids=*/std::nullopt, /*multimodalItemRunCuOffsets=*/std::vector<int32_t>{0, 2},
+        /*multimodalRunPositions=*/std::vector<int32_t>{0, 48},
+        /*multimodalRunLengths=*/std::vector<int32_t>{20, 20}));
+    LlmRequest sparseRequest(1, execRequest);
+    EXPECT_TRUE(getMultimodalSnapshotBoundaries(sparseRequest, 32).empty());
+    EXPECT_EQ(getRecurrentStateSnapshotBoundaries(sparseRequest, 32, 32), (std::vector<int32_t>{32, 64}));
+}
+
 TEST_F(MicroBatchSchedulerTest, StateSnapshotBoundaryColdPrompt)
 {
     batch_scheduler::ContextChunkingConfig chunkConfig{
