@@ -34,7 +34,8 @@ full-attention layers with gated-delta linear-attention layers.
 | Quantization | Not supported |
 | Vision inputs | Supported for batch-1 image input by `multimodal_demo.py` |
 | Standard legacy runtime/generation | Supported through `ModelRunnerCpp` |
-| Speculative decoding, disaggregated serving, and offload | Not supported |
+| External-draft verification | K=1, BF16/TP=1, greedy through `ModelRunnerCpp`; no prefix reuse or chunked context |
+| Integrated MTP drafter, disaggregated serving, and offload | Not supported |
 
 The implementation has been validated with the `Qwen3.5-2B` Hugging Face
 checkpoint. Other dense Qwen3.5 sizes using the same text-decoder architecture
@@ -43,9 +44,9 @@ are expected to use the same graph, but have not been validated yet.
 ## Planned MTP enablement
 
 > [!NOTE]
-> Multi-token prediction (MTP) is not supported by this TensorRT graph yet.
-> This section records the intended implementation and validation order; it is
-> not a description of currently available functionality.
+> An integrated MTP drafter is not supported by this TensorRT graph yet.
+> The external-draft verification and Session state-commit reference below
+> are available; the remaining implementation order describes future work.
 
 ### Engine-level external-draft verification (K=1)
 
@@ -53,9 +54,8 @@ The first target-verification path supports BF16, TP=1, beam width 1, and
 one externally supplied draft token per request. Build the graph with
 `max_draft_len=1` and `speculative_decoding_draft_tokens_external=True` in
 `Qwen35ForCausalLM.prepare_inputs` (CLI: `--max_draft_len 1
---speculative_decoding_mode draft_tokens_external`). Execute it directly with
-`Session`; `ModelRunnerCpp` still rejects speculative hybrid engines until
-acceptance and state commit are implemented.
+--speculative_decoding_mode draft_tokens_external`). Both direct `Session`
+execution and the C++ external-draft request path described below are available.
 
 Each generation verification request packs `[current_token, draft_token]`.
 For a batch of N requests, supply:
@@ -73,11 +73,105 @@ For a batch of N requests, supply:
 Prefill and ordinary single-token decode use `spec_decoding_use=[0]`.
 The GDN and Conv plugins use their stateful prefill kernels for two-token
 verification. All resulting caches are **tentative**: retain the prefix state
-and do not promote the verification state after rejecting a draft. Automatic
-acceptance, accepted-prefix snapshots, and cache commit are not included yet.
+and do not promote the verification state after rejecting a draft. The
+Session reference below manages acceptance and commits the selected prefix.
 The engine contains no MTP drafter. Greedy verification is covered by
 `test_qwen35_external_draft_verification`, which compares both logits, final
 cache state, and the next decode against sequential single-token execution.
+
+### C++ executor external-draft requests
+
+`ModelRunnerCpp` supports the existing external-draft API with paged attention
+KV and paged recurrent state. Use a BF16/TP=1 engine built with the flags above,
+beam width 1, and `top_k=1`. Disable `kv_cache_enable_block_reuse` and
+`enable_chunked_context`. Draft logits are not supported in this initial path.
+
+```python
+runner = ModelRunnerCpp.from_dir(
+    engine_dir="/path/to/verification_engine",
+    kv_cache_enable_block_reuse=False,
+    enable_chunked_context=False,
+    use_runtime_defaults=False,
+)
+outputs = runner.generate(
+    batch_input_ids=[prompt_ids],  # One-dimensional torch int32 tensor.
+    draft_tokens_list=[[candidate_token_id]],
+    max_new_tokens=2,
+    top_k=1,
+    end_id=eos_token_id,
+    pad_id=pad_token_id,
+)
+```
+
+The candidate is appended to the last context input. Each request verifies
+**once and returns**: rejection emits a correction; acceptance emits the draft
+and a bonus token, subject to EOS and the output limit. This API does not feed
+new candidates into an ongoing generation request. Calls without candidates
+perform ordinary generation on the same engine.
+The existing external-draft decoder excludes an accepted EOS from the returned
+sequence; that terminal case can therefore return no new tokens.
+
+Each recurrent physical block reserves three GDN/Conv records: committed state,
+the snapshot before the candidate, and the state after the candidate. Fresh
+prefill reads the same record that the plugin zeroes, preventing stale state
+from a previous block owner from being consumed. After decoding, the executor
+copies the selected complete record, waits for the copy, and rewinds rejected
+attention KV tokens before releasing the request. These extra records triple
+the recurrent-state allocation; attention KV allocation is unchanged.
+
+`tests/unittest/trt/model/test_qwen35_executor.py` builds a full Qwen3.5-2B
+engine and checks acceptance/rejection, physical-slot reuse, KV block
+boundaries, EOS/output limits, and unsupported executor configurations.
+There is no MTP drafter or throughput improvement claim in this step.
+
+### Session acceptance and state commit
+
+`Qwen35VerificationSession` in
+`examples/models/core/qwen3_5/target_verification.py` implements the synchronous
+BF16/TP=1, fixed-batch, greedy correctness reference. It uses **continuous
+attention KV** and **paged recurrent state**, with three combined GDN/Conv
+records per request. It lives in examples because it is a correctness reference,
+not a supported runtime API. This reference is independent of `ModelRunnerCpp`.
+
+For each step, S0 remains read-only. The existing snapshot kernels save S1
+after the current token, and the normal target-state store saves S2 after the
+draft. If the first target argmax matches the draft, commit S2 and advance the
+KV length by two; otherwise commit S1 and advance by one. Rejected KV rows
+remain allocated but lie outside the effective length and are overwritten by
+future steps. Switching one committed-state object publishes the selected
+record, KV buffer, effective length, and next-token logits together after GPU
+completion. Scratch slots rotate, so neither acceptance outcome overwrites
+the old committed record during verification.
+
+`prefill(prompts)` emits the first pending token per request. `step(drafts)`
+consumes that pending token and one external candidate, then returns either
+`[correction, -1]` on rejection or `[draft, bonus]` on acceptance. The last
+emitted token remains pending until the next step. `decode()` processes one
+pending token without a draft; use it when only one position remains.
+`reset()` reuses the slots for a fresh batch. The caller handles EOS and output
+limits; there is no scheduler, request compaction, or actual MTP drafter.
+
+A full-model demo builds the reference engine and compares generated token IDs
+with ordinary greedy decode:
+
+```bash
+python examples/models/core/qwen3_5/target_verification_demo.py \
+    --model_dir /path/to/Qwen3.5-2B \
+    --prompt "The capital of France is" --max_new_tokens 16
+```
+
+By default the external candidate repeats the pending token; use
+`--draft_token_id` to supply a constant candidate. This is a correctness demo,
+not a speed measurement. Build directly with the low-level `Builder`, as this
+demo does: `trtllm-build` currently forces **both** caches to paged for hybrid
+models, and its engine cannot be loaded by this continuous-KV reference.
+
+The multi-round tests cover all-accept, all-reject, alternating, and mixed
+acceptance in a two-request batch, compare GDN/Conv and valid KV state against
+sequential execution, poison stale KV rows, reuse slots after reset, and inject
+an enqueue failure to verify that the previous state is retained. C++ inflight
+batching, paged attention-KV allocation/rewind, and MTP weight loading remain
+separate integration work.
 
 ### Remaining implementation order
 

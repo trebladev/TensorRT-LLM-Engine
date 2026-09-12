@@ -8556,6 +8556,50 @@ TEST_F(KVCacheManagerTest, LinearAttentionBuffersUsePhysicalStateSlots)
     EXPECT_THAT(std::vector<SizeType32>(generationCuSeqlens, generationCuSeqlens + 3), testing::ElementsAre(0, 1, 2));
     EXPECT_THAT(
         std::vector<SizeType32>(generationHasInitialState, generationHasInitialState + 2), testing::ElementsAre(1, 1));
+
+    // Slot mappings use three plugin records per physical block in verification mode.
+    // This checks metadata only; no plugin accesses the pool in this test.
+    request0->setState(LlmRequestState::kCONTEXT_INIT);
+    request0->setContextCurrentPosition(0);
+    request0->setContextChunkSize(request0->mPromptLen);
+    request0->setDraftTokens(std::make_shared<VecTokens>(VecTokens{17}));
+    LinearAttentionBuffers verification{2, bufferManager, 16, true};
+    verification.reshape(2);
+    verification.fill({request0}, {request1}, kvCacheManager);
+    auto const slot0 = kvCacheManager.getRecurrentStateSlot(request0->mRequestId);
+    auto const slot1 = kvCacheManager.getRecurrentStateSlot(request1->mRequestId);
+    auto const* targets = tr::bufferCast<SizeType32>(*verification.targetStateSlotMappingHost);
+    EXPECT_EQ(targets[0], 3 * slot0 + 2);
+    EXPECT_EQ(targets[1], 3 * slot1);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*verification.sourceStateSlotMappingHost)[0], targets[0]);
+    auto const* ends = tr::bufferCast<SizeType32>(*verification.cuSeqlensHost);
+    EXPECT_THAT(std::vector<SizeType32>(ends, ends + 3), testing::ElementsAre(0, 8, 9));
+    auto const* snapshots = tr::bufferCast<SizeType32>(*verification.snapshotSlotMappingHost);
+    EXPECT_THAT(std::vector<SizeType32>(snapshots, snapshots + 9),
+        testing::ElementsAre(-1, -1, -1, -1, -1, -1, 3 * slot0 + 1, -1, -1));
+    request0->setDraftTokens(std::make_shared<VecTokens>(VecTokens{17, 18}));
+    EXPECT_THROW(verification.fill({request0}, {request1}, kvCacheManager), std::exception);
+}
+
+TEST_F(KVCacheManagerTest, LinearAttentionExternalDraftBindings)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::BufferManager manager{stream};
+    LinearAttentionBuffers buffers{4, manager, 32, true};
+    buffers.reshape(2);
+    tr::ITensor::TensorMap bindings;
+    buffers.getBuffers(bindings);
+    auto const use = bindings.at("spec_decoding_use");
+    EXPECT_EQ(use->getMemoryType(), tr::MemoryType::kCPU);
+    EXPECT_EQ(tr::bufferCast<SizeType32>(*use)[0], 0);
+    EXPECT_EQ(bindings.at("spec_decoding_generation_lengths")->getShape().d[0], 2);
+    EXPECT_EQ(bindings.at("spec_decoding_position_offsets")->getShape().d[0], 2);
+    EXPECT_EQ(bindings.at("spec_decoding_packed_mask")->getShape().d[1], 1);
+    EXPECT_THROW((LinearAttentionBuffers{4, manager, 0, true}), std::exception);
+    LinearAttentionBuffers ordinary{4, manager, 32};
+    bindings.clear();
+    ordinary.getBuffers(bindings);
+    EXPECT_EQ(bindings.count("spec_decoding_use"), 0);
 }
 
 TEST_F(KVCacheManagerTest, LinearAttentionBuffersSelectStateSlotForCurrentToken)

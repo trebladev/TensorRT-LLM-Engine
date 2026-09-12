@@ -30,6 +30,7 @@
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/linearAttentionBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
@@ -260,8 +261,16 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             "Attention-linear hybrid models require GPT attention, MambaConv1d, and packed input support.");
         TLLM_CHECK_WITH_INFO(!mModelConfig.useCrossAttention(),
             "The initial attention-linear hybrid runtime does not support cross attention.");
-        TLLM_CHECK_WITH_INFO(mModelConfig.getSpeculativeDecodingMode().isNone(),
-            "The initial attention-linear hybrid runtime does not support speculative decoding.");
+        auto const specMode = mModelConfig.getSpeculativeDecodingMode();
+        TLLM_CHECK_WITH_INFO(specMode.isNone() || specMode.isDraftTokensExternal(),
+            "Attention-linear hybrid models only support external draft verification.");
+        if (specMode.isDraftTokensExternal())
+        {
+            TLLM_CHECK_WITH_INFO(mModelConfig.getMaxDecodingDraftTokens() == 1 && tensorParallelism == 1,
+                "Qwen3.5 external draft verification requires K=1 and TP=1.");
+            TLLM_CHECK_WITH_INFO(!kvCacheConfig.getEnableBlockReuse() && !executorConfig.getEnableChunkedContext(),
+                "Qwen3.5 external draft verification requires prefix reuse and chunked context disabled.");
+        }
         TLLM_CHECK_WITH_INFO(
             mModelConfig.getKVCacheType() == ModelConfig::KVCacheType::kPAGED && mModelConfig.usePagedState(),
             "Attention-linear hybrid models require paged KV cache and paged state.");
@@ -282,7 +291,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             "The initial attention-linear hybrid runtime requires full attention windows equal to maxSequenceLen.");
     }
 
-    if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
+    if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && !mModelConfig.isAttentionLinearHybrid())
     {
         TLLM_CHECK_WITH_INFO(kvCacheConfig.getEnableBlockReuse(),
             "KV cache block reuse must be enabled for speculative decoding target model");
@@ -786,7 +795,10 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
         kv_cache_manager::LinearAttentionMetadata metadata{};
         metadata.cacheType = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
-        metadata.allRecurrentStatesBytes = linearConfig.getStateSlotBytes();
+        auto const recordsPerBlock = mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+            ? LinearAttentionBuffers::kVerificationStateRecords
+            : 1;
+        metadata.allRecurrentStatesBytes = linearConfig.getStateSlotBytes() * recordsPerBlock;
         constexpr SizeType32 kRecurrentStateSnapshotInterval = 256;
         metadata.statesSnapshotInterval = kvCacheConfig.getEnableBlockReuse() ? kRecurrentStateSnapshotInterval : 0;
         metadata.saveLastSnapshot = kvCacheConfig.getEnableBlockReuse();
@@ -1603,6 +1615,14 @@ void TrtGptModelInflightBatching::verifyRequests(RequestList const& activeReques
         TLLM_CHECK_WITH_INFO(draftLength <= maxDraftLength,
             "Number of draft tokens (%d) is larger than maximum number of draft tokens (%d)", draftLength,
             maxDraftLength);
+
+        if (mModelConfig.isAttentionLinearHybrid() && draftLength > 0)
+        {
+            auto const& topK = llmReq->mSamplingConfig.topK;
+            TLLM_CHECK_WITH_INFO(
+                topK.has_value() && topK->size() == 1 && topK->front() == 1 && !llmReq->getDraftLogits().has_value(),
+                "Qwen3.5 external draft verification requires greedy topK=1 without draft logits.");
+        }
 
         // FIXME: Remove this check when varying beam width is supported
         {
@@ -2732,6 +2752,38 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             TLLM_LOG_DEBUG("[RANK %d] decoderSync: request ID %lu beam %d tokens %s finished %d",
                 COMM_SESSION.getRank(), llmReq->mRequestId, beam, common::vec2str(llmReq->getTokens(beam)).c_str(),
                 static_cast<int>(finishReason.toFinishReason()));
+        }
+
+        if (mModelConfig.isAttentionLinearHybrid() && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+            && llmReq->getNumDraftTokens() > 0)
+        {
+            // The final emitted token is pending. One output commits the before-draft
+            // snapshot; two outputs commit the state that includes the accepted draft.
+            auto const numOutputTokens = numNewTokens.at(0);
+            // External-draft decoding excludes an accepted EOS from its sequence
+            // length. In that terminal case retain the state before the candidate.
+            TLLM_CHECK_WITH_INFO(numOutputTokens == 1 || numOutputTokens == 2
+                    || (numOutputTokens == 0 && decoderFinishedSumPtr[seqSlot] == reqBeamWidth),
+                "K=1 external verification must emit one or two tokens unless already finished.");
+            auto const selectedRecord = std::max(1, numOutputTokens);
+            auto const& cacheManager = static_cast<kv_cache_manager::KVCacheManager const&>(*mKvCacheManager);
+            auto const blockSlot = cacheManager.getRecurrentStateSlot(llmReq->mRequestId);
+            auto const recordBytes = mModelConfig.getLinearAttentionConfig()->getStateSlotBytes();
+            auto const byteOffset = static_cast<std::int64_t>(blockSlot)
+                * LinearAttentionBuffers::kVerificationStateRecords * recordBytes;
+            for (auto const& layerState : mLinearAttentionLayerStateViews)
+            {
+                TLLM_CHECK(byteOffset >= 0
+                    && byteOffset + (selectedRecord + 1) * recordBytes
+                        <= static_cast<std::int64_t>(layerState->getSizeInBytes()));
+                auto* committed = static_cast<std::uint8_t*>(layerState->data()) + byteOffset;
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(committed, committed + selectedRecord * recordBytes, recordBytes,
+                    cudaMemcpyDeviceToDevice, getBufferManager().getStream().get()));
+            }
+            // Complete the copy before request termination can release/reassign the block.
+            getBufferManager().getStream().synchronize();
+            // Only the candidate was appended to context KV; the bonus was not.
+            mKvCacheManager->rewindKVCache(llmReq->mRequestId, 2 - selectedRecord);
         }
 
         // Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.

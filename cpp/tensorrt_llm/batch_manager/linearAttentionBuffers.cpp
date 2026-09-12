@@ -32,8 +32,23 @@ namespace tensorrt_llm::batch_manager
 {
 
 LinearAttentionBuffers::LinearAttentionBuffers(
-    SizeType32 maxBatchSize, BufferManager const& manager, SizeType32 maxSnapshotTokens)
+    SizeType32 maxBatchSize, BufferManager const& manager, SizeType32 maxSnapshotTokens, bool externalDraftVerification)
+    : mExternalDraftVerification(externalDraftVerification)
 {
+    if (mExternalDraftVerification)
+    {
+        TLLM_CHECK(maxSnapshotTokens > 0);
+        // External candidates run in causal context attention, not speculative generation.
+        // Keep the extra engine bindings valid and the generation path disabled.
+        mSpecDecodingUse = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+        bufferCast<SizeType32>(*mSpecDecodingUse)[0] = 0;
+        mSpecDecodingLengths = manager.gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mSpecDecodingOffsets = manager.gpu(ITensor::makeShape({maxBatchSize, 1}), nvinfer1::DataType::kINT32);
+        mSpecDecodingMask = manager.gpu(ITensor::makeShape({maxBatchSize, 1}), nvinfer1::DataType::kINT32);
+        manager.setZero(*mSpecDecodingLengths);
+        manager.setZero(*mSpecDecodingOffsets);
+        manager.setZero(*mSpecDecodingMask);
+    }
     if (maxSnapshotTokens > 0)
     {
         auto const shape = ITensor::makeShape({maxSnapshotTokens});
@@ -55,6 +70,12 @@ LinearAttentionBuffers::LinearAttentionBuffers(
 void LinearAttentionBuffers::reshape(SizeType32 numSequences)
 {
     auto const sequenceShape = ITensor::makeShape({numSequences});
+    if (mExternalDraftVerification)
+    {
+        mSpecDecodingLengths->reshape(sequenceShape);
+        mSpecDecodingOffsets->reshape(ITensor::makeShape({numSequences, 1}));
+        mSpecDecodingMask->reshape(ITensor::makeShape({numSequences, 1}));
+    }
     sourceStateSlotMappingHost->reshape(sequenceShape);
     sourceStateSlotMappingDevice->reshape(sequenceShape);
     targetStateSlotMappingHost->reshape(sequenceShape);
@@ -75,13 +96,17 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
     auto* cuSeqlens = bufferCast<SizeType32>(*cuSeqlensHost);
     auto* hasInitialState = bufferCast<SizeType32>(*hostHasInitialState);
 
+    auto const recordsPerBlock = mExternalDraftVerification ? kVerificationStateRecords : 1;
+    TLLM_CHECK_WITH_INFO(!mExternalDraftVerification || !kvCacheManager.isEnableBlockReuse(),
+        "Qwen3.5 external draft verification does not support prefix reuse.");
     SizeType32* snapshotSlots = nullptr;
     if (snapshotSlotMappingHost)
     {
         SizeType32 numTokens = static_cast<SizeType32>(generationRequests.size());
         for (auto const& request : contextRequests)
         {
-            numTokens += request->getContextChunkSize();
+            numTokens
+                += request->getContextChunkSize() + (request->isLastContextChunk() ? request->getNumDraftTokens() : 0);
         }
         snapshotSlotMappingHost->reshape(ITensor::makeShape({numTokens}));
         snapshotSlotMappingDevice->reshape(ITensor::makeShape({numTokens}));
@@ -95,15 +120,18 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
 
     for (auto const& request : contextRequests)
     {
-        TLLM_CHECK_WITH_INFO(
-            request->getNumDraftTokens() == 0, "Qwen3.5 linear attention does not support draft tokens.");
+        auto const draftLength = request->getNumDraftTokens();
+        TLLM_CHECK_WITH_INFO(draftLength == 0
+                || (mExternalDraftVerification && draftLength == 1 && request->isLastContextChunk()
+                    && request->getContextCurrentPosition() == 0),
+            "Qwen3.5 external draft verification requires one candidate and unchunked context.");
         auto const contextStart = request->getContextCurrentPosition();
         auto const contextEnd = contextStart + request->getContextChunkSize();
         auto const sourceTokenIdx = contextStart > 0 ? std::make_optional(contextStart - 1) : std::nullopt;
         auto const slots
             = kvCacheManager.getRecurrentStateSlotPair(request->mRequestId, sourceTokenIdx, contextEnd - 1);
-        sourceStateSlotMapping[sequenceIdx] = slots.sourceSlot.value_or(slots.targetSlot);
-        targetStateSlotMapping[sequenceIdx] = slots.targetSlot;
+        sourceStateSlotMapping[sequenceIdx] = recordsPerBlock * slots.sourceSlot.value_or(slots.targetSlot);
+        targetStateSlotMapping[sequenceIdx] = recordsPerBlock * slots.targetSlot;
         if (snapshotSlots && kvCacheManager.isEnableBlockReuse())
         {
             // Iterate the actual allocated blocks, including visual/last-full snapshots.
@@ -122,7 +150,19 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
                 }
             }
         }
-        cumulativeLength += request->getContextChunkSize();
+        if (draftLength > 0)
+        {
+            snapshotSlots[cumulativeLength + request->getContextChunkSize() - 1]
+                = recordsPerBlock * slots.targetSlot + 1;
+            targetStateSlotMapping[sequenceIdx] += 2;
+            // Fresh prefill zeroes the target record. Read that same zeroed record,
+            // not the committed bank left by an earlier owner of this physical block.
+            if (!slots.sourceSlot.has_value())
+            {
+                sourceStateSlotMapping[sequenceIdx] = targetStateSlotMapping[sequenceIdx];
+            }
+        }
+        cumulativeLength += request->getContextChunkSize() + draftLength;
         cuSeqlens[sequenceIdx + 1] = cumulativeLength;
         hasInitialState[sequenceIdx] = slots.sourceSlot.has_value() ? 1 : 0;
         ++sequenceIdx;
@@ -137,8 +177,8 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
         auto const lastTokenIdx = request->getNumTokens(/*beam=*/0) - 1;
         auto const slots = kvCacheManager.getRecurrentStateSlotPair(
             request->mRequestId, /*sourceTokenIdx=*/lastTokenIdx, /*targetTokenIdx=*/lastTokenIdx);
-        sourceStateSlotMapping[sequenceIdx] = slots.sourceSlot.value();
-        targetStateSlotMapping[sequenceIdx] = slots.targetSlot;
+        sourceStateSlotMapping[sequenceIdx] = recordsPerBlock * slots.sourceSlot.value();
+        targetStateSlotMapping[sequenceIdx] = recordsPerBlock * slots.targetSlot;
         ++cumulativeLength;
         cuSeqlens[sequenceIdx + 1] = cumulativeLength;
         hasInitialState[sequenceIdx] = 1;
@@ -163,6 +203,13 @@ void LinearAttentionBuffers::copyToDevice(BufferManager const& manager)
 
 void LinearAttentionBuffers::getBuffers(TensorMap& inputBuffers) const
 {
+    if (mExternalDraftVerification)
+    {
+        inputBuffers.insert_or_assign("spec_decoding_use", mSpecDecodingUse);
+        inputBuffers.insert_or_assign("spec_decoding_generation_lengths", mSpecDecodingLengths);
+        inputBuffers.insert_or_assign("spec_decoding_position_offsets", mSpecDecodingOffsets);
+        inputBuffers.insert_or_assign("spec_decoding_packed_mask", mSpecDecodingMask);
+    }
     if (snapshotSlotMappingDevice)
     {
         inputBuffers.insert_or_assign("state_snapshot_slot_mapping", snapshotSlotMappingDevice);

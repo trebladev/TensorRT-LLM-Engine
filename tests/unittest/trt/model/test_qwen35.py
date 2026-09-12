@@ -26,6 +26,7 @@ from transformers import Qwen3_5ForConditionalGeneration
 from utils.llm_data import llm_models_root
 from utils.util import run_session
 
+from examples.models.core.qwen3_5.target_verification import Qwen35VerificationSession
 from tensorrt_llm import Builder
 from tensorrt_llm.functional import RopeEmbeddingUtils
 from tensorrt_llm.mapping import Mapping
@@ -179,6 +180,7 @@ def _build_qwen35_session(
     max_draft_len: int = 0,
     max_input_len: int = _MAX_INPUT_LENGTH,
     max_num_tokens: int = _MAX_NUM_TOKENS,
+    paged_state: bool = False,
 ) -> tuple[Session, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(model_dir, dtype="bfloat16")
     _truncate_trt_config(config)
@@ -219,7 +221,7 @@ def _build_qwen35_session(
     network.plugin_config.mamba_conv1d_plugin = "bfloat16"
     network.plugin_config.remove_input_padding = True
     network.plugin_config.paged_kv_cache = False
-    network.plugin_config.paged_state = False
+    network.plugin_config.paged_state = paged_state
 
     with net_guard(network):
         network.set_named_parameters(model.named_parameters())
@@ -766,3 +768,182 @@ def test_qwen35_verification_rejects_unsupported_settings(
             speculative_decoding_draft_tokens_external=external,
             spec_decoding_is_generation_length_variable=variable_length,
         )
+
+
+@pytest.fixture(scope="module")
+def qwen35_snapshot_verification_session(qwen35_checkpoint_dir: Path):
+    return _build_qwen35_session(
+        qwen35_checkpoint_dir,
+        max_draft_len=1,
+        max_input_len=128,
+        max_num_tokens=512,
+        paged_state=True,
+    )
+
+
+@pytest.mark.parametrize("acceptance", ["accept", "reject", "alternate", "mixed"])
+def test_qwen35_verification_commits_accepted_prefix(
+    qwen35_snapshot_verification_session: tuple[Session, Qwen35Config],
+    qwen35_verification_session: tuple[Session, Qwen35Config, torch.Tensor],
+    acceptance: str,
+) -> None:
+    """Full snapshots must sustain repeated acceptance/rejection and slot reuse."""
+    session, config = qwen35_snapshot_verification_session
+    baseline_session, baseline_config, mrope_cache = qwen35_verification_session
+    lengths = (61, 63)
+    batch = len(lengths)
+    runner = Qwen35VerificationSession(session, config, batch, _MAX_SEQUENCE_LENGTH)
+    padded_ids, _ = _make_input_ids(lengths)
+    prompts = [padded_ids[idx, :length].tolist() for idx, length in enumerate(lengths)]
+    pending = runner.prefill(prompts)
+    baseline = run_session(
+        baseline_session,
+        _prefill_inputs(baseline_session, baseline_config, padded_ids, lengths, mrope_cache),
+    )
+    assert torch.equal(pending, baseline["logits"].argmax(-1).int())
+    processed = torch.tensor(lengths, dtype=torch.int32)
+
+    for iteration in range(8):
+        pending = baseline["logits"].argmax(-1).int()
+        first = run_session(
+            baseline_session,
+            _generation_inputs(
+                baseline_session,
+                baseline_config,
+                pending,
+                tuple(processed.tolist()),
+                1,
+                mrope_cache,
+                baseline,
+            ),
+        )
+        want_accept = torch.tensor(
+            [
+                acceptance == "accept"
+                or (acceptance == "alternate" and iteration % 2 == 0)
+                or (acceptance == "mixed" and (iteration + idx) % 2 == 0)
+                for idx in range(batch)
+            ],
+            device="cuda",
+        )
+        draft = (first["logits"].argmax(-1).int() + (~want_accept).int()) % config.vocab_size
+        second = run_session(
+            baseline_session,
+            _generation_inputs(
+                baseline_session,
+                baseline_config,
+                draft,
+                tuple((processed + 1).tolist()),
+                1,
+                mrope_cache,
+                first,
+            ),
+        )
+        old_slots = runner._state.slots.clone()
+        old_records = {
+            idx: records.index_select(0, old_slots.cuda().long()).clone()
+            for idx, records in runner._records.items()
+        }
+        result = runner.step(draft)
+        assert torch.equal(result.accepted_draft, want_accept)
+        expected_tokens = torch.stack(
+            [
+                first["logits"].argmax(-1).int(),
+                torch.where(want_accept, second["logits"].argmax(-1).int(), -1),
+            ],
+            dim=1,
+        )
+        assert torch.equal(result.tokens, expected_tokens)
+        for idx, records in runner._records.items():
+            torch.testing.assert_close(
+                records.index_select(0, old_slots.cuda().long()), old_records[idx], atol=0, rtol=0
+            )
+        processed += 1 + want_accept.cpu().int()
+        assert torch.equal(runner.past_lengths, processed)
+        baseline = {
+            name: torch.where(
+                want_accept.reshape((batch,) + (1,) * (value.ndim - 1)), second[name], value
+            )
+            for name, value in first.items()
+        }
+        assert torch.equal(runner.current_tokens, baseline["logits"].argmax(-1).int())
+        for name, value in runner.recurrent_states().items():
+            torch.testing.assert_close(value, baseline[name], atol=0.03, rtol=0.03, msg=name)
+        for local_idx, layer_idx in enumerate(runner._attention_ids):
+            kv = runner._state.kv[f"past_key_value_{local_idx}"]
+            for idx, length in enumerate(processed.tolist()):
+                torch.testing.assert_close(
+                    kv[idx, :, :, :length],
+                    baseline[f"present_key_value_{layer_idx}"][idx, :, :, :length],
+                    atol=0.08,
+                    rtol=0.03,
+                )
+                # Stale/rejected rows must remain invisible to subsequent calls.
+                kv[idx, :, :, length:] = 1000
+
+    # Reuse the same state slots for fresh requests after an explicit reset.
+    runner.reset()
+    with pytest.raises(RuntimeError, match="prefill"):
+        runner.decode()
+    fresh_baseline = run_session(
+        baseline_session,
+        _prefill_inputs(baseline_session, baseline_config, padded_ids, lengths, mrope_cache),
+    )
+    assert torch.equal(runner.prefill(prompts), fresh_baseline["logits"].argmax(-1).int())
+
+
+def test_qwen35_verification_failed_step_preserves_committed_state(
+    qwen35_snapshot_verification_session: tuple[Session, Qwen35Config],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, config = qwen35_snapshot_verification_session
+    runner = Qwen35VerificationSession(session, config, 1, _MAX_SEQUENCE_LENGTH)
+    runner.prefill([[1, 2, 3]])
+    state = runner._state
+    snapshots = runner.recurrent_states()
+    original_run = session.run
+
+    def fail_after_enqueue(*args, **kwargs):
+        assert original_run(*args, **kwargs)
+        torch.cuda.synchronize()
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "run", fail_after_enqueue)
+        with pytest.raises(RuntimeError, match="not committed"):
+            runner.step(torch.tensor([0], dtype=torch.int32))
+    assert runner._state is state
+    for name, value in runner.recurrent_states().items():
+        torch.testing.assert_close(value, snapshots[name], atol=0, rtol=0)
+    runner.step(torch.tensor([0], dtype=torch.int32))
+    assert runner.past_lengths.item() in (4, 5)
+
+
+def test_qwen35_verification_limits_do_not_commit(
+    qwen35_snapshot_verification_session: tuple[Session, Qwen35Config],
+) -> None:
+    session, config = qwen35_snapshot_verification_session
+    runner = Qwen35VerificationSession(session, config, 1, max_seq_len=4)
+    runner.prefill([[1, 2, 3]])
+    state = runner._state
+    for invalid in (
+        torch.tensor([-1]),
+        torch.tensor([config.vocab_size]),
+        torch.tensor([2**32 + 1]),
+    ):
+        with pytest.raises(ValueError, match="outside the vocabulary"):
+            runner.step(invalid)
+        assert runner._state is state
+    with pytest.raises(ValueError, match="integer draft token"):
+        runner.step(torch.tensor([1.0]))
+    with pytest.raises(ValueError, match="single-token decode"):
+        runner.step(torch.tensor([0]))
+    assert runner._state is state
+    runner.decode()
+    assert runner.past_lengths.item() == 4
+    state = runner._state
+    with pytest.raises(ValueError, match="exceeds max_seq_len"):
+        runner.decode()
+    with pytest.raises(RuntimeError, match="reset"):
+        runner.prefill([[1]])
+    assert runner._state is state
