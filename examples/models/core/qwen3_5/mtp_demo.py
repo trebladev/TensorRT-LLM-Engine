@@ -13,11 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a Session reference engine and compare external-draft and greedy output.
-
-This uses the full dense text model, BF16/TP=1, continuous attention KV, and
-paged recurrent snapshots. The candidates are placeholders, not an MTP model.
-"""
+"""Build two TensorRT engines and compare native K=1 MTP with target greedy decoding."""
 
 import argparse
 import gc
@@ -27,20 +23,17 @@ import tensorrt as trt
 import torch
 from transformers import AutoTokenizer
 
-from examples.models.core.qwen3_5.target_verification import Qwen35VerificationSession
 from tensorrt_llm import Builder
-from tensorrt_llm.models.qwen35.model import Qwen35ForCausalLM
+from tensorrt_llm.models.qwen35.mtp import Qwen35MTP
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.runtime import Session
 
+from .mtp import Qwen35MTPGenerator, Qwen35MTPSession
+from .target_verification_demo import build_session
 
-def build_session(
-    model_dir: Path, max_seq_len: int, *, capture_mtp_hidden_states: bool = False
-) -> Qwen35VerificationSession:
-    """Build directly to retain continuous KV for the correctness reference."""
-    model = Qwen35ForCausalLM.from_hugging_face(model_dir, dtype="bfloat16")
-    model.capture_mtp_hidden_states = capture_mtp_hidden_states
-    config = model.config
+
+def build_draft_session(model: Qwen35MTP, max_seq_len: int) -> Qwen35MTPSession:
+    """Build a continuous-KV draft engine for one persistent request."""
     builder = Builder()
     builder_config = builder.create_builder_config(precision="bfloat16", strongly_typed=True)
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
@@ -69,59 +62,42 @@ def build_session(
         )
     engine = builder.build_engine(network, builder_config)
     if engine is None:
-        raise RuntimeError("Failed to build the verification engine")
-    del model, network, builder_config, builder
-    gc.collect()
-    torch.cuda.empty_cache()
-    session = Session.from_serialized_engine(engine)
-    return Qwen35VerificationSession(session, config, 1, max_seq_len)
+        raise RuntimeError("Failed to build the MTP draft engine")
+    return Qwen35MTPSession(Session.from_serialized_engine(engine), model.config, max_seq_len)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir", type=Path, required=True)
     parser.add_argument("--prompt", default="The capital of France is")
-    parser.add_argument("--max_new_tokens", type=int, default=16)
-    parser.add_argument(
-        "--draft_token_id",
-        type=int,
-        default=None,
-        help="External constant candidate; defaults to repeating the pending token",
-    )
+    parser.add_argument("--max_new_tokens", type=int, default=32)
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("max_new_tokens must be positive")
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     prompt = tokenizer.encode(args.prompt, add_special_tokens=True)
-    runner = build_session(args.model_dir, len(prompt) + args.max_new_tokens + 1)
-    emitted = runner.prefill([prompt]).tolist()
-    accepted, iterations = 0, 0
-    while len(emitted) < args.max_new_tokens and emitted[-1] != tokenizer.eos_token_id:
-        if args.max_new_tokens - len(emitted) == 1:
-            emitted.extend(runner.decode().tolist())
-            break
-        draft = (
-            runner.current_tokens
-            if args.draft_token_id is None
-            else torch.tensor([args.draft_token_id], dtype=torch.int64)
-        )
-        result = runner.step(draft)
-        accepted += int(result.accepted_draft.item())
-        iterations += 1
-        for token in result.tokens[0].tolist():
-            if token >= 0:
-                emitted.append(token)
-                if token == tokenizer.eos_token_id:
-                    break
-
-    runner.reset()
-    greedy = runner.prefill([prompt]).tolist()
-    while len(greedy) < args.max_new_tokens and greedy[-1] != tokenizer.eos_token_id:
-        greedy.extend(runner.decode().tolist())
-    if emitted != greedy:
-        raise AssertionError(f"Verification differs from greedy: {emitted} versus {greedy}")
-    print(tokenizer.decode(emitted, skip_special_tokens=True))
-    print(f"Matched greedy output ({len(emitted)} tokens); accepted {accepted}/{iterations} drafts")
+    capacity = len(prompt) + args.max_new_tokens + 1
+    # Fail on absent/incompatible MTP weights before building the target.
+    model = Qwen35MTP.from_hugging_face(args.model_dir)
+    draft = build_draft_session(model, capacity)
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    target = build_session(args.model_dir, capacity, capture_mtp_hidden_states=True)
+    generator = Qwen35MTPGenerator(target, draft)
+    eos = () if tokenizer.eos_token_id is None else (tokenizer.eos_token_id,)
+    result = generator.generate(prompt, args.max_new_tokens, eos)
+    target.reset()
+    greedy = target.prefill([prompt]).tolist()
+    while len(greedy) < args.max_new_tokens and greedy[-1] not in eos:
+        greedy.extend(target.decode().tolist())
+    if result.tokens != greedy:
+        raise AssertionError(f"MTP differs from target greedy: {result.tokens} versus {greedy}")
+    print(tokenizer.decode(result.tokens, skip_special_tokens=True))
+    print(
+        f"Matched {len(result.tokens)} greedy tokens; "
+        f"accepted {result.accepted_drafts}/{result.verified_drafts} native MTP candidates"
+    )
 
 
 if __name__ == "__main__":

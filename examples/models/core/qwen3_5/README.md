@@ -35,18 +35,73 @@ full-attention layers with gated-delta linear-attention layers.
 | Vision inputs | Supported for batch-1 image input by `multimodal_demo.py` |
 | Standard legacy runtime/generation | Supported through `ModelRunnerCpp` |
 | External-draft verification | K=1, BF16/TP=1, greedy through `ModelRunnerCpp`; no prefix reuse or chunked context |
-| Integrated MTP drafter, disaggregated serving, and offload | Not supported |
+| Native MTP generation | K=1 BF16/TP=1 text-only, one request, greedy through two persistent TensorRT Sessions; see below |
+| C++ executor automatic MTP drafting, disaggregated serving, and offload | Not supported |
 
 The implementation has been validated with the `Qwen3.5-2B` Hugging Face
 checkpoint. Other dense Qwen3.5 sizes using the same text-decoder architecture
 are expected to use the same graph, but have not been validated yet.
 
-## Planned MTP enablement
+## MTP enablement
 
 > [!NOTE]
-> An integrated MTP drafter is not supported by this TensorRT graph yet.
-> The external-draft verification and Session state-commit reference below
-> are available; the remaining implementation order describes future work.
+> Native MTP weights and a persistent two-engine generation loop are available
+> as a Session correctness baseline. The C++ executor still supports only
+> externally supplied candidates; automatic drafting in its scheduler remains
+> future work.
+
+### Native MTP generation with persistent TensorRT Sessions
+
+Run from the repository root with the current branch's TensorRT-LLM plugin
+libraries built and installed in `tensorrt_llm/libs`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m examples.models.core.qwen3_5.mtp_demo \
+    --model_dir /path/to/Qwen3.5-2B \
+    --prompt "The capital of France is" \
+    --max_new_tokens 32
+```
+
+The demo builds a target engine and a separate native MTP draft engine, runs
+multi-round generation, and checks its tokens against ordinary target greedy
+decoding. Both neural forwards execute in TensorRT. PyTorch supplies tensor
+storage and greedy selection; no PyTorch model forward runs during generation.
+The draft engine has independent continuous attention KV that remains resident
+for the request. The target retains the three-record GDN/Conv snapshot scheme.
+This is a correctness baseline, without a throughput improvement claim.
+
+`Qwen35MTP` in `tensorrt_llm/models/qwen35/mtp.py` loads `mtp.fc`, both
+`mtp.pre_fc_norm_*` norms, `mtp.layers.0`, and `mtp.norm`. Embeddings and the
+output head share the target checkpoint's weights (each engine owns its own
+storage). The loader requires exactly one native MTP layer and rejects dedicated
+MTP embeddings. Missing MTP parameters fail loading rather than generating
+placeholder candidates.
+
+The target exports normalized hidden states for **all** processed positions
+when `capture_mtp_hidden_states=True`. Prompt priming pairs target hidden state
+at position t with input token t+1, using the first greedy token for the final
+prompt position. After verification:
+
+- Rejection appends `(h_current, correction)` to the draft history.
+- Acceptance appends `(h_current, draft)` and `(h_draft, bonus)`.
+
+Rejected target states never enter draft KV. EOS is honored at either output
+position, and the last single output position uses ordinary target decoding.
+Each new request resets both histories, including after an interrupted or
+failed generation. Calls on an instance must be serialized.
+
+The supported baseline is BF16, TP=PP=CP=1, one text request, K=1, and greedy
+sampling. It uses continuous attention KV, so these Session engines are built
+directly rather than with the hybrid `trtllm-build` paged-KV defaults. Automatic
+MTP in `ModelRunnerCpp`/inflight batching, streaming, multi-request scheduling,
+prefix reuse, chunked context, quantization, and compact recurrent-state replay
+are not implemented by this example.
+
+Tests in `tests/unittest/trt/model/test_qwen35_mtp.py` cover native draft logits
+against an independent HF decoder, cached versus full-prefill draft execution,
+accept/reject token-history alignment, EOS/output limits, failed draft enqueue,
+request reset, and full-checkpoint target-greedy equivalence. Set
+`LLM_MODELS_ROOT` to the parent of `Qwen3.5-2B` when running them.
 
 ### Engine-level external-draft verification (K=1)
 
@@ -170,8 +225,9 @@ The multi-round tests cover all-accept, all-reject, alternating, and mixed
 acceptance in a two-request batch, compare GDN/Conv and valid KV state against
 sequential execution, poison stale KV rows, reuse slots after reset, and inject
 an enqueue failure to verify that the previous state is retained. C++ inflight
-batching, paged attention-KV allocation/rewind, and MTP weight loading remain
-separate integration work.
+batching and paged attention-KV allocation/rewind use the separate C++ path
+described above; native MTP weight loading and multi-round generation use the
+Session path.
 
 ### Remaining implementation order
 
@@ -188,7 +244,10 @@ the state after all draft tokens cannot be rolled back by changing a sequence
 length. Convolution state has the same commit problem, although its state is
 small enough to retain per-step snapshots.
 
-The implementation should proceed in the following order:
+The original roadmap below remains useful for tracking broader support.
+Stages 1–6 have restricted K=1 verification implementations, and stage 7 now
+has the native two-Session baseline. General K, automatic C++ drafting, compact
+replay, and optimized/distributed configurations remain future work:
 
 | Stage | Implementation | Test types |
 | --- | --- | --- |

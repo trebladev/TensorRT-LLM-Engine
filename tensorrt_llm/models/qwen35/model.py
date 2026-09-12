@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from copy import copy
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -736,6 +737,7 @@ class Qwen35ForCausalLM(PretrainedModel):
         self.dtype = str_dtype_to_trt(config.dtype)
         self._logits_dtype = str_dtype_to_trt(config.logits_dtype)
         self.gather_context_logits = False
+        self.capture_mtp_hidden_states = False
         self.attention_layer_ids = [
             idx
             for idx, layer_type in enumerate(config.decoder_layer_types)
@@ -746,7 +748,12 @@ class Qwen35ForCausalLM(PretrainedModel):
             for idx, layer_type in enumerate(config.decoder_layer_types)
             if layer_type == "linear_attention"
         ]
-        Attention.create_attention_const_params(self, config)
+        # The shared helper reads rotary_dim/rotary_pct, while this model
+        # stores rotary_embedding_dim/rotary_embedding_percentage. Generation
+        # must use the same partial-RoPE width as the prefill MRoPE cache.
+        rope_config = copy(config)
+        rope_config.rotary_dim = config.rotary_embedding_dim
+        Attention.create_attention_const_params(self, rope_config)
         self.position_embedding_type = config.position_embedding_type
         self.visual = Qwen35VisionModel(config) if config.has_vision else None
         self.transformer = Qwen35Model(config)
@@ -807,6 +814,8 @@ class Qwen35ForCausalLM(PretrainedModel):
             snapshot_slot_mapping=snapshot_slot_mapping,
             spec_decoding_params=spec_decoding_params,
         )
+        if self.capture_mtp_hidden_states:
+            hidden_states.mark_output("mtp_hidden_states", self.dtype)
         if not self.gather_context_logits:
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids, default_net().plugin_config.remove_input_padding

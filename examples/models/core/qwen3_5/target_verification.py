@@ -52,6 +52,7 @@ class _CommittedState:
     slots: torch.Tensor  # CPU: one GDN/Conv record index per request.
     kv: dict[str, torch.Tensor]
     logits: torch.Tensor  # CUDA: predicts the pending token.
+    hidden_states: torch.Tensor | None = None
 
 
 class Qwen35VerificationSession:
@@ -145,6 +146,14 @@ class Qwen35VerificationSession:
     def past_lengths(self) -> torch.Tensor:
         """Committed effective KV lengths [N] on the CPU."""
         return self._require_state().lengths.clone()
+
+    @property
+    def last_hidden_states(self) -> torch.Tensor:
+        """Normalized packed target states from the last forward, including rejected rows."""
+        hidden = self._require_state().hidden_states
+        if hidden is None:
+            raise RuntimeError("Build the target with capture_mtp_hidden_states=True")
+        return hidden
 
     def reset(self) -> None:
         """Release committed KV and reuse recurrent slots for a fresh batch."""
@@ -259,7 +268,7 @@ class Qwen35VerificationSession:
         # All three caches describe the same processed prefix when this single
         # state reference is published. Rejected KV tails are outside lengths.
         torch.cuda.current_stream(self._device).synchronize()
-        self._state = _CommittedState(lengths, slots, kv, logits)
+        self._state = _CommittedState(lengths, slots, kv, logits, outputs.get("mtp_hidden_states"))
 
     def prefill(self, prompts: list[list[int]]) -> torch.Tensor:
         """Prefill a fresh batch and return the first pending greedy tokens [N]."""
