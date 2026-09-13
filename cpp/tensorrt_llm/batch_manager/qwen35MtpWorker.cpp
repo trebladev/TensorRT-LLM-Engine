@@ -28,11 +28,13 @@ namespace tensorrt_llm::batch_manager
 using namespace runtime;
 
 Qwen35MtpWorker::Qwen35MtpWorker(std::string const& enginePath, nvinfer1::ILogger* logger, SizeType32 maxSequenceLength,
-    SizeType32 hiddenSize, SizeType32 vocabSize)
+    SizeType32 hiddenSize, SizeType32 vocabSize, SizeType32 maxBatchSize, SizeType32 rotaryDim)
     : mRuntime(RawEngine(std::filesystem::path(enginePath)), logger)
     , mMaxSequenceLength(maxSequenceLength)
     , mHiddenSize(hiddenSize)
     , mVocabSize(vocabSize)
+    , mMaxBatchSize(maxBatchSize)
+    , mRotaryDim(rotaryDim)
 {
     auto const& engine = mRuntime.getEngine();
     TLLM_CHECK_WITH_INFO(engine.getNbOptimizationProfiles() == 1, "Native MTP requires a single-profile draft engine");
@@ -44,54 +46,86 @@ Qwen35MtpWorker::Qwen35MtpWorker(std::string const& enginePath, nvinfer1::ILogge
             && engine.getTensorDataType("target_hidden_states") == nvinfer1::DataType::kBF16,
         "Native MTP draft hidden-state dimensions or dtype differ from target");
     auto const kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
-    TLLM_CHECK_WITH_INFO(kvShape.nbDims == 5 && kvShape.d[0] == 1 && kvShape.d[3] >= maxSequenceLength,
-        "Native MTP draft cache must cover the target maximum sequence length, with batch one");
+    TLLM_CHECK_WITH_INFO(kvShape.nbDims == 5 && kvShape.d[0] >= maxBatchSize && kvShape.d[3] >= maxSequenceLength,
+        "Native MTP draft cache must cover the target maximum sequence length, and runtime batch size");
     auto const logitsShape = engine.getTensorShape("logits");
     TLLM_CHECK_WITH_INFO(logitsShape.nbDims == 2 && logitsShape.d[1] == vocabSize
             && engine.getTensorDataType("logits") == nvinfer1::DataType::kFLOAT,
         "Native MTP requires FP32 draft logits with the target vocabulary");
     mRuntime.addContext(0);
-    mRuntime.setCurrentBeamWidths({1});
 }
 
 void Qwen35MtpWorker::release(std::uint64_t requestId)
 {
-    if (mRequestId == requestId)
-    {
-        mRuntime.getStream().synchronize();
-        mRequestId.reset();
-        mKv.reset();
-        mHiddenStates.reset();
-        mRotaryCache.reset();
-        mPositionDeltas.reset();
-        mLength = 0;
-        mPromptLength = 0;
-    }
+    mRequests.erase(requestId);
+}
+
+bool Qwen35MtpWorker::isContext(std::uint64_t requestId) const
+{
+    return mRequests.at(requestId).context;
 }
 
 void Qwen35MtpWorker::capture(std::uint64_t requestId, bool context, TensorPtr const& hiddenStates,
-    TensorPtr const& rotaryCache, TensorPtr const& positionDeltas)
+    TensorPtr const& rotaryCache, SizeType32 positionDelta)
 {
     if (context)
     {
-        TLLM_CHECK_WITH_INFO(!mRequestId || mRequestId == requestId, "Native MTP supports one active request");
         release(requestId);
-        mRequestId = requestId;
+        mRequests.emplace(requestId, RequestState{});
     }
-    TLLM_CHECK_WITH_INFO(mRequestId == requestId, "Native MTP generation has no matching draft history");
-    TLLM_CHECK(hiddenStates && rotaryCache && positionDeltas);
-    mContext = context;
-    mHiddenStates = hiddenStates;
-    mRotaryCache = rotaryCache;
-    mPositionDeltas = positionDeltas;
+    TLLM_CHECK_WITH_INFO(mRequests.count(requestId), "Native MTP generation has no matching draft history");
+    TLLM_CHECK(hiddenStates && rotaryCache);
+    auto& state = mRequests.at(requestId);
+    TLLM_CHECK(state.tokens.empty());
+    state.context = context;
+    state.hiddenStates = hiddenStates;
+    state.rotaryCache = rotaryCache;
+    state.positionDelta = positionDelta;
 }
 
-TokenIdType Qwen35MtpWorker::draft(std::vector<TokenIdType> const& tokens)
+void Qwen35MtpWorker::queue(std::uint64_t requestId, Tokens tokens)
 {
-    auto const count = static_cast<SizeType32>(tokens.size());
-    TLLM_CHECK_WITH_INFO(count > 0 && (mContext || count <= 2), "Invalid native MTP accepted-prefix length");
-    TLLM_CHECK(mLength + count <= mMaxSequenceLength);
-    TLLM_CHECK(mHiddenStates && mHiddenStates->getShape().d[0] >= count);
+    auto& state = mRequests.at(requestId);
+    TLLM_CHECK(state.tokens.empty());
+    TLLM_CHECK(!tokens.empty() && (state.context || tokens.size() <= 2));
+    state.tokens = std::move(tokens);
+}
+
+std::map<std::uint64_t, TokenIdType> Qwen35MtpWorker::draft()
+{
+    std::map<std::uint64_t, TokenIdType> result;
+    // Prefills may have different lengths. Generation groups append either one
+    // correction pair or two accepted pairs, using causal verification attention.
+    for (SizeType32 group = 0; group < 3; ++group)
+    {
+        std::vector<RequestState*> states;
+        std::vector<std::uint64_t> ids;
+        for (auto& [id, state] : mRequests)
+        {
+            if (!state.tokens.empty() && (state.context ? 0 : static_cast<SizeType32>(state.tokens.size())) == group)
+            {
+                states.push_back(&state);
+                ids.push_back(id);
+            }
+        }
+        if (!states.empty())
+        {
+            auto const tokens = draftBatch(states);
+            for (std::size_t i = 0; i < ids.size(); ++i)
+            {
+                result.emplace(ids[i], tokens[i]);
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
+{
+    auto const batchSize = static_cast<SizeType32>(states.size());
+    TLLM_CHECK(batchSize > 0 && batchSize <= mMaxBatchSize);
+    auto const context = states.front()->context;
+    auto const width = context ? 1 : static_cast<SizeType32>(states.front()->tokens.size());
     auto& manager = mRuntime.getBufferManager();
     auto const& engine = mRuntime.getEngine();
     std::vector<TensorPtr> staging;
@@ -104,39 +138,85 @@ TokenIdType Qwen35MtpWorker::draft(std::vector<TokenIdType> const& tokens)
         return gpu ? TensorPtr(manager.copyFrom(*host, MemoryType::kGPU)) : host;
     };
     auto scalar = [&](SizeType32 value, bool gpu) { return ints({value}, ITensor::makeShape({1}), gpu); };
-    if (mContext)
+    auto batchInts = [&](std::vector<SizeType32> const& values, bool gpu)
+    { return ints(values, ITensor::makeShape({batchSize}), gpu); };
+
+    Tokens tokens;
+    std::vector<SizeType32> pastLengths, promptLengths, sequenceLengths, lastTokenIds, positionDeltas;
+    for (auto const* state : states)
     {
-        auto shape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
-        shape.d[3] = mMaxSequenceLength;
-        mKv = manager.gpu(shape, nvinfer1::DataType::kBF16);
-        manager.setZero(*mKv);
+        auto const count = static_cast<SizeType32>(state->tokens.size());
+        TLLM_CHECK(state->context == context && (context || count == width));
+        TLLM_CHECK(state->length + count <= mMaxSequenceLength);
+        TLLM_CHECK(state->hiddenStates->getShape().d[0] >= count);
+        tokens.insert(tokens.end(), state->tokens.begin(), state->tokens.end());
+        pastLengths.push_back(state->length);
+        promptLengths.push_back(context ? count : state->promptLength);
+        sequenceLengths.push_back(state->length + count);
+        lastTokenIds.push_back(static_cast<SizeType32>(tokens.size()));
+        positionDeltas.push_back(state->positionDelta);
     }
-    auto const promptLength = mContext ? count : mPromptLength;
-    auto const verification = !mContext && count == 2;
-    auto const generationLength = verification ? 2 : 1;
+    auto const numTokens = static_cast<SizeType32>(tokens.size());
+    auto kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
+    kvShape.d[0] = batchSize;
+    kvShape.d[3] = mMaxSequenceLength;
+    TensorPtr kv = manager.gpu(kvShape, nvinfer1::DataType::kBF16);
+    TensorPtr hidden = manager.gpu(ITensor::makeShape({numTokens, mHiddenSize}), nvinfer1::DataType::kBF16);
+    auto ropeShape = engine.getProfileShape("mrope_rotary_cos_sin", 0, nvinfer1::OptProfileSelector::kMAX);
+    ropeShape.d[0] = batchSize;
+    TensorPtr rope = manager.gpu(ropeShape, nvinfer1::DataType::kFLOAT);
+    if (context)
+    {
+        manager.setZero(*kv);
+    }
+    TensorPtr ropeFlat = ITensor::view(rope, ITensor::makeShape({static_cast<ITensor::DimType64>(rope->getSize())}));
+    SizeType32 offset = 0;
+    for (SizeType32 i = 0; i < batchSize; ++i)
+    {
+        auto const& state = *states[i];
+        auto const count = static_cast<SizeType32>(state.tokens.size());
+        manager.copy(*ITensor::slice(state.hiddenStates, 0, count), *ITensor::slice(hidden, offset, count));
+        if (context)
+        {
+            // Context MRoPE coefficients follow packed token order, not padded batch rows.
+            manager.copy(*ITensor::slice(state.rotaryCache, 0, count * mRotaryDim),
+                *ITensor::slice(ropeFlat, offset * mRotaryDim, count * mRotaryDim));
+        }
+        else
+        {
+            TLLM_CHECK(state.kv);
+            manager.copy(*state.kv, *ITensor::slice(kv, i, 1));
+        }
+        offset += count;
+    }
     TensorPtr knobs = BufferManager::cpu(ITensor::makeShape({16}), nvinfer1::DataType::kINT64);
     std::fill_n(bufferCast<std::int64_t>(*knobs), 16, -1);
     TensorPtr progress = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT64);
     bufferCast<std::int64_t>(*progress)[0] = 0;
-    TensorPtr indirection = manager.gpu(ITensor::makeShape({1, 1, mMaxSequenceLength}), nvinfer1::DataType::kINT32);
+    TensorPtr indirection
+        = manager.gpu(ITensor::makeShape({batchSize, 1, mMaxSequenceLength}), nvinfer1::DataType::kINT32);
     manager.setZero(*indirection);
-    TllmRuntime::TensorMap allInputs{{"input_ids", ints(tokens, ITensor::makeShape({count}), true)},
-        {"target_hidden_states", ITensor::slice(mHiddenStates, 0, count)}, {"past_key_value_0", mKv},
-        {"position_ids", scalar(mLength, true)}, {"last_token_ids", scalar(count, true)},
-        {"context_lengths", scalar(promptLength, true)}, {"host_context_lengths", scalar(promptLength, false)},
-        {"sequence_length", scalar(mLength + count, true)}, {"host_past_key_value_lengths", scalar(mLength, false)},
-        {"host_request_types", scalar(mContext ? 0 : 1, false)},
+    std::vector<SizeType32> offsets(batchSize * width), mask(batchSize * width);
+    for (SizeType32 i = 0; i < batchSize * width; ++i)
+    {
+        offsets[i] = i % width;
+        mask[i] = (1 << (i % width + 1)) - 1;
+    }
+    TllmRuntime::TensorMap allInputs{{"input_ids", ints(tokens, ITensor::makeShape({numTokens}), true)},
+        {"target_hidden_states", hidden}, {"past_key_value_0", kv}, {"position_ids", batchInts(pastLengths, true)},
+        {"last_token_ids", batchInts(lastTokenIds, true)}, {"context_lengths", batchInts(promptLengths, true)},
+        {"host_context_lengths", batchInts(promptLengths, false)},
+        {"sequence_length", batchInts(sequenceLengths, true)},
+        {"host_past_key_value_lengths", batchInts(pastLengths, false)},
+        {"host_request_types", batchInts(std::vector<SizeType32>(batchSize, context ? 0 : 1), false)},
         {"host_max_attention_window_sizes", scalar(mMaxSequenceLength, false)},
         {"host_sink_token_length", scalar(0, false)}, {"host_runtime_perf_knobs", knobs},
-        {"host_context_progress", progress}, {"cache_indirection", indirection}, {"mrope_rotary_cos_sin", mRotaryCache},
-        {"mrope_position_deltas", mPositionDeltas}, {"spec_decoding_use", scalar(verification ? 1 : 0, false)},
-        {"spec_decoding_generation_lengths", scalar(generationLength, true)},
-        {"spec_decoding_position_offsets",
-            ints(verification ? std::vector<SizeType32>{0, 1} : std::vector<SizeType32>{0},
-                ITensor::makeShape({1, generationLength}), true)},
-        {"spec_decoding_packed_mask",
-            ints(verification ? std::vector<SizeType32>{1, 3} : std::vector<SizeType32>{1},
-                ITensor::makeShape({generationLength, 1}), true)}};
+        {"host_context_progress", progress}, {"cache_indirection", indirection}, {"mrope_rotary_cos_sin", rope},
+        {"mrope_position_deltas", ints(positionDeltas, ITensor::makeShape({batchSize, 1}), true)},
+        {"spec_decoding_use", scalar(width > 1 ? 1 : 0, false)},
+        {"spec_decoding_generation_lengths", batchInts(std::vector<SizeType32>(batchSize, width), true)},
+        {"spec_decoding_position_offsets", ints(offsets, ITensor::makeShape({batchSize, width}), true)},
+        {"spec_decoding_packed_mask", ints(mask, ITensor::makeShape({batchSize * width, 1}), true)}};
     TllmRuntime::TensorMap inputs;
     for (int i = 0; i < engine.getNbIOTensors(); ++i)
     {
@@ -147,18 +227,34 @@ TokenIdType Qwen35MtpWorker::draft(std::vector<TokenIdType> const& tokens)
             inputs.emplace(name, allInputs.at(name));
         }
     }
+    mRuntime.setCurrentBeamWidths(std::vector<SizeType32>(batchSize, 1));
     mRuntime.setInputTensors(0, inputs);
     TllmRuntime::TensorMap outputs;
     mRuntime.setOutputTensors(0, outputs);
     TLLM_CHECK_WITH_INFO(mRuntime.executeContext(0), "Native MTP draft engine enqueue failed");
-    auto const lastLogits = ITensor::slice(outputs.at("logits"), count - 1, 1);
-    auto hostLogits = manager.copyFrom(*lastLogits, MemoryType::kCPU);
+    std::vector<TensorPtr> hostLogits, nextKv;
+    for (SizeType32 i = 0; i < batchSize; ++i)
+    {
+        hostLogits.emplace_back(
+            manager.copyFrom(*ITensor::slice(outputs.at("logits"), lastTokenIds[i] - 1, 1), MemoryType::kCPU));
+        // Own only this request's KV so finishing peers do not keep an entire batch allocation alive.
+        nextKv.emplace_back(
+            manager.copyFrom(*ITensor::slice(outputs.at("present_key_value_0"), i, 1), MemoryType::kGPU));
+    }
     manager.getStream().synchronize();
-    auto const* logits = bufferCast<float const>(*hostLogits);
-    auto const token = static_cast<TokenIdType>(std::max_element(logits, logits + mVocabSize) - logits);
-    mKv = outputs.at("present_key_value_0");
-    mLength += count;
-    mPromptLength = promptLength;
-    return token;
+    std::vector<TokenIdType> result;
+    for (SizeType32 i = 0; i < batchSize; ++i)
+    {
+        auto const* logits = bufferCast<float const>(*hostLogits[i]);
+        result.push_back(static_cast<TokenIdType>(std::max_element(logits, logits + mVocabSize) - logits));
+        auto& state = *states[i];
+        state.kv = std::move(nextKv[i]);
+        state.length = sequenceLengths[i];
+        state.promptLength = promptLengths[i];
+        state.tokens.clear();
+        state.hiddenStates.reset();
+        state.rotaryCache.reset();
+    }
+    return result;
 }
 } // namespace tensorrt_llm::batch_manager

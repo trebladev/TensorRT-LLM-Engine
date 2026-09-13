@@ -202,22 +202,38 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
 
     if (mExternalDraftVerification)
     {
-        auto const width = generationRequests.empty() ? 1 : generationRequests.front()->getNumDraftTokens() + 1;
-        TLLM_CHECK_WITH_INFO(width == 1 || contextRequests.empty(), "MTP does not support mixed context/generation");
+        SizeType32 width = 1;
+        SizeType32 numGenTokens = 0;
         for (auto const& request : generationRequests)
         {
-            TLLM_CHECK_WITH_INFO(request->getNumDraftTokens() + 1 == width, "MTP requires uniform generation widths");
+            auto const count = request->getNumDraftTokens() + 1;
+            width = std::max(width, count);
+            numGenTokens += count;
         }
+        // The attention plugin indexes speculative metadata from generation
+        // sequence zero, even when context tokens precede it in the packed batch.
+        auto const numGen = static_cast<SizeType32>(generationRequests.size());
         bufferCast<SizeType32>(*mSpecDecodingUse)[0] = width > 1 ? 1 : 0;
-        mSpecDecodingLengthsHost->reshape(ITensor::makeShape({sequenceIdx}));
-        mSpecDecodingOffsetsHost->reshape(ITensor::makeShape({sequenceIdx, width}));
-        mSpecDecodingMaskHost->reshape(ITensor::makeShape({sequenceIdx * width, 1}));
-        std::fill_n(bufferCast<SizeType32>(*mSpecDecodingLengthsHost), sequenceIdx, width);
-        for (SizeType32 i = 0; i < sequenceIdx * width; ++i)
+        // Keep one dummy row for older single-request engine profiles in context-only steps.
+        auto const rows = std::max(1, numGen);
+        mSpecDecodingLengthsHost->reshape(ITensor::makeShape({rows}));
+        mSpecDecodingOffsetsHost->reshape(ITensor::makeShape({rows, width}));
+        mSpecDecodingMaskHost->reshape(ITensor::makeShape({std::max(1, numGenTokens), 1}));
+        std::fill_n(bufferCast<SizeType32>(*mSpecDecodingLengthsHost), rows, 1);
+        std::fill_n(bufferCast<SizeType32>(*mSpecDecodingMaskHost), std::max(1, numGenTokens), 1);
+        for (SizeType32 i = 0; i < rows * width; ++i)
         {
-            auto const position = i % width;
-            bufferCast<SizeType32>(*mSpecDecodingOffsetsHost)[i] = position;
-            bufferCast<SizeType32>(*mSpecDecodingMaskHost)[i] = (1 << (position + 1)) - 1;
+            bufferCast<SizeType32>(*mSpecDecodingOffsetsHost)[i] = i % width;
+        }
+        SizeType32 tokenOffset = 0;
+        for (SizeType32 i = 0; i < numGen; ++i)
+        {
+            auto const count = generationRequests[i]->getNumDraftTokens() + 1;
+            bufferCast<SizeType32>(*mSpecDecodingLengthsHost)[i] = count;
+            for (SizeType32 token = 0; token < count; ++token)
+            {
+                bufferCast<SizeType32>(*mSpecDecodingMaskHost)[tokenOffset++] = (1 << (token + 1)) - 1;
+            }
         }
     }
 

@@ -960,10 +960,8 @@ class Qwen35ForCausalLM(PretrainedModel):
                 raise ValueError("Qwen3.5 target verification currently requires TP=1")
             if not use_cache:
                 raise ValueError("Qwen3.5 target verification requires use_cache=true")
-        if spec_decoding_is_generation_length_variable:
-            raise ValueError(
-                "The initial Qwen3.5 implementation does not support variable generation lengths"
-            )
+        if spec_decoding_is_generation_length_variable and max_draft_len != 1:
+            raise ValueError("Variable generation lengths require K=1 target verification")
         if lora_target_modules:
             raise ValueError("The initial Qwen3.5 implementation does not support LoRA")
         if position_encoding_2d:
@@ -996,6 +994,7 @@ class Qwen35ForCausalLM(PretrainedModel):
             # plugin's positional offsets and causal packed mask. The legacy
             # external-draft path would omit these inputs.
             speculative_decoding_draft_tokens_external=False,
+            spec_decoding_is_generation_length_variable=max_draft_len == 1,
             gather_context_logits=gather_context_logits,
             opt_batch_size=opt_batch_size,
             num_hidden_layers=len(self.attention_layer_ids),

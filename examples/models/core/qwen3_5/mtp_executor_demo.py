@@ -31,23 +31,27 @@ from tensorrt_llm.runtime import ModelRunnerCpp
 from .mtp_demo import build_draft_engine
 
 
-def build_engines(model_dir: Path, engine_dir: Path, max_seq_len: int = 128) -> Path:
+def build_engines(
+    model_dir: Path, engine_dir: Path, max_seq_len: int = 128, max_batch_size: int = 1
+) -> Path:
     """Save a paged-KV target and a continuous-KV MTP draft engine."""
+    if max_batch_size < 1 or max_seq_len < 3:
+        raise ValueError("max_batch_size must be positive and max_seq_len must be at least 3")
     engine_dir.mkdir(parents=True, exist_ok=True)
     model = Qwen35MTP.from_hugging_face(model_dir)
     draft_path = engine_dir / "mtp.engine"
-    draft_path.write_bytes(bytes(build_draft_engine(model, max_seq_len + 1)))
+    draft_path.write_bytes(bytes(build_draft_engine(model, max_seq_len + 1, max_batch_size)))
     del model
     gc.collect()
     torch.cuda.empty_cache()
     model = Qwen35ForCausalLM.from_hugging_face(model_dir, dtype="bfloat16")
     model.capture_mtp_hidden_states = True
     config = BuildConfig(
-        max_batch_size=1,
+        max_batch_size=max_batch_size,
         max_input_len=max_seq_len - 2,
         max_seq_len=max_seq_len,
-        max_num_tokens=max_seq_len,
-        opt_num_tokens=min(64, max_seq_len),
+        max_num_tokens=max_seq_len * max_batch_size,
+        opt_num_tokens=min(64, max_seq_len) * max_batch_size,
         max_draft_len=1,
         speculative_decoding_mode=SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
     )
@@ -63,16 +67,22 @@ def main() -> None:
     parser.add_argument("--model_dir", type=Path, required=True)
     parser.add_argument("--engine_dir", type=Path, required=True)
     parser.add_argument("--build", action="store_true")
-    parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--max_batch_size", type=int, default=1)
+    parser.add_argument(
+        "--prompt", action="append", help="Repeat to generate multiple prompts in one batch"
+    )
     parser.add_argument("--max_new_tokens", type=int, default=24)
     args = parser.parse_args()
+    prompts = args.prompt or ["The capital of France is"]
+    if args.max_batch_size < 1 or len(prompts) > args.max_batch_size:
+        parser.error("max_batch_size must be positive and cover the number of prompts")
     if args.build:
-        build_engines(args.model_dir, args.engine_dir)
+        build_engines(args.model_dir, args.engine_dir, max_batch_size=args.max_batch_size)
         gc.collect()
         torch.cuda.empty_cache()
     runner = ModelRunnerCpp.from_dir(
         str(args.engine_dir),
-        max_batch_size=1,
+        max_batch_size=args.max_batch_size,
         cuda_graph_mode=False,
         kv_cache_enable_block_reuse=False,
         enable_chunked_context=False,
@@ -80,9 +90,9 @@ def main() -> None:
         mtp_draft_engine_path=str(args.engine_dir / "mtp.engine"),
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    prompt = tokenizer.encode(args.prompt, add_special_tokens=True)
+    prompt_ids = [tokenizer.encode(prompt, add_special_tokens=True) for prompt in prompts]
     outputs = runner.generate(
-        [torch.tensor(prompt, dtype=torch.int32)],
+        [torch.tensor(prompt, dtype=torch.int32) for prompt in prompt_ids],
         max_new_tokens=args.max_new_tokens,
         top_k=1,
         end_id=tokenizer.eos_token_id,
@@ -90,10 +100,14 @@ def main() -> None:
         return_dict=True,
         output_sequence_lengths=True,
     )
-    length = int(outputs["sequence_lengths"][0, 0])
-    tokens = outputs["output_ids"][0, 0, len(prompt) : length].tolist()
-    print(tokenizer.decode(tokens, skip_special_tokens=True))
-    print(f"C++ executor generated {len(tokens)} tokens with automatic native MTP drafting")
+    for i, prompt in enumerate(prompt_ids):
+        length = int(outputs["sequence_lengths"][i, 0])
+        tokens = outputs["output_ids"][i, 0, len(prompt) : length].tolist()
+        print(tokenizer.decode(tokens, skip_special_tokens=True))
+        print(
+            f"Request {i}: C++ executor generated {len(tokens)} tokens with automatic native MTP drafting"
+        )
+    runner.session.shutdown()
 
 
 if __name__ == "__main__":

@@ -32,8 +32,10 @@ from .mtp import Qwen35MTPGenerator, Qwen35MTPSession
 from .target_verification_demo import build_session
 
 
-def build_draft_engine(model: Qwen35MTP, max_seq_len: int) -> trt.IHostMemory:
-    """Build a serializable continuous-KV draft engine for one request."""
+def build_draft_engine(
+    model: Qwen35MTP, max_seq_len: int, max_batch_size: int = 1
+) -> trt.IHostMemory:
+    """Build a serializable continuous-KV draft engine."""
     builder = Builder()
     builder_config = builder.create_builder_config(precision="bfloat16", strongly_typed=True)
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
@@ -50,11 +52,11 @@ def build_draft_engine(model: Qwen35MTP, max_seq_len: int) -> trt.IHostMemory:
         network.set_named_parameters(model.named_parameters())
         model(
             **model.prepare_inputs(
-                max_batch_size=1,
+                max_batch_size=max_batch_size,
                 max_input_len=max_seq_len,
                 max_seq_len=max_seq_len,
-                max_num_tokens=max_seq_len,
-                opt_num_tokens=min(64, max_seq_len),
+                max_num_tokens=max_seq_len * max_batch_size,
+                opt_num_tokens=min(64, max_seq_len) * max_batch_size,
                 use_cache=True,
                 max_draft_len=1,
                 speculative_decoding_draft_tokens_external=True,

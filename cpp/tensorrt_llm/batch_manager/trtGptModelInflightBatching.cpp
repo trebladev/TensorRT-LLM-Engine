@@ -318,8 +318,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         TLLM_CHECK_WITH_INFO(mModelConfig.isAttentionLinearHybrid()
                 && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
                 && mModelConfig.getDataType() == nvinfer1::DataType::kBF16 && mWorldConfig.getSize() == 1
-                && getMaxBatchSize() == 1 && getMaxBeamWidth() == 1,
-            "Native Qwen3.5 MTP requires a BF16 K=1 hybrid target, single rank, and max_batch_size=1");
+                && getMaxBeamWidth() == 1,
+            "Native Qwen3.5 MTP requires a BF16 K=1 hybrid target, single rank, and beam width one");
         TLLM_CHECK_WITH_INFO(!isTrtOverlap() && !isCudaGraphMode() && !nativeSpecConfig->fastLogits
                 && !executorConfig.getCacheTransceiverConfig() && !executorConfig.getGuidedDecodingConfig(),
             "Native MTP does not support overlap, CUDA graphs, fast logits, disaggregation, or guided decoding");
@@ -327,7 +327,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             mRuntime->getEngine().getTensorIOMode("mtp_hidden_states") == nvinfer1::TensorIOMode::kOUTPUT,
             "Build the native MTP target with capture_mtp_hidden_states=True");
         mNativeMtp = std::make_unique<Qwen35MtpWorker>(*nativeSpecConfig->mtpDraftEnginePath, mLogger.get(),
-            getMaxSequenceLen(), mModelConfig.getHiddenSize(), mModelConfig.getVocabSize());
+            getMaxSequenceLen(), mModelConfig.getHiddenSize(), mModelConfig.getVocabSize(), getMaxBatchSize(),
+            mModelConfig.getRotaryEmbeddingDim());
     }
 
     setupSpeculativeDecodingModule(mDecodingConfig);
@@ -2185,10 +2186,20 @@ void TrtGptModelInflightBatching::executeStep(
     executeContext(optProfileId, bufferId);
     if (mNativeMtp)
     {
-        TLLM_CHECK(contextRequests.size() + generationRequests.size() == 1);
-        auto const& request = contextRequests.empty() ? generationRequests.front() : contextRequests.front();
-        mNativeMtp->capture(request->mRequestId, !contextRequests.empty(), outputMap.at("mtp_hidden_states"),
-            inputMap.at("mrope_rotary_cos_sin"), inputMap.at("mrope_position_deltas"));
+        SizeType32 offset = 0;
+        auto capture = [&](RequestVector const& requests, bool context)
+        {
+            for (auto const& request : requests)
+            {
+                auto const count = context ? request->getContextChunkSize() : request->getNumDraftTokens() + 1;
+                mNativeMtp->capture(request->mRequestId, context,
+                    ITensor::slice(outputMap.at("mtp_hidden_states"), offset, count),
+                    request->getMropeRotaryCosSin().value(), request->getMropePositionDeltas().value());
+                offset += count;
+            }
+        };
+        capture(contextRequests, true);
+        capture(generationRequests, false);
     }
 
     // If batch state has any context request, do not capture this graph.
@@ -2873,9 +2884,9 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             if (remaining > 1)
             {
                 auto const& tokens = llmReq->getTokens(0);
-                auto const begin = mNativeMtp->isContext() ? 1 : currentNumOfTokens;
+                auto const begin = mNativeMtp->isContext(llmReq->mRequestId) ? 1 : currentNumOfTokens;
                 std::vector<TokenIdType> acceptedTokens(tokens.begin() + begin, tokens.end());
-                nextDraft->push_back(mNativeMtp->draft(acceptedTokens));
+                mNativeMtp->queue(llmReq->mRequestId, std::move(acceptedTokens));
             }
             llmReq->setDraftTokens(nextDraft);
         }
@@ -2989,6 +3000,19 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
             {
                 llmReq->setNumPreDecodedTokens(numNewTokens[beam], beam);
+            }
+        }
+    }
+
+    if (mNativeMtp)
+    {
+        auto const candidates = mNativeMtp->draft();
+        for (auto const& request : scheduledRequests.generationRequests)
+        {
+            auto const it = candidates.find(request->mRequestId);
+            if (it != candidates.end())
+            {
+                request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>(1, it->second));
             }
         }
     }

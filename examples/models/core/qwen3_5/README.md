@@ -30,13 +30,13 @@ full-attention layers with gated-delta linear-attention layers.
 | KV/state management | Paged KV cache and paged linear-attention state |
 | Generation | Prefill followed by decode, beam width 1 |
 | Prefix cache / block reuse | Supported for full-attention KV and gated-delta recurrent state with beam width 1 |
-| Mixed prefill and decode batch | Not supported |
+| Mixed prefill and decode batch | Supported by the packed BF16 C++ executor path |
 | Quantization | Not supported |
 | Vision inputs | Supported for batch-1 image input by `multimodal_demo.py` |
 | Standard legacy runtime/generation | Supported through `ModelRunnerCpp` |
 | External-draft verification | K=1, BF16/TP=1, greedy through `ModelRunnerCpp`; no prefix reuse or chunked context |
 | Native MTP generation | K=1 BF16/TP=1 text-only, one request, greedy through two persistent TensorRT Sessions; see below |
-| C++ executor automatic MTP drafting | K=1 BF16, single rank and active request, greedy; see below |
+| C++ executor automatic MTP drafting | K=1 BF16, single rank, batched greedy; see below |
 | Disaggregated serving and offload | Not supported |
 
 The implementation has been validated with the `Qwen3.5-2B` Hugging Face
@@ -57,11 +57,12 @@ Build matching target/draft engines and run automatic drafting:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m examples.models.core.qwen3_5.mtp_executor_demo \
     --model_dir /path/to/Qwen3.5-2B \
-    --engine_dir /tmp/qwen35_mtp --build \
+    --engine_dir /tmp/qwen35_mtp --max_batch_size 4 --build \
     --prompt "The capital of France is" --max_new_tokens 24
 ```
 
-Omit `--build` to reuse the engines. Rebuild and install the C++ runtime, plugins,
+Omit `--build` to reuse the engines. Use the same `--max_batch_size` at runtime.
+Repeat `--prompt` to submit multiple prompts together. Rebuild and install the C++ runtime, plugins,
 and Python bindings from this branch before running the demo. The target uses
 paged attention KV and exports `mtp_hidden_states`; `mtp.engine` uses continuous
 KV and includes the extra verification position reserved by the target builder.
@@ -69,21 +70,33 @@ KV and includes the extra verification position reserved by the target builder.
 Pass `mtp_draft_engine_path` to `ModelRunnerCpp.from_dir`, or set
 `ExecutorConfig.spec_dec_config.mtp_draft_engine_path` through the Python bindings.
 The C++ worker primes draft KV from shifted prompt/hidden-state pairs, refreshes
-one candidate per iteration, and retains only the accepted prefix. Requests run
+one candidate per request per iteration, and retains only each accepted prefix.
+Draft KV, lengths, and hidden-state slices are keyed by request ID. Prefills are
+batched with packed MRoPE coefficients; accepted single/two-token extensions
+run in separate generation groups. Requests run
 until EOS or their output limit; the last single-token position uses ordinary
-verification-free decoding. Request termination releases the draft history.
+verification-free decoding. Request termination, cancellation, and pause release only that request's draft history.
 
-This path requires BF16, K=1, TP=PP=CP=1, beam width one, `top_k=1`, and runtime
-`max_batch_size=1`. Disable prefix reuse, chunked context, overlap, and CUDA graphs.
+This path requires BF16, K=1, TP=PP=CP=1, beam width one, and `top_k=1`.
+Build both engines for at least the runtime `max_batch_size`. Rebuild old target
+engines to enable variable generation lengths before using batched native MTP.
+The target can mix prefill and generation, and generation requests may have one
+or two packed tokens. Disable prefix reuse, chunked context, overlap, and CUDA graphs.
 Returned generation logits/log probabilities, guided decoding, disaggregation, and prompt
 embeddings are unsupported. Draft argmax currently copies the last logits row to
-CPU and synchronizes each step; this is a correctness baseline with no throughput
-improvement claim. Batched drafting and compact recurrent-state replay remain
-future work.
+CPU and synchronizes each draft group. Continuous draft KV is packed and copied
+back per request on each forward. This is a correctness baseline with no throughput
+improvement claim; GPU argmax, fewer copies, and compact recurrent-state replay
+remain future work. BF16 computation is not bitwise invariant to batch shape:
+near-tied logits can select different greedy tokens even without MTP. Regression
+tests require matching token prefixes and check the reference logits explicitly
+for the final mixed-batch token, allowing at most one BF16 rounding unit.
 
 `tests/unittest/trt/model/test_qwen35_native_mtp.py` compares persistent generation
 with target greedy decoding, including output limits, cache block boundaries,
-EOS, and request reuse. Set `LLM_MODELS_ROOT` to the checkpoint parent directory.
+EOS, request reuse, multiple active requests, and staggered arrivals with mixed
+output budgets. Scheduler statistics check that generation actually runs
+concurrently and overlaps with prefill. Set `LLM_MODELS_ROOT` to the checkpoint parent directory.
 `QWEN35_MTP_ENGINE_DIR` optionally reuses engines built by this demo.
 
 ### Native MTP generation with persistent TensorRT Sessions
@@ -281,7 +294,7 @@ small enough to retain per-step snapshots.
 
 The original roadmap below remains useful for tracking broader support.
 Stages 1–6 have restricted K=1 verification implementations, and stage 7 now
-has native Session and automatic C++ executor baselines. General K, batched drafting,
+has native Session and automatic C++ executor baselines. General K,
 compact replay, and optimized/distributed configurations remain future work:
 
 | Stage | Implementation | Test types |

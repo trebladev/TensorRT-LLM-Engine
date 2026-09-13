@@ -217,16 +217,27 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         maxSeqLen = inputDesc[getInputTensorIdx()].dims.d[1];
     }
 
-    // only support context or generation, not for both of them
+    // Packed stateful execution supports independent context and generation lengths.
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getHostRequestTypesIdx()]);
 
     auto const numTokens = mRemovePadding ? inputDesc[getInputTensorIdx()].dims.d[0] : batchSize;
-    bool const isVerification = reqTypes[0] == RequestType::kGENERATION && numTokens != batchSize;
+    bool const hasContext
+        = std::any_of(reqTypes, reqTypes + batchSize, [](RequestType type) { return type == RequestType::kCONTEXT; });
+    bool const hasGeneration = std::any_of(
+        reqTypes, reqTypes + batchSize, [](RequestType type) { return type == RequestType::kGENERATION; });
+    TLLM_CHECK_WITH_INFO(!hasContext || !hasGeneration || (mRemovePadding && mUseInitialStateMask),
+        "Mixed Conv context/generation requires packed input and an initial-state mask");
+    bool const isVerification = !hasContext && numTokens != batchSize;
+    if (hasContext && hasGeneration)
+    {
+        maxSeqLen = std::max(maxSeqLen, 2);
+    }
     if (isVerification)
     {
         constexpr int kVerificationTokens = 2;
-        TLLM_CHECK_WITH_INFO(mRemovePadding && mUseInitialStateMask && numTokens == kVerificationTokens * batchSize,
-            "Conv verification requires two packed tokens per request and an initial-state mask");
+        TLLM_CHECK_WITH_INFO(mRemovePadding && mUseInitialStateMask && numTokens >= batchSize
+                && numTokens <= kVerificationTokens * batchSize,
+            "Conv verification requires one or two packed tokens per request and an initial-state mask");
         maxSeqLen = kVerificationTokens;
     }
 
@@ -247,10 +258,14 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         auto const maskIdx = getHostHasInitialStateIdx();
         auto const maskType = inputDesc[maskIdx].type;
         auto const* hostHasInitialState = inputs[maskIdx];
-        if (reqTypes[0] == RequestType::kGENERATION)
+        if (hasGeneration)
         {
             for (int requestIdx = 0; requestIdx < batchSize; ++requestIdx)
             {
+                if (reqTypes[requestIdx] != RequestType::kGENERATION)
+                {
+                    continue;
+                }
                 auto const hasState = maskType == DataType::kINT32
                     ? static_cast<int32_t const*>(hostHasInitialState)[requestIdx]
                     : static_cast<int8_t const*>(hostHasInitialState)[requestIdx];
@@ -258,7 +273,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
                     hasState == 1, "MambaConv1d generation request %d does not have an initial state", requestIdx);
             }
         }
-        if (reqTypes[0] == RequestType::kCONTEXT || isVerification)
+        if (hasContext || isVerification)
         {
             if (maskType == DataType::kINT32)
             {
@@ -303,7 +318,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
             "Conv snapshot mapping must contain one slot (or -1) per packed token");
         mambaConv1dParams.snapshot_slot_mapping_ptr = static_cast<int32_t const*>(inputs[idx]);
     }
-    if (reqTypes[0] == RequestType::kCONTEXT || isVerification)
+    if (hasContext || isVerification)
     {
         invokeMambaConv1dContext<T>(mambaConv1dParams, stream);
     }

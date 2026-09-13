@@ -729,7 +729,7 @@ def test_qwen35_external_draft_verification(
         (2, True, 1, True, False, "one external draft token"),
         (1, True, 2, True, False, "TP=1"),
         (1, True, 1, False, False, "use_cache=true"),
-        (1, True, 1, True, True, "variable generation lengths"),
+        (0, False, 1, True, True, "Variable generation lengths require K=1"),
     ],
 )
 def test_qwen35_verification_rejects_unsupported_settings(
