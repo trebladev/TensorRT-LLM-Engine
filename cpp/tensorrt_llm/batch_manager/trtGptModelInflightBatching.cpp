@@ -16,6 +16,7 @@
  */
 
 #include "trtGptModelInflightBatching.h"
+#include "qwen35MtpWorker.h"
 
 #include "tensorrt_llm/batch_manager/allocateKvCache.h"
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
@@ -309,6 +310,24 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mSeamlessLADMaxDraftLen = modelConfig.getMaxDecodingDraftTokens();
         // TODO: enable it when speculativeDecodingMode is None and run with '--lookahead_config'
         mUseSeamlessLookahead = false;
+    }
+
+    auto const nativeSpecConfig = executorConfig.getSpecDecConfig();
+    if (nativeSpecConfig && nativeSpecConfig->mtpDraftEnginePath)
+    {
+        TLLM_CHECK_WITH_INFO(mModelConfig.isAttentionLinearHybrid()
+                && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+                && mModelConfig.getDataType() == nvinfer1::DataType::kBF16 && mWorldConfig.getSize() == 1
+                && getMaxBatchSize() == 1 && getMaxBeamWidth() == 1,
+            "Native Qwen3.5 MTP requires a BF16 K=1 hybrid target, single rank, and max_batch_size=1");
+        TLLM_CHECK_WITH_INFO(!isTrtOverlap() && !isCudaGraphMode() && !nativeSpecConfig->fastLogits
+                && !executorConfig.getCacheTransceiverConfig() && !executorConfig.getGuidedDecodingConfig(),
+            "Native MTP does not support overlap, CUDA graphs, fast logits, disaggregation, or guided decoding");
+        TLLM_CHECK_WITH_INFO(
+            mRuntime->getEngine().getTensorIOMode("mtp_hidden_states") == nvinfer1::TensorIOMode::kOUTPUT,
+            "Build the native MTP target with capture_mtp_hidden_states=True");
+        mNativeMtp = std::make_unique<Qwen35MtpWorker>(*nativeSpecConfig->mtpDraftEnginePath, mLogger.get(),
+            getMaxSequenceLen(), mModelConfig.getHiddenSize(), mModelConfig.getVocabSize());
     }
 
     setupSpeculativeDecodingModule(mDecodingConfig);
@@ -1038,6 +1057,10 @@ void TrtGptModelInflightBatching::createRuntimePerfKnobsTensor(
 
 void TrtGptModelInflightBatching::terminateRequest(LlmRequestPtr const& llmReq, bool pause)
 {
+    if (mNativeMtp)
+    {
+        mNativeMtp->release(llmReq->mRequestId);
+    }
     utils::terminateRequest(
         *mSeqSlotManager, *llmReq, getMaxInputLen(), mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager, pause);
 }
@@ -1136,6 +1159,18 @@ void TrtGptModelInflightBatching::forwardSync()
                         llmReq->setState(LlmRequestState::kGENERATION_COMPLETE);
                         terminateRequest(llmReq);
                     }
+                }
+            }
+        }
+
+        if (mNativeMtp)
+        {
+            for (auto const& request : currRequests.generationRequests)
+            {
+                if (mReqIdsToPause.count(request->mRequestId))
+                {
+                    mNativeMtp->release(request->mRequestId);
+                    request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>());
                 }
             }
         }
@@ -1304,6 +1339,15 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
             = (*mMicroBatchScheduler)(fittingRequests, mInflightReqIds, mMaxBatchSizeRuntime, mMaxNumTokensRuntime);
         TLLM_CHECK(currRequests.size() <= static_cast<size_t>(getMaxBatchSize()));
+
+        if (mNativeMtp)
+        {
+            for (auto const& request : requestsToPause)
+            {
+                mNativeMtp->release(request->mRequestId);
+                request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>());
+            }
+        }
 
         (*mPauseRequests)(requestsToPause, mInflightReqIds, mReqIdsToPause, false, *mSeqSlotManager, mKvCacheManager,
             mCrossKvCacheManager, mPeftCacheManager);
@@ -1615,6 +1659,17 @@ void TrtGptModelInflightBatching::verifyRequests(RequestList const& activeReques
         TLLM_CHECK_WITH_INFO(draftLength <= maxDraftLength,
             "Number of draft tokens (%d) is larger than maximum number of draft tokens (%d)", draftLength,
             maxDraftLength);
+
+        if (mNativeMtp)
+        {
+            auto const& topK = llmReq->mSamplingConfig.topK;
+            TLLM_CHECK_WITH_INFO(topK && topK->size() == 1 && topK->front() == 1 && beamWidth == 1
+                    && !llmReq->getDraftLogits() && !llmReq->getPromptEmbeddingTable()
+                    && !llmReq->getReturnGenerationLogits() && !llmReq->returnLogProbs(),
+                "Native MTP requires greedy text requests without draft logits or returned logits/log probabilities");
+            TLLM_CHECK_WITH_INFO(!llmReq->isContextInitState() || draftLength == 0,
+                "Native MTP generates its own candidates; do not provide external draft tokens");
+        }
 
         if (mModelConfig.isAttentionLinearHybrid() && draftLength > 0)
         {
@@ -2128,6 +2183,13 @@ void TrtGptModelInflightBatching::executeStep(
     }
 
     executeContext(optProfileId, bufferId);
+    if (mNativeMtp)
+    {
+        TLLM_CHECK(contextRequests.size() + generationRequests.size() == 1);
+        auto const& request = contextRequests.empty() ? generationRequests.front() : contextRequests.front();
+        mNativeMtp->capture(request->mRequestId, !contextRequests.empty(), outputMap.at("mtp_hidden_states"),
+            inputMap.at("mrope_rotary_cos_sin"), inputMap.at("mrope_position_deltas"));
+    }
 
     // If batch state has any context request, do not capture this graph.
     if (isCudaGraphMode() && contextRequests.empty())
@@ -2513,6 +2575,12 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
+    if (mNativeMtp)
+    {
+        mCreateNewDecoderRequests->refreshExternalDraftTokens(scheduledRequests.generationRequests, *mDecoderState,
+            mModelConfig, mWorldConfig, *mDecoder->getDecoderStream());
+    }
+
     auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
 
     auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -2786,8 +2854,31 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             mKvCacheManager->rewindKVCache(llmReq->mRequestId, 2 - selectedRecord);
         }
 
+        // External-draft acceptance excludes EOS from the reported sequence length.
+        // Native generation returns the terminal token just like ordinary greedy decoding.
+        if (mNativeMtp && finishReasonsHostData[seqSlot].isFinishedEOS() && llmReq->mEndId
+            && (numNewTokens[0] == 0 || llmReq->getTokens(0).back() != *llmReq->mEndId)
+            && llmReq->getMaxNumGeneratedTokens() < llmReq->mMaxNewTokens)
+        {
+            llmReq->addNewToken(*llmReq->mEndId, 0);
+        }
+
         // Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
         llmReq->updateNumTokensPerIteration(llmReq->getMaxBeamNumTokens() - currentNumOfTokens, mModelConfig);
+
+        if (mNativeMtp && decoderFinishedSumPtr[seqSlot] != reqBeamWidth)
+        {
+            auto const remaining = llmReq->mMaxNewTokens - llmReq->getMaxNumGeneratedTokens();
+            auto nextDraft = std::make_shared<std::vector<TokenIdType>>();
+            if (remaining > 1)
+            {
+                auto const& tokens = llmReq->getTokens(0);
+                auto const begin = mNativeMtp->isContext() ? 1 : currentNumOfTokens;
+                std::vector<TokenIdType> acceptedTokens(tokens.begin() + begin, tokens.end());
+                nextDraft->push_back(mNativeMtp->draft(acceptedTokens));
+            }
+            llmReq->setDraftTokens(nextDraft);
+        }
 
         // Fill new draft tokens for the next step
         if (decoderFinishedSumPtr[seqSlot] != reqBeamWidth
@@ -2843,7 +2934,8 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 
         // Terminate if request has finished or if it is speculative decoding target model
         if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
-            || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
+            || (!mNativeMtp && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+                && llmReq->hasDraftTokens()))
         {
             postProcessRequest(*llmReq, numDroppedTokens);
 

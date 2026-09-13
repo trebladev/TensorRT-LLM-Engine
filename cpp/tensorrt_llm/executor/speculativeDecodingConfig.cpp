@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +27,7 @@ SpeculativeDecodingConfig::SpeculativeDecodingConfig(bool inFastLogits)
 
 bool SpeculativeDecodingConfig::operator==(SpeculativeDecodingConfig const& other) const
 {
-    return fastLogits == other.fastLogits;
+    return fastLogits == other.fastLogits && mtpDraftEnginePath == other.mtpDraftEnginePath;
 }
 
 Tensor SpeculativeDecodingFastLogitsInfo::toTensor() const

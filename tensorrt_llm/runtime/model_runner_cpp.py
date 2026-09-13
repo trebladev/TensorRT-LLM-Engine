@@ -133,6 +133,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         mm_embedding_offloading: bool = False,
         fail_fast_on_attention_window_too_large: bool = False,
         normalize_log_probs: bool = False,
+        mtp_draft_engine_path: Optional[str] = None,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -187,6 +188,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Maximum amount of tokens configured in kv cache.
             kv_cache_enable_block_reuse (bool):
                 Enables block reuse in kv cache.
+            mtp_draft_engine_path (str):
+                Optional native Qwen3.5 K=1 draft engine for single-request BF16 greedy generation.
             enable_chunked_context (bool):
                 Enables chunked context.
             is_enc_dec (bool):
@@ -411,6 +414,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             gather_generation_logits=gather_generation_logits,
             normalize_log_probs=normalize_log_probs,
         )
+        if mtp_draft_engine_path is not None:
+            spec_config = trtllm.SpeculativeDecodingConfig()
+            spec_config.mtp_draft_engine_path = mtp_draft_engine_path
+            trtllm_config.spec_dec_config = spec_config
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
         trtllm_config.mm_embedding_offloading = mm_embedding_offloading

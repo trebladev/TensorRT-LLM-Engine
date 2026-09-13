@@ -32,8 +32,8 @@ from .mtp import Qwen35MTPGenerator, Qwen35MTPSession
 from .target_verification_demo import build_session
 
 
-def build_draft_session(model: Qwen35MTP, max_seq_len: int) -> Qwen35MTPSession:
-    """Build a continuous-KV draft engine for one persistent request."""
+def build_draft_engine(model: Qwen35MTP, max_seq_len: int) -> trt.IHostMemory:
+    """Build a serializable continuous-KV draft engine for one request."""
     builder = Builder()
     builder_config = builder.create_builder_config(precision="bfloat16", strongly_typed=True)
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
@@ -63,6 +63,12 @@ def build_draft_session(model: Qwen35MTP, max_seq_len: int) -> Qwen35MTPSession:
     engine = builder.build_engine(network, builder_config)
     if engine is None:
         raise RuntimeError("Failed to build the MTP draft engine")
+    return engine
+
+
+def build_draft_session(model: Qwen35MTP, max_seq_len: int) -> Qwen35MTPSession:
+    """Build a continuous-KV draft Session for one persistent request."""
+    engine = build_draft_engine(model, max_seq_len)
     return Qwen35MTPSession(Session.from_serialized_engine(engine), model.config, max_seq_len)
 
 

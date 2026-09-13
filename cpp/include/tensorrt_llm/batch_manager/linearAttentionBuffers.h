@@ -72,6 +72,9 @@ private:
     TensorPtr mSpecDecodingLengths;
     TensorPtr mSpecDecodingOffsets;
     TensorPtr mSpecDecodingMask;
+    TensorPtr mSpecDecodingLengthsHost;
+    TensorPtr mSpecDecodingOffsetsHost;
+    TensorPtr mSpecDecodingMaskHost;
 };
 
 } // namespace tensorrt_llm::batch_manager

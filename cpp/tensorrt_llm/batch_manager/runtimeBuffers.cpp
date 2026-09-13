@@ -128,6 +128,11 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
     inputsIds = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
+    if (engine.getTensorIOMode("mtp_hidden_states") == nvinfer1::TensorIOMode::kOUTPUT)
+    {
+        mtpHiddenStates = manager.emptyTensor(MemoryType::kGPU, modelConfig.getDataType());
+    }
+
     if (worldConfig.isPipelineParallel())
     {
         hiddenStates = manager.emptyTensor(MemoryType::kGPU, modelConfig.getDataType());
@@ -396,6 +401,10 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
 
     auto const numTokens = getNumTokens();
     inputsIds->reshape(ITensor::makeShape({numTokens}));
+    if (mtpHiddenStates)
+    {
+        mtpHiddenStates->reshape(ITensor::makeShape({numTokens, modelConfig.getHiddenSize()}));
+    }
 
     if (modelConfig.useMrope())
     {
@@ -995,6 +1004,10 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
     {
         // feed a view to TensorRT runtime so reshaping does not change logits buffer
         outputMap.insert_or_assign(kLogitsTensorName, ITensor::view(logits));
+        if (mtpHiddenStates)
+        {
+            outputMap.insert_or_assign("mtp_hidden_states", mtpHiddenStates);
+        }
     }
     else
     {

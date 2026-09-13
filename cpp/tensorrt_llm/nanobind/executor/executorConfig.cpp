@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -377,19 +377,25 @@ void initConfigBindings(nb::module_& m)
         .def("__getstate__", extendedRuntimePerfKnobConfigGetstate)
         .def("__setstate__", extendedRuntimePerfKnobConfigSetstate);
 
-    auto SpeculativeDecodingConfigGetState
-        = [](tle::SpeculativeDecodingConfig const& self) { return nb::make_tuple(self.fastLogits); };
+    auto SpeculativeDecodingConfigGetState = [](tle::SpeculativeDecodingConfig const& self)
+    { return nb::make_tuple(self.fastLogits, self.mtpDraftEnginePath); };
     auto SpeculativeDecodingConfigSetState = [](tle::SpeculativeDecodingConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 1)
+        if (state.size() != 1 && state.size() != 2)
         {
             throw std::runtime_error("Invalid SpeculativeDecodingConfig state!");
         }
         new (&self) tle::SpeculativeDecodingConfig(nb::cast<bool>(state[0]));
+        if (state.size() == 2)
+        {
+            self.mtpDraftEnginePath = nb::cast<std::optional<std::string>>(state[1]);
+        }
     };
     nb::class_<tle::SpeculativeDecodingConfig>(m, "SpeculativeDecodingConfig")
         .def(nb::init<bool>(), nb::arg("fast_logits") = false)
         .def_rw("fast_logits", &tle::SpeculativeDecodingConfig::fastLogits)
+        .def_rw("mtp_draft_engine_path", &tle::SpeculativeDecodingConfig::mtpDraftEnginePath,
+            nb::arg("mtp_draft_engine_path").none())
         .def("__getstate__", SpeculativeDecodingConfigGetState)
         .def("__setstate__", SpeculativeDecodingConfigSetState);
 

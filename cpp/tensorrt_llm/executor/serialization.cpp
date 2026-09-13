@@ -1698,18 +1698,22 @@ size_t Serialization::serializedSize(EagleConfig const& eagleConfig)
 SpeculativeDecodingConfig Serialization::deserializeSpeculativeDecodingConfig(std::istream& is)
 {
     auto fastLogits = su::deserialize<decltype(SpeculativeDecodingConfig::fastLogits)>(is);
-    return SpeculativeDecodingConfig(fastLogits);
+    SpeculativeDecodingConfig config(fastLogits);
+    config.mtpDraftEnginePath = su::deserialize<decltype(config.mtpDraftEnginePath)>(is);
+    return config;
 }
 
 void Serialization::serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os)
 {
     su::serialize(specDecConfig.fastLogits, os);
+    su::serialize(specDecConfig.mtpDraftEnginePath, os);
 }
 
 size_t Serialization::serializedSize(SpeculativeDecodingConfig const& specDecConfig)
 {
     size_t totalSize = 0;
     totalSize += su::serializedSize(specDecConfig.fastLogits);
+    totalSize += su::serializedSize(specDecConfig.mtpDraftEnginePath);
     return totalSize;
 }
 

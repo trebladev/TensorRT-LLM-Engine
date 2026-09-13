@@ -58,7 +58,8 @@ class MpiWaitThread;
 namespace tensorrt_llm::batch_manager
 {
 class BaseCacheTransceiver;
-}
+class Qwen35MtpWorker;
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager
 {
@@ -495,6 +496,7 @@ private:
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     // Runner for the TRT engine. The engine produces logits.
     std::unique_ptr<runtime::TllmRuntime> mRuntime;
+    std::unique_ptr<Qwen35MtpWorker> mNativeMtp;
     // Decoder that generates new tokens from the logits.
     std::unique_ptr<runtime::GptDecoderBatched> mDecoder;
     // Decoder state for all requests

@@ -51,6 +51,7 @@ set(SRCS
     pauseRequests.cpp
     peftCacheManager.cpp
     promptTuningBuffers.cpp
+    qwen35MtpWorker.cpp
     rnnStateBuffers.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp

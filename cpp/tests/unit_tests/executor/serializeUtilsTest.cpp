@@ -823,6 +823,9 @@ TEST(SerializeUtilsTest, ExecutorConfig)
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
         std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
         texec::CacheTransceiverConfig(std::nullopt, 1024, 100, 1000), true, true, true);
+    auto specConfig = executorConfig.getSpecDecConfig().value();
+    specConfig.mtpDraftEnginePath = "/tmp/qwen35/mtp.engine";
+    executorConfig.setSpecDecConfig(specConfig);
     auto executorConfig2 = serializeDeserialize(executorConfig);
 
     EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());

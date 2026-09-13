@@ -132,6 +132,7 @@ private:
 
     //! General
     TensorPtr inputsIds;
+    TensorPtr mtpHiddenStates;
 
     TensorPtr contextLengthsHost;
     TensorPtr contextLengthsDevice;

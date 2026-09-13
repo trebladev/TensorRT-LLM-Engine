@@ -525,6 +525,9 @@ public:
     /// @brief Send logits tensor directly from draft to target model.
     bool fastLogits;
 
+    /// @brief Optional native Qwen3.5 K=1 draft engine; BF16, single-rank, batch one.
+    std::optional<std::string> mtpDraftEnginePath;
+
 private:
     friend class Serialization;
 };
