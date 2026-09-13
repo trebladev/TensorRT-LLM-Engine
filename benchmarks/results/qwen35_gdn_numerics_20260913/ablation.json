@@ -1,0 +1,83 @@
+{
+  "ablations": [
+    {
+      "mode": 0,
+      "output_vs_chunk": {
+        "max_abs": 0.00048828125,
+        "relative_l2": 0.001792003633454442,
+        "unequal": 6550,
+        "count": 16384
+      },
+      "snapshots_vs_chunk": {
+        "max_abs": 0.00775456428527832,
+        "relative_l2": 0.00040430802619084716,
+        "unequal": 1044473,
+        "count": 1048576
+      },
+      "output_vs_captured_fast": {
+        "max_abs": 9.313225746154785e-10,
+        "relative_l2": 1.4090117961274018e-09,
+        "unequal": 1,
+        "count": 16384
+      },
+      "snapshots_vs_captured_fast": {
+        "max_abs": 4.76837158203125e-07,
+        "relative_l2": 2.5415863191824428e-08,
+        "unequal": 100958,
+        "count": 1048576
+      }
+    },
+    {
+      "mode": 1,
+      "output_vs_chunk": {
+        "max_abs": 0.00048828125,
+        "relative_l2": 0.001792003633454442,
+        "unequal": 6551,
+        "count": 16384
+      },
+      "snapshots_vs_chunk": {
+        "max_abs": 0.0077533721923828125,
+        "relative_l2": 0.00040430802619084716,
+        "unequal": 1044479,
+        "count": 1048576
+      }
+    },
+    {
+      "mode": 2,
+      "output_vs_chunk": {
+        "max_abs": 0.00048828125,
+        "relative_l2": 0.001521500525996089,
+        "unequal": 5547,
+        "count": 16384
+      },
+      "snapshots_vs_chunk": {
+        "max_abs": 0.0024337172508239746,
+        "relative_l2": 0.00032376055605709553,
+        "unequal": 1044456,
+        "count": 1048576
+      }
+    }
+  ],
+  "norms": {
+    "q": {
+      "min_norm": 0.20437411963939667,
+      "max_norm": 8.628128051757812,
+      "epsilon_change": {
+        "max_abs": 5.662441253662109e-06,
+        "relative_l2": 1.4982778111516382e-06,
+        "unequal": 16296,
+        "count": 16384
+      }
+    },
+    "k": {
+      "min_norm": 0.2065315693616867,
+      "max_norm": 1.8314685821533203,
+      "epsilon_change": {
+        "max_abs": 2.1457672119140625e-06,
+        "relative_l2": 1.183146650873823e-06,
+        "unequal": 15745,
+        "count": 16384
+      }
+    }
+  }
+}

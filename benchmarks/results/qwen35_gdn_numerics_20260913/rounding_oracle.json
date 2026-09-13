@@ -1,0 +1,92 @@
+[
+  {
+    "omitted_rounding": "none",
+    "output": {
+      "max_abs": 3.814697265625e-06,
+      "relative_l2": 8.058328603510745e-06,
+      "unequal": 1,
+      "count": 8192
+    },
+    "snapshot": {
+      "max_abs": 4.76837158203125e-07,
+      "relative_l2": 2.5608843046143193e-08,
+      "unequal": 377391,
+      "count": 1048576
+    }
+  },
+  {
+    "omitted_rounding": "state",
+    "output": {
+      "max_abs": 0.00048828125,
+      "relative_l2": 0.0016291310312226415,
+      "unequal": 1835,
+      "count": 8192
+    },
+    "snapshot": {
+      "max_abs": 0.0025177001953125,
+      "relative_l2": 0.00019772005907725543,
+      "unequal": 569887,
+      "count": 1048576
+    }
+  },
+  {
+    "omitted_rounding": "wu",
+    "output": {
+      "max_abs": 0.00048828125,
+      "relative_l2": 0.0012465682812035084,
+      "unequal": 1008,
+      "count": 8192
+    },
+    "snapshot": {
+      "max_abs": 0.003204345703125,
+      "relative_l2": 0.00037313770735636353,
+      "unequal": 755680,
+      "count": 1048576
+    }
+  },
+  {
+    "omitted_rounding": "residual",
+    "output": {
+      "max_abs": 0.000244140625,
+      "relative_l2": 0.000790411839261651,
+      "unequal": 900,
+      "count": 8192
+    },
+    "snapshot": {
+      "max_abs": 0.0034487247467041016,
+      "relative_l2": 0.00021837730309925973,
+      "unequal": 1040892,
+      "count": 1048576
+    }
+  },
+  {
+    "omitted_rounding": "qk",
+    "output": {
+      "max_abs": 0.00048828125,
+      "relative_l2": 0.0010901778005063534,
+      "unequal": 909,
+      "count": 8192
+    },
+    "snapshot": {
+      "max_abs": 4.76837158203125e-07,
+      "relative_l2": 2.5608843046143193e-08,
+      "unequal": 377391,
+      "count": 1048576
+    }
+  },
+  {
+    "omitted_rounding": "all",
+    "output": {
+      "max_abs": 0.00048828125,
+      "relative_l2": 0.0016252037603408098,
+      "unequal": 2691,
+      "count": 8192
+    },
+    "snapshot": {
+      "max_abs": 0.0024337172508239746,
+      "relative_l2": 0.00032376364106312394,
+      "unequal": 1044456,
+      "count": 1048576
+    }
+  }
+]

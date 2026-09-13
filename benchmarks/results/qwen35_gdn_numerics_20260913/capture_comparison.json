@@ -1,0 +1,1136 @@
+[
+  {
+    "gdn_index": 0,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.00048828125,
+      "rmse": 9.255088116333354e-06,
+      "relative_l2": 0.0017920049140229821,
+      "unequal": 6550,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.00775456428527832,
+      "rmse": 1.824842365749646e-05,
+      "relative_l2": 0.0004043102962896228,
+      "unequal": 1044480,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 1,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.01171875,
+      "rmse": 0.00037287321174517274,
+      "relative_l2": 0.005218796897679567,
+      "unequal": 10157,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.0078125,
+      "rmse": 0.00030572747346013784,
+      "relative_l2": 0.004417892079800367,
+      "unequal": 8271,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.0078125,
+      "rmse": 0.00022914250439498574,
+      "relative_l2": 0.003736142534762621,
+      "unequal": 7900,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.010486245155334473,
+      "rmse": 0.0027320089284330606,
+      "relative_l2": 0.0031725293956696987,
+      "unequal": 82,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.004180908203125,
+      "rmse": 0.0011425375705584884,
+      "relative_l2": 0.0018300480442121625,
+      "unequal": 87,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.0001220703125,
+      "rmse": 2.6532241008681012e-06,
+      "relative_l2": 0.0044270833022892475,
+      "unequal": 11414,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.007634758949279785,
+      "rmse": 2.5493292923783883e-05,
+      "relative_l2": 0.002313195029273629,
+      "unequal": 1048449,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 2,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0006752489716745913,
+      "relative_l2": 0.005331035237759352,
+      "unequal": 11321,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.03125,
+      "rmse": 0.0007858707685954869,
+      "relative_l2": 0.00636008707806468,
+      "unequal": 9505,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.0078125,
+      "rmse": 0.00030845709261484444,
+      "relative_l2": 0.005064668133854866,
+      "unequal": 9109,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.013270854949951172,
+      "rmse": 0.0023257529828697443,
+      "relative_l2": 0.003229256486520171,
+      "unequal": 94,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.0055588483810424805,
+      "rmse": 0.001443567220121622,
+      "relative_l2": 0.0026220905128866434,
+      "unequal": 76,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.000244140625,
+      "rmse": 5.289900855132146e-06,
+      "relative_l2": 0.003946939017623663,
+      "unequal": 11815,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.002568274736404419,
+      "rmse": 1.4723343156219926e-05,
+      "relative_l2": 0.001363008632324636,
+      "unequal": 1048510,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 3,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.03125,
+      "rmse": 0.0012489545624703169,
+      "relative_l2": 0.0072066644206643105,
+      "unequal": 12371,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.046875,
+      "rmse": 0.0012301106471568346,
+      "relative_l2": 0.007026746403425932,
+      "unequal": 9131,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.03125,
+      "rmse": 0.0009373936918564141,
+      "relative_l2": 0.005115134175866842,
+      "unequal": 9470,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.028177499771118164,
+      "rmse": 0.004263074602931738,
+      "relative_l2": 0.0062656463123857975,
+      "unequal": 109,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.004258692264556885,
+      "rmse": 0.001311317435465753,
+      "relative_l2": 0.0027532228268682957,
+      "unequal": 80,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.00390625,
+      "rmse": 6.201727228472009e-05,
+      "relative_l2": 0.0054015954956412315,
+      "unequal": 12128,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.006831556558609009,
+      "rmse": 2.994925671373494e-05,
+      "relative_l2": 0.0005070332554168999,
+      "unequal": 1048450,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 4,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.03125,
+      "rmse": 0.0013083437224850059,
+      "relative_l2": 0.008526510559022427,
+      "unequal": 12303,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.033203125,
+      "rmse": 0.0009494476835243404,
+      "relative_l2": 0.005907748360186815,
+      "unequal": 9797,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.015625,
+      "rmse": 0.0004739496507681906,
+      "relative_l2": 0.004262247122824192,
+      "unequal": 10092,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.005581021308898926,
+      "rmse": 0.0006587862153537571,
+      "relative_l2": 0.004771388601511717,
+      "unequal": 89,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.0035615116357803345,
+      "rmse": 0.0012620107736438513,
+      "relative_l2": 0.003296484239399433,
+      "unequal": 78,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.00048828125,
+      "rmse": 8.65781657921616e-06,
+      "relative_l2": 0.003138516563922167,
+      "unequal": 11800,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.002071589231491089,
+      "rmse": 1.3711091924051289e-05,
+      "relative_l2": 0.0007263240986503661,
+      "unequal": 1048415,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 5,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.046875,
+      "rmse": 0.0013311528600752354,
+      "relative_l2": 0.008908665738999844,
+      "unequal": 12794,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.0625,
+      "rmse": 0.0010857702000066638,
+      "relative_l2": 0.009304639883339405,
+      "unequal": 10309,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.0078125,
+      "rmse": 0.0003900021256413311,
+      "relative_l2": 0.006827378645539284,
+      "unequal": 9752,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.014138340950012207,
+      "rmse": 0.0021125338971614838,
+      "relative_l2": 0.005479026585817337,
+      "unequal": 93,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.008045703172683716,
+      "rmse": 0.0022380768787115812,
+      "relative_l2": 0.004858534317463636,
+      "unequal": 92,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.000244140625,
+      "rmse": 5.414659426605795e-06,
+      "relative_l2": 0.0056085847318172455,
+      "unequal": 12789,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.0019302666187286377,
+      "rmse": 1.1822398846561555e-05,
+      "relative_l2": 0.0011924684513360262,
+      "unequal": 1048398,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 6,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0014016643399372697,
+      "relative_l2": 0.009136524982750416,
+      "unequal": 12931,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.015625,
+      "rmse": 0.0007403505151160061,
+      "relative_l2": 0.0067500886507332325,
+      "unequal": 9779,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.015625,
+      "rmse": 0.00044924308895133436,
+      "relative_l2": 0.006164313293993473,
+      "unequal": 11238,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.005428791046142578,
+      "rmse": 0.0009807022288441658,
+      "relative_l2": 0.005422950256615877,
+      "unequal": 93,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.0036430954933166504,
+      "rmse": 0.0012947277864441276,
+      "relative_l2": 0.002761378651484847,
+      "unequal": 89,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.00048828125,
+      "rmse": 1.1142724360979628e-05,
+      "relative_l2": 0.00524857547134161,
+      "unequal": 12840,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.0012390948832035065,
+      "rmse": 1.396638708683895e-05,
+      "relative_l2": 0.0008226829231716692,
+      "unequal": 1048468,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 7,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0012544868513941765,
+      "relative_l2": 0.009747814387083054,
+      "unequal": 13302,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.03125,
+      "rmse": 0.0007973790052346885,
+      "relative_l2": 0.00849244650453329,
+      "unequal": 9890,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.014404296875,
+      "rmse": 0.00037116240127943456,
+      "relative_l2": 0.0044679236598312855,
+      "unequal": 10078,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.0025696158409118652,
+      "rmse": 0.0005351097206585109,
+      "relative_l2": 0.005997208412736654,
+      "unequal": 89,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.00847858190536499,
+      "rmse": 0.0017558237304911017,
+      "relative_l2": 0.005102984141558409,
+      "unequal": 75,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.0001220703125,
+      "rmse": 3.622103804445942e-06,
+      "relative_l2": 0.005020492244511843,
+      "unequal": 12310,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.0024454593658447266,
+      "rmse": 9.562389095663093e-06,
+      "relative_l2": 0.001030075247399509,
+      "unequal": 1048179,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 8,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0013036930467933416,
+      "relative_l2": 0.009758273139595985,
+      "unequal": 13126,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0006880138535052538,
+      "relative_l2": 0.008326559327542782,
+      "unequal": 10767,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.005859375,
+      "rmse": 0.00031180732185021043,
+      "relative_l2": 0.008526850491762161,
+      "unequal": 10448,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.010423362255096436,
+      "rmse": 0.0014239209704101086,
+      "relative_l2": 0.004677433520555496,
+      "unequal": 109,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.006035953760147095,
+      "rmse": 0.0016537447227165103,
+      "relative_l2": 0.00328067853115499,
+      "unequal": 81,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 6.103515625e-05,
+      "rmse": 2.4737094008742133e-06,
+      "relative_l2": 0.006507267244160175,
+      "unequal": 12904,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.0018313229084014893,
+      "rmse": 1.4002675015944988e-05,
+      "relative_l2": 0.002412106143310666,
+      "unequal": 1048473,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 9,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.03125,
+      "rmse": 0.0016763887833803892,
+      "relative_l2": 0.008217786438763142,
+      "unequal": 13034,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.078125,
+      "rmse": 0.001408460084348917,
+      "relative_l2": 0.009369191713631153,
+      "unequal": 9324,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.02734375,
+      "rmse": 0.0007647736347280443,
+      "relative_l2": 0.00991862453520298,
+      "unequal": 11012,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.005984365940093994,
+      "rmse": 0.0006932836840860546,
+      "relative_l2": 0.009798434562981129,
+      "unequal": 96,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.005599617958068848,
+      "rmse": 0.0015326120192185044,
+      "relative_l2": 0.006267963908612728,
+      "unequal": 81,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.000732421875,
+      "rmse": 1.5993300621630624e-05,
+      "relative_l2": 0.0068718018010258675,
+      "unequal": 12358,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.0039215087890625,
+      "rmse": 1.2170883564976975e-05,
+      "relative_l2": 0.0006694405456073582,
+      "unequal": 1048264,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 10,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0013712650397792459,
+      "relative_l2": 0.007936481386423111,
+      "unequal": 13144,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.03125,
+      "rmse": 0.0011254334822297096,
+      "relative_l2": 0.007993508130311966,
+      "unequal": 10395,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.015625,
+      "rmse": 0.00042170414235442877,
+      "relative_l2": 0.008190729655325413,
+      "unequal": 11588,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.00529402494430542,
+      "rmse": 0.0011835041223093867,
+      "relative_l2": 0.005851844325661659,
+      "unequal": 96,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.005962193012237549,
+      "rmse": 0.0018104591872543097,
+      "relative_l2": 0.004695090930908918,
+      "unequal": 89,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 9.1552734375e-05,
+      "rmse": 2.283331923536025e-06,
+      "relative_l2": 0.006407971028238535,
+      "unequal": 12846,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.0017729997634887695,
+      "rmse": 9.231092008121777e-06,
+      "relative_l2": 0.0014926623553037643,
+      "unequal": 1048317,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 11,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.125,
+      "rmse": 0.0018049506470561028,
+      "relative_l2": 0.0041757384315133095,
+      "unequal": 12545,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.013671875,
+      "rmse": 0.0008303358335979283,
+      "relative_l2": 0.009286189451813698,
+      "unequal": 10955,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.01953125,
+      "rmse": 0.00046334558282978833,
+      "relative_l2": 0.0072179376147687435,
+      "unequal": 11117,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.0050757527351379395,
+      "rmse": 0.0008615645347163081,
+      "relative_l2": 0.009481844492256641,
+      "unequal": 105,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.0036319196224212646,
+      "rmse": 0.0013903169892728329,
+      "relative_l2": 0.0033411059994250536,
+      "unequal": 84,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 7.486343383789062e-05,
+      "rmse": 2.539433580750483e-06,
+      "relative_l2": 0.004798330832272768,
+      "unequal": 12185,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.002128899097442627,
+      "rmse": 1.3549478353525046e-05,
+      "relative_l2": 0.0013871692353859544,
+      "unequal": 1048490,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 12,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0625,
+      "rmse": 0.002031841780990362,
+      "relative_l2": 0.00565505912527442,
+      "unequal": 12275,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.0546875,
+      "rmse": 0.0016874009743332863,
+      "relative_l2": 0.008161182515323162,
+      "unequal": 9780,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.03125,
+      "rmse": 0.0010017669992521405,
+      "relative_l2": 0.006870003882795572,
+      "unequal": 10717,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.00927811861038208,
+      "rmse": 0.001520868274383247,
+      "relative_l2": 0.006490323692560196,
+      "unequal": 87,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.004730343818664551,
+      "rmse": 0.001421185676008463,
+      "relative_l2": 0.0032096344511955976,
+      "unequal": 94,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.00048828125,
+      "rmse": 1.967339267139323e-05,
+      "relative_l2": 0.004866752307862043,
+      "unequal": 12261,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.00600859522819519,
+      "rmse": 4.212688872939907e-05,
+      "relative_l2": 0.00194372923579067,
+      "unequal": 1048476,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 13,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.125,
+      "rmse": 0.0026682750321924686,
+      "relative_l2": 0.004279560875147581,
+      "unequal": 11257,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.046875,
+      "rmse": 0.0018052371451631188,
+      "relative_l2": 0.006785097531974316,
+      "unequal": 8900,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.0234375,
+      "rmse": 0.0013159193331375718,
+      "relative_l2": 0.006512089166790247,
+      "unequal": 9921,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.0038725435733795166,
+      "rmse": 0.0006896078120917082,
+      "relative_l2": 0.015472013503313065,
+      "unequal": 96,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.005292415618896484,
+      "rmse": 0.0016796586569398642,
+      "relative_l2": 0.0043866909109056,
+      "unequal": 90,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.0009765625,
+      "rmse": 2.649247289809864e-05,
+      "relative_l2": 0.005483945831656456,
+      "unequal": 11565,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.006622791290283203,
+      "rmse": 5.054699431639165e-05,
+      "relative_l2": 0.0018186564557254314,
+      "unequal": 1048411,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 14,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0625,
+      "rmse": 0.001965452218428254,
+      "relative_l2": 0.004735898692160845,
+      "unequal": 11781,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.03125,
+      "rmse": 0.001803190796636045,
+      "relative_l2": 0.0063671232201159,
+      "unequal": 7878,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.03125,
+      "rmse": 0.0015798222739249468,
+      "relative_l2": 0.0059823631308972836,
+      "unequal": 9629,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.0063658952713012695,
+      "rmse": 0.0009324367856606841,
+      "relative_l2": 0.007027642801403999,
+      "unequal": 89,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.008527696132659912,
+      "rmse": 0.002067738212645054,
+      "relative_l2": 0.0037262928672134876,
+      "unequal": 98,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.0009765625,
+      "rmse": 4.080856160726398e-05,
+      "relative_l2": 0.00476525304839015,
+      "unequal": 12128,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.008409619331359863,
+      "rmse": 7.357567665167153e-05,
+      "relative_l2": 0.0019067672546952963,
+      "unequal": 1048493,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 15,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0625,
+      "rmse": 0.0018594462890177965,
+      "relative_l2": 0.004894849844276905,
+      "unequal": 11814,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.046875,
+      "rmse": 0.0023170490749180317,
+      "relative_l2": 0.008471447974443436,
+      "unequal": 9756,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.0390625,
+      "rmse": 0.0015278946375474334,
+      "relative_l2": 0.007851220667362213,
+      "unequal": 10781,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.008703231811523438,
+      "rmse": 0.0018284596735611558,
+      "relative_l2": 0.005478103645145893,
+      "unequal": 102,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.006339222192764282,
+      "rmse": 0.0019424024503678083,
+      "relative_l2": 0.0036330679431557655,
+      "unequal": 101,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.0009765625,
+      "rmse": 2.8903585189254954e-05,
+      "relative_l2": 0.004530098754912615,
+      "unequal": 11967,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.010881215333938599,
+      "rmse": 6.241701339604333e-05,
+      "relative_l2": 0.002007758943364024,
+      "unequal": 1048528,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 16,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0625,
+      "rmse": 0.002419941360130906,
+      "relative_l2": 0.003842155681923032,
+      "unequal": 11274,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.03125,
+      "rmse": 0.0018111991230398417,
+      "relative_l2": 0.006721288897097111,
+      "unequal": 9844,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.046875,
+      "rmse": 0.0013899579644203186,
+      "relative_l2": 0.008017615415155888,
+      "unequal": 11705,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.004547208547592163,
+      "rmse": 0.0010702336439862847,
+      "relative_l2": 0.016038551926612854,
+      "unequal": 89,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.007127285003662109,
+      "rmse": 0.0021498107817023993,
+      "relative_l2": 0.004330085124820471,
+      "unequal": 94,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.000732421875,
+      "rmse": 2.7925985705223866e-05,
+      "relative_l2": 0.005126175936311483,
+      "unequal": 12149,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.010426998138427734,
+      "rmse": 5.562883598031476e-05,
+      "relative_l2": 0.002290433971211314,
+      "unequal": 1048531,
+      "count": 1048576
+    }
+  },
+  {
+    "gdn_index": 17,
+    "source_state": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "relative_l2": 0.0,
+      "unequal": 0,
+      "count": 1048576
+    },
+    "query": {
+      "max_abs": 0.0625,
+      "rmse": 0.001706465263850987,
+      "relative_l2": 0.004877661820501089,
+      "unequal": 9735,
+      "count": 16384
+    },
+    "key": {
+      "max_abs": 0.03125,
+      "rmse": 0.0012162209022790194,
+      "relative_l2": 0.005302244797348976,
+      "unequal": 11340,
+      "count": 16384
+    },
+    "value": {
+      "max_abs": 0.015625,
+      "rmse": 0.0008139711571857333,
+      "relative_l2": 0.006874530576169491,
+      "unequal": 12019,
+      "count": 16384
+    },
+    "log_decay": {
+      "max_abs": 0.01826488971710205,
+      "rmse": 0.002718850737437606,
+      "relative_l2": 0.0036263111978769302,
+      "unequal": 97,
+      "count": 128
+    },
+    "beta": {
+      "max_abs": 0.0081024169921875,
+      "rmse": 0.0018474332755431533,
+      "relative_l2": 0.0031966581009328365,
+      "unequal": 87,
+      "count": 128
+    },
+    "output": {
+      "max_abs": 0.000244140625,
+      "rmse": 1.4681869288324378e-05,
+      "relative_l2": 0.005685166921466589,
+      "unequal": 12197,
+      "count": 16384
+    },
+    "source_identical": true,
+    "target_identical": true,
+    "snapshots_identical": true,
+    "cu_seqlens_identical": true,
+    "snapshot_state": {
+      "max_abs": 0.009147882461547852,
+      "rmse": 3.836882024188526e-05,
+      "relative_l2": 0.002670045243576169,
+      "unequal": 1048504,
+      "count": 1048576
+    }
+  }
+]
