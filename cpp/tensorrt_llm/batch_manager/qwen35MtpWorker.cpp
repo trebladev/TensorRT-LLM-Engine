@@ -17,6 +17,7 @@
 #include "qwen35MtpWorker.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/mtpKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 
@@ -232,11 +233,14 @@ std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> 
     TllmRuntime::TensorMap outputs;
     mRuntime.setOutputTensors(0, outputs);
     TLLM_CHECK_WITH_INFO(mRuntime.executeContext(0), "Native MTP draft engine enqueue failed");
-    std::vector<TensorPtr> hostLogits, nextKv;
+    TensorPtr selectedTokens = manager.gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+    kernels::invokeMTPPackedGreedySampling(bufferCast<float const>(*outputs.at("logits")),
+        bufferCast<SizeType32 const>(*allInputs.at("last_token_ids")), bufferCast<TokenIdType>(*selectedTokens),
+        batchSize, mVocabSize, manager.getStream().get());
+    TensorPtr hostTokens = manager.copyFrom(*selectedTokens, MemoryType::kCPU);
+    std::vector<TensorPtr> nextKv;
     for (SizeType32 i = 0; i < batchSize; ++i)
     {
-        hostLogits.emplace_back(
-            manager.copyFrom(*ITensor::slice(outputs.at("logits"), lastTokenIds[i] - 1, 1), MemoryType::kCPU));
         // Own only this request's KV so finishing peers do not keep an entire batch allocation alive.
         nextKv.emplace_back(
             manager.copyFrom(*ITensor::slice(outputs.at("present_key_value_0"), i, 1), MemoryType::kGPU));
@@ -245,8 +249,7 @@ std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> 
     std::vector<TokenIdType> result;
     for (SizeType32 i = 0; i < batchSize; ++i)
     {
-        auto const* logits = bufferCast<float const>(*hostLogits[i]);
-        result.push_back(static_cast<TokenIdType>(std::max_element(logits, logits + mVocabSize) - logits));
+        result.push_back(bufferCast<TokenIdType const>(*hostTokens)[i]);
         auto& state = *states[i];
         state.kv = std::move(nextKv[i]);
         state.length = sequenceLengths[i];

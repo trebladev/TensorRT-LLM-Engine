@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -183,7 +183,7 @@ template void invokeMTPPrepareDrafterInputs<__nv_bfloat16>(MTPPrepareDrafterInpu
 
 template <typename T, int BLOCK_SIZE>
 __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, int const numContextRequest,
-    int const vocabSize, T const* logits, int* targetTokens)
+    int const vocabSize, T const* logits, int* targetTokens, int const* lastTokenIds = nullptr)
 {
     /*
         In a batch of request: context request (at the beginning) + generation requests
@@ -201,9 +201,9 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
     int const bid = static_cast<int>(blockIdx.x);
     int const tid = static_cast<int>(threadIdx.x);
 
-    // Do greedy sampliing for the input logits
-
-    T const* curLogitsPtr = logits + bid * vocabSize;
+    // Select the last packed row for native drafting, or the dense row otherwise.
+    auto const row = lastTokenIds ? lastTokenIds[bid] - 1 : bid;
+    T const* curLogitsPtr = logits + static_cast<int64_t>(row) * vocabSize;
 
     T tmpMaxValue = curLogitsPtr[0];
     int tmpMaxValueIndex = 0;
@@ -224,7 +224,9 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
     __syncthreads();
 
     // reduction
-    ii = min(blockDim.x, vocabSize) / 2;
+    // The packed launcher always uses a full power-of-two block, including
+    // vocabularies smaller than the block. Inactive lanes retain token zero.
+    ii = lastTokenIds ? blockDim.x / 2 : min(blockDim.x, vocabSize) / 2;
     while (ii != 0)
     {
         if (tid < ii)
@@ -245,6 +247,17 @@ __global__ void mtpGreedySampling(int const numMTPModules, int const batchSize, 
     {
         targetTokens[bid] = maxValueIndexCache[tid];
     }
+}
+
+void invokeMTPPackedGreedySampling(
+    float const* logits, int const* lastTokenIds, int* outputTokens, int batchSize, int vocabSize, cudaStream_t stream)
+{
+    TLLM_CHECK(logits && lastTokenIds && outputTokens);
+    TLLM_CHECK(batchSize > 0 && vocabSize > 0);
+    constexpr int kBlockSize = 256;
+    mtpGreedySampling<float, kBlockSize>
+        <<<batchSize, kBlockSize, 0, stream>>>(0, batchSize, batchSize, vocabSize, logits, outputTokens, lastTokenIds);
+    sync_check_cuda_error(stream);
 }
 
 __global__ void mtpAcceptDraftToken(int const numMTPModules, int const batchSize, int const numContextRequest,

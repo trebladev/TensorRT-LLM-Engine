@@ -83,11 +83,12 @@ engines to enable variable generation lengths before using batched native MTP.
 The target can mix prefill and generation, and generation requests may have one
 or two packed tokens. Disable prefix reuse, chunked context, overlap, and CUDA graphs.
 Returned generation logits/log probabilities, guided decoding, disaggregation, and prompt
-embeddings are unsupported. Draft argmax currently copies the last logits row to
-CPU and synchronizes each draft group. Continuous draft KV is packed and copied
-back per request on each forward. This is a correctness baseline with no throughput
-improvement claim; GPU argmax, fewer copies, and compact recurrent-state replay
-remain future work. BF16 computation is not bitwise invariant to batch shape:
+embeddings are unsupported. Draft argmax reduces the last logits row on GPU and
+copies back one token ID per request, preserving the first-maximum tie rule.
+Each draft group still synchronizes.
+Continuous draft KV is packed and copied back per request on each forward.
+Throughput gains remain workload-dependent; fewer copies and compact recurrent-state
+replay remain future work. BF16 computation is not bitwise invariant to batch shape:
 near-tied logits can select different greedy tokens even without MTP. Regression
 tests require matching token prefixes and check the reference logits explicitly
 for the final mixed-batch token, allowing at most one BF16 rounding unit.

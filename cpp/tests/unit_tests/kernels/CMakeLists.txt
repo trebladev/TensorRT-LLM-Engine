@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -86,6 +86,7 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+add_gtest(mtpPackedGreedyTest mtpPackedGreedyTest.cpp)
 
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp

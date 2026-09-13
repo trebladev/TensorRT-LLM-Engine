@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,12 @@ TRTLLM_NAMESPACE_BEGIN
 // namespace tensorrt_llm::kernels
 namespace kernels
 {
+
+//! Select the first maximum from each request's final packed FP32 logits row.
+//! lastTokenIds contains one-based row offsets, as in the TensorRT last_token_ids input.
+//! All buffers are on the device; outputTokens has batchSize elements.
+void invokeMTPPackedGreedySampling(
+    float const* logits, int const* lastTokenIds, int* outputTokens, int batchSize, int vocabSize, cudaStream_t stream);
 
 // Prepare drafter input
 struct MTPPrepareDrafterInputsParam
