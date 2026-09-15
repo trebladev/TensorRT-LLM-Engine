@@ -87,6 +87,9 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(mtpPackedGreedyTest mtpPackedGreedyTest.cpp)
+if(BUILD_PYT)
+  target_link_libraries(mtpPackedGreedyTest PUBLIC ${TORCH_LIBRARIES})
+endif()
 
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp

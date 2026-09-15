@@ -37,6 +37,45 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+namespace
+{
+__global__ void mtpCommitStateRecords(std::int64_t const* pointers, std::int64_t recordBytes)
+{
+    auto const* source = reinterpret_cast<uint4 const*>(pointers[2 * blockIdx.x]);
+    auto* destination = reinterpret_cast<uint4*>(pointers[2 * blockIdx.x + 1]);
+    if ((pointers[2 * blockIdx.x] | pointers[2 * blockIdx.x + 1]) % alignof(uint4) != 0)
+    {
+        for (std::int64_t i = blockIdx.y * blockDim.x + threadIdx.x; i < recordBytes; i += gridDim.y * blockDim.x)
+        {
+            reinterpret_cast<char*>(destination)[i] = reinterpret_cast<char const*>(source)[i];
+        }
+        return;
+    }
+    auto const vectors = recordBytes / sizeof(uint4);
+    for (std::int64_t i = blockIdx.y * blockDim.x + threadIdx.x; i < vectors; i += gridDim.y * blockDim.x)
+    {
+        destination[i] = source[i];
+    }
+    auto const tail = vectors * sizeof(uint4) + blockIdx.y * blockDim.x + threadIdx.x;
+    if (tail < recordBytes)
+    {
+        reinterpret_cast<char*>(destination)[tail] = reinterpret_cast<char const*>(source)[tail];
+    }
+}
+} // namespace
+
+void invokeMTPCommitStateRecords(
+    std::int64_t const* recordPointers, int numRecords, std::int64_t recordBytes, cudaStream_t stream)
+{
+    if (numRecords == 0)
+    {
+        return;
+    }
+    constexpr int kThreads = 256;
+    constexpr int kTiles = 16;
+    mtpCommitStateRecords<<<dim3(numRecords, kTiles), kThreads, 0, stream>>>(recordPointers, recordBytes);
+}
+
 template <typename T>
 __device__ void copyChunkedHiddenStates(T const* srcPtr, T* dstPtr, int const numElement)
 {

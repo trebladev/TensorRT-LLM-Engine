@@ -41,6 +41,8 @@ struct GatedDeltaRuleDecodeParams
     int32_t const* targetStateSlotMapping;
     int32_t const* cuSeqLens;
     int32_t batchSize;
+    void* finalState = nullptr;
+    int32_t const* snapshotSlotMapping = nullptr;
 };
 
 class GatedDeltaRuleDecodeRunner
@@ -55,6 +57,7 @@ public:
     GatedDeltaRuleDecodeRunner& operator=(GatedDeltaRuleDecodeRunner&&) = delete;
 
     void run(GatedDeltaRuleDecodeParams const& params, cudaStream_t stream) const;
+    void runVerification(GatedDeltaRuleDecodeParams const& params, cudaStream_t stream) const;
 
 private:
     int32_t mNumVHeads;
@@ -63,6 +66,8 @@ private:
     int32_t mSharedMemoryBytes;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     CUfunction mFunction{};
+    CUfunction mVerificationFunction{};
+    int32_t mVerificationSharedMemoryBytes{};
 };
 
 } // namespace tensorrt_llm::plugins

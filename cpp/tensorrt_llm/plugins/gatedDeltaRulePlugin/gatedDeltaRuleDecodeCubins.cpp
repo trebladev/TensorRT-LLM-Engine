@@ -32,6 +32,15 @@ extern unsigned char const gated_delta_rule_decode_bf16_h16_hv32_k128_v128_sm89_
 extern unsigned int const gated_delta_rule_decode_bf16_h16_hv32_k128_v128_sm89_cubin_len;
 extern unsigned char const gated_delta_rule_decode_bf16_h16_hv48_k128_v128_sm89_cubin[];
 extern unsigned int const gated_delta_rule_decode_bf16_h16_hv48_k128_v128_sm89_cubin_len;
+
+extern unsigned char const gated_delta_rule_verification_bf16_h8_hv8_k128_v128_sm89_cubin[];
+extern unsigned int const gated_delta_rule_verification_bf16_h8_hv8_k128_v128_sm89_cubin_len;
+extern unsigned char const gated_delta_rule_verification_bf16_h16_hv16_k128_v128_sm89_cubin[];
+extern unsigned int const gated_delta_rule_verification_bf16_h16_hv16_k128_v128_sm89_cubin_len;
+extern unsigned char const gated_delta_rule_verification_bf16_h16_hv32_k128_v128_sm89_cubin[];
+extern unsigned int const gated_delta_rule_verification_bf16_h16_hv32_k128_v128_sm89_cubin_len;
+extern unsigned char const gated_delta_rule_verification_bf16_h16_hv48_k128_v128_sm89_cubin[];
+extern unsigned int const gated_delta_rule_verification_bf16_h16_hv48_k128_v128_sm89_cubin_len;
 #endif
 
 } // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
@@ -74,12 +83,52 @@ auto const& getCubins()
 #endif
 }
 
+auto const& getVerificationCubins()
+{
+#if !defined(_WIN32) && !defined(EXCLUDE_SM_89)
+    constexpr int32_t kSm = 89;
+    constexpr int32_t kHeadKDim = 128;
+    constexpr int32_t kHeadVDim = 128;
+    constexpr int32_t kSharedMemoryBytes = 4096;
+    constexpr char const* kKernelName = "gated_delta_rule_verification_kernel";
+    static std::array<GatedDeltaRuleDecodeCubin, 4> const cubins{{
+        {kSm, 8, 8, kHeadKDim, kHeadVDim,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::gated_delta_rule_verification_bf16_h8_hv8_k128_v128_sm89_cubin,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h8_hv8_k128_v128_sm89_cubin_len,
+            kKernelName, kSharedMemoryBytes},
+        {kSm, 16, 16, kHeadKDim, kHeadVDim,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h16_hv16_k128_v128_sm89_cubin,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h16_hv16_k128_v128_sm89_cubin_len,
+            kKernelName, kSharedMemoryBytes},
+        {kSm, 16, 32, kHeadKDim, kHeadVDim,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h16_hv32_k128_v128_sm89_cubin,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h16_hv32_k128_v128_sm89_cubin_len,
+            kKernelName, kSharedMemoryBytes},
+        {kSm, 16, 48, kHeadKDim, kHeadVDim,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h16_hv48_k128_v128_sm89_cubin,
+            tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels::
+                gated_delta_rule_verification_bf16_h16_hv48_k128_v128_sm89_cubin_len,
+            kKernelName, kSharedMemoryBytes},
+    }};
+    return cubins;
+#else
+    static std::array<GatedDeltaRuleDecodeCubin, 0> const cubins{};
+    return cubins;
+#endif
+}
+
 } // namespace
 
 GatedDeltaRuleDecodeCubin const* findGatedDeltaRuleDecodeCubin(
-    int32_t sm, int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim)
+    int32_t sm, int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim, bool verification)
 {
-    for (auto const& cubin : getCubins())
+    for (auto const& cubin : verification ? getVerificationCubins() : getCubins())
     {
         if (cubin.sm == sm && cubin.numQHeads == numQHeads && cubin.numVHeads == numVHeads && cubin.headKDim == headKDim
             && cubin.headVDim == headVDim)

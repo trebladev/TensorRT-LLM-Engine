@@ -123,7 +123,8 @@ private:
     int32_t enqueuePrefill(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
     int32_t enqueueDecode(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream,
+        bool verification = false) noexcept;
 
     int32_t mNumQHeads;
     int32_t mNumVHeads;

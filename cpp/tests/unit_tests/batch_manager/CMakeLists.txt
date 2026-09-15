@@ -32,3 +32,8 @@ add_gtest(cudaGraphExecutorCacheTest cudaGraphExecutorCacheTest.cpp)
 add_gtest(agentTreeTest agentTreeTest.cpp)
 add_gtest(truncateBlocksTest truncateBlocksTest.cpp)
 add_gtest(encDecBeamSearchTest encDecBeamSearchTest.cpp)
+
+add_gtest(qwen35MtpWorkerTest qwen35MtpWorkerTest.cpp)
+if(BUILD_PYT)
+  target_link_libraries(qwen35MtpWorkerTest PUBLIC ${TORCH_LIBRARIES})
+endif()

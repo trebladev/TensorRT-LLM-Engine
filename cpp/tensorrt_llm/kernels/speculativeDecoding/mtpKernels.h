@@ -37,6 +37,12 @@ namespace kernels
 void invokeMTPPackedGreedySampling(
     float const* logits, int const* lastTokenIds, int* outputTokens, int batchSize, int vocabSize, cudaStream_t stream);
 
+//! Copy equal-sized recurrent/convolution records across all requests and layers.
+//! recordPointers contains device [source, destination] address pairs.
+//! Source and destination records must not overlap across the batch.
+void invokeMTPCommitStateRecords(
+    std::int64_t const* recordPointers, int numRecords, std::int64_t recordBytes, cudaStream_t stream);
+
 // Prepare drafter input
 struct MTPPrepareDrafterInputsParam
 {

@@ -17,12 +17,14 @@
 #include "qwen35MtpWorker.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/mtpKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 
 #include <algorithm>
 #include <filesystem>
+#include <numeric>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -36,6 +38,7 @@ Qwen35MtpWorker::Qwen35MtpWorker(std::string const& enginePath, nvinfer1::ILogge
     , mVocabSize(vocabSize)
     , mMaxBatchSize(maxBatchSize)
     , mRotaryDim(rotaryDim)
+    , mMergeDraftBatches(!common::getBoolEnv("TRTLLM_QWEN35_MTP_DISABLE_DRAFT_BATCHING"))
 {
     auto const& engine = mRuntime.getEngine();
     TLLM_CHECK_WITH_INFO(engine.getNbOptimizationProfiles() == 1, "Native MTP requires a single-profile draft engine");
@@ -49,15 +52,49 @@ Qwen35MtpWorker::Qwen35MtpWorker(std::string const& enginePath, nvinfer1::ILogge
     auto const kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
     TLLM_CHECK_WITH_INFO(kvShape.nbDims == 5 && kvShape.d[0] >= maxBatchSize && kvShape.d[3] >= maxSequenceLength,
         "Native MTP draft cache must cover the target maximum sequence length, and runtime batch size");
-    auto const logitsShape = engine.getTensorShape("logits");
+    for (int i = 0; i < engine.getNbIOTensors(); ++i)
+    {
+        if (std::string(engine.getIOTensorName(i)) == "last_token_logits")
+        {
+            mLastTokenLogits = true;
+        }
+    }
+    auto const* logitsName = mLastTokenLogits ? "last_token_logits" : "logits";
+    auto const logitsShape = engine.getTensorShape(logitsName);
     TLLM_CHECK_WITH_INFO(logitsShape.nbDims == 2 && logitsShape.d[1] == vocabSize
-            && engine.getTensorDataType("logits") == nvinfer1::DataType::kFLOAT,
+            && engine.getTensorDataType(logitsName) == nvinfer1::DataType::kFLOAT,
         "Native MTP requires FP32 draft logits with the target vocabulary");
     mRuntime.addContext(0);
 }
 
+Qwen35MtpWorker::~Qwen35MtpWorker()
+{
+    if (mPending)
+    {
+        mReady.synchronize();
+    }
+}
+
+void Qwen35MtpWorker::waitReady(CudaStream const& stream) const
+{
+    if (mPending)
+    {
+        stream.wait(mReady);
+    }
+}
+
+Qwen35MtpWorker::TensorPtr const& Qwen35MtpWorker::candidate(std::uint64_t requestId) const
+{
+    return mRequests.at(requestId).candidate;
+}
+
 void Qwen35MtpWorker::release(std::uint64_t requestId)
 {
+    // Cancellation or context reinitialization can bypass the next target wait.
+    if (mPending && mRequests.count(requestId))
+    {
+        mReady.synchronize();
+    }
     mRequests.erase(requestId);
 }
 
@@ -94,16 +131,65 @@ void Qwen35MtpWorker::queue(std::uint64_t requestId, Tokens tokens)
 
 std::map<std::uint64_t, TokenIdType> Qwen35MtpWorker::draft()
 {
+    auto const ids = draftDevice();
+    auto& manager = mRuntime.getBufferManager();
+    std::vector<TensorPtr> tokens;
+    for (auto id : ids)
+    {
+        tokens.emplace_back(manager.copyFrom(*candidate(id), MemoryType::kCPU));
+    }
+    manager.getStream().synchronize();
     std::map<std::uint64_t, TokenIdType> result;
-    // Prefills may have different lengths. Generation groups append either one
-    // correction pair or two accepted pairs, using causal verification attention.
+    for (std::size_t i = 0; i < ids.size(); ++i)
+    {
+        result.emplace(ids[i], bufferCast<TokenIdType const>(*tokens[i])[0]);
+    }
+    return result;
+}
+
+std::vector<std::uint64_t> Qwen35MtpWorker::draftDevice()
+{
+    // The target normally consumes the previous candidates before reaching
+    // here. Standalone callers must also finish reads of reusable host staging.
+    if (mPending)
+    {
+        auto const status = cudaEventQuery(mReady.get());
+        if (status == cudaErrorNotReady)
+        {
+            mReady.synchronize();
+        }
+        else
+        {
+            TLLM_CUDA_CHECK(status);
+        }
+    }
+    std::vector<std::uint64_t> result;
+    // Generation uses a common causal window, padding after each valid prefix.
+    // Fall back to equal-length groups if padding would exceed any request's KV capacity.
+    SizeType32 width = 1;
+    for (auto const& [id, state] : mRequests)
+    {
+        if (!state.context)
+        {
+            width = std::max(width, static_cast<SizeType32>(state.tokens.size()));
+        }
+    }
+    bool const merge = mMergeDraftBatches
+        && std::all_of(mRequests.begin(), mRequests.end(),
+            [this, width](auto const& entry)
+            {
+                auto const& state = entry.second;
+                return state.context || state.tokens.empty() || state.length <= mMaxSequenceLength - width;
+            });
+    // Context stays packed-ragged and separate from generation.
     for (SizeType32 group = 0; group < 3; ++group)
     {
         std::vector<RequestState*> states;
         std::vector<std::uint64_t> ids;
         for (auto& [id, state] : mRequests)
         {
-            if (!state.tokens.empty() && (state.context ? 0 : static_cast<SizeType32>(state.tokens.size())) == group)
+            auto const requestGroup = state.context ? 0 : (merge ? 1 : static_cast<SizeType32>(state.tokens.size()));
+            if (!state.tokens.empty() && requestGroup == group)
             {
                 states.push_back(&state);
                 ids.push_back(id);
@@ -111,32 +197,58 @@ std::map<std::uint64_t, TokenIdType> Qwen35MtpWorker::draft()
         }
         if (!states.empty())
         {
-            auto const tokens = draftBatch(states);
-            for (std::size_t i = 0; i < ids.size(); ++i)
-            {
-                result.emplace(ids[i], tokens[i]);
-            }
+            draftBatch(states);
+            result.insert(result.end(), ids.begin(), ids.end());
         }
     }
+    mRuntime.getStream().record(mReady);
+    mPending = true;
     return result;
 }
 
-std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
+void Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
 {
     auto const batchSize = static_cast<SizeType32>(states.size());
     TLLM_CHECK(batchSize > 0 && batchSize <= mMaxBatchSize);
     auto const context = states.front()->context;
-    auto const width = context ? 1 : static_cast<SizeType32>(states.front()->tokens.size());
+    SizeType32 width = 1;
+    if (!context)
+    {
+        for (auto const* state : states)
+        {
+            width = std::max(width, static_cast<SizeType32>(state->tokens.size()));
+        }
+    }
     auto& manager = mRuntime.getBufferManager();
     auto const& engine = mRuntime.getEngine();
-    std::vector<TensorPtr> staging;
+    auto& workspace = mWorkspaces[context ? 0 : width];
+    workspace.retained.clear();
+    std::size_t hostIndex = 0, deviceIndex = 0;
+    auto acquire = [&](bool gpu, nvinfer1::Dims const& shape, nvinfer1::DataType type) -> TensorPtr
+    {
+        auto& buffers = gpu ? workspace.device : workspace.host;
+        auto& index = gpu ? deviceIndex : hostIndex;
+        if (index == buffers.size())
+        {
+            buffers.emplace_back(gpu ? manager.gpu(shape, type) : BufferManager::pinned(shape, type));
+        }
+        auto const& buffer = buffers[index++];
+        TLLM_CHECK(buffer->getDataType() == type);
+        buffer->reshape(shape);
+        return buffer;
+    };
     auto ints = [&](std::vector<SizeType32> const& values, nvinfer1::Dims const& shape, bool gpu) -> TensorPtr
     {
-        TensorPtr host = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+        auto host = acquire(false, shape, nvinfer1::DataType::kINT32);
         TLLM_CHECK(host->getSize() == values.size());
         std::copy(values.begin(), values.end(), bufferCast<SizeType32>(*host));
-        staging.push_back(host);
-        return gpu ? TensorPtr(manager.copyFrom(*host, MemoryType::kGPU)) : host;
+        if (!gpu)
+        {
+            return host;
+        }
+        auto device = acquire(true, shape, nvinfer1::DataType::kINT32);
+        manager.copy(*host, *device);
+        return device;
     };
     auto scalar = [&](SizeType32 value, bool gpu) { return ints({value}, ITensor::makeShape({1}), gpu); };
     auto batchInts = [&](std::vector<SizeType32> const& values, bool gpu)
@@ -147,25 +259,32 @@ std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> 
     for (auto const* state : states)
     {
         auto const count = static_cast<SizeType32>(state->tokens.size());
-        TLLM_CHECK(state->context == context && (context || count == width));
-        TLLM_CHECK(state->length + count <= mMaxSequenceLength);
+        TLLM_CHECK(state->context == context);
+        auto const physicalCount = context ? count : width;
+        TLLM_CHECK(state->length + physicalCount <= mMaxSequenceLength);
         TLLM_CHECK(state->hiddenStates->getShape().d[0] >= count);
         tokens.insert(tokens.end(), state->tokens.begin(), state->tokens.end());
         pastLengths.push_back(state->length);
         promptLengths.push_back(context ? count : state->promptLength);
-        sequenceLengths.push_back(state->length + count);
+        sequenceLengths.push_back(state->length + physicalCount);
         lastTokenIds.push_back(static_cast<SizeType32>(tokens.size()));
+        // Sampling reads the last valid row, before this request's trailing padding.
+        tokens.insert(tokens.end(), physicalCount - count, 0);
         positionDeltas.push_back(state->positionDelta);
     }
     auto const numTokens = static_cast<SizeType32>(tokens.size());
     auto kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
     kvShape.d[0] = batchSize;
     kvShape.d[3] = mMaxSequenceLength;
-    TensorPtr kv = manager.gpu(kvShape, nvinfer1::DataType::kBF16);
-    TensorPtr hidden = manager.gpu(ITensor::makeShape({numTokens, mHiddenSize}), nvinfer1::DataType::kBF16);
+    TensorPtr kv = acquire(true, kvShape, nvinfer1::DataType::kBF16);
+    TensorPtr hidden = acquire(true, ITensor::makeShape({numTokens, mHiddenSize}), nvinfer1::DataType::kBF16);
+    if (!context)
+    {
+        manager.setZero(*hidden);
+    }
     auto ropeShape = engine.getProfileShape("mrope_rotary_cos_sin", 0, nvinfer1::OptProfileSelector::kMAX);
     ropeShape.d[0] = batchSize;
-    TensorPtr rope = manager.gpu(ropeShape, nvinfer1::DataType::kFLOAT);
+    TensorPtr rope = acquire(true, ropeShape, nvinfer1::DataType::kFLOAT);
     if (context)
     {
         manager.setZero(*kv);
@@ -188,14 +307,14 @@ std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> 
             TLLM_CHECK(state.kv);
             manager.copy(*state.kv, *ITensor::slice(kv, i, 1));
         }
-        offset += count;
+        offset += context ? count : width;
     }
-    TensorPtr knobs = BufferManager::cpu(ITensor::makeShape({16}), nvinfer1::DataType::kINT64);
+    TensorPtr knobs = acquire(false, ITensor::makeShape({16}), nvinfer1::DataType::kINT64);
     std::fill_n(bufferCast<std::int64_t>(*knobs), 16, -1);
-    TensorPtr progress = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT64);
+    TensorPtr progress = acquire(false, ITensor::makeShape({1}), nvinfer1::DataType::kINT64);
     bufferCast<std::int64_t>(*progress)[0] = 0;
     TensorPtr indirection
-        = manager.gpu(ITensor::makeShape({batchSize, 1, mMaxSequenceLength}), nvinfer1::DataType::kINT32);
+        = acquire(true, ITensor::makeShape({batchSize, 1, mMaxSequenceLength}), nvinfer1::DataType::kINT32);
     manager.setZero(*indirection);
     std::vector<SizeType32> offsets(batchSize * width), mask(batchSize * width);
     for (SizeType32 i = 0; i < batchSize * width; ++i)
@@ -230,34 +349,46 @@ std::vector<TokenIdType> Qwen35MtpWorker::draftBatch(std::vector<RequestState*> 
     }
     mRuntime.setCurrentBeamWidths(std::vector<SizeType32>(batchSize, 1));
     mRuntime.setInputTensors(0, inputs);
-    TllmRuntime::TensorMap outputs;
+    auto& outputs = workspace.outputs;
     mRuntime.setOutputTensors(0, outputs);
     TLLM_CHECK_WITH_INFO(mRuntime.executeContext(0), "Native MTP draft engine enqueue failed");
-    TensorPtr selectedTokens = manager.gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
-    kernels::invokeMTPPackedGreedySampling(bufferCast<float const>(*outputs.at("logits")),
-        bufferCast<SizeType32 const>(*allInputs.at("last_token_ids")), bufferCast<TokenIdType>(*selectedTokens),
-        batchSize, mVocabSize, manager.getStream().get());
-    TensorPtr hostTokens = manager.copyFrom(*selectedTokens, MemoryType::kCPU);
-    std::vector<TensorPtr> nextKv;
-    for (SizeType32 i = 0; i < batchSize; ++i)
+    TensorPtr selectedTokens = acquire(true, ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+    auto samplingRows = allInputs.at("last_token_ids");
+    if (mLastTokenLogits)
     {
-        // Own only this request's KV so finishing peers do not keep an entire batch allocation alive.
-        nextKv.emplace_back(
-            manager.copyFrom(*ITensor::slice(outputs.at("present_key_value_0"), i, 1), MemoryType::kGPU));
+        auto const& logits = outputs.at("last_token_logits");
+        TLLM_CHECK(logits->getShape().d[0] == batchSize);
+        std::vector<SizeType32> rows(batchSize);
+        std::iota(rows.begin(), rows.end(), 1);
+        samplingRows = batchInts(rows, true);
     }
-    manager.getStream().synchronize();
-    std::vector<TokenIdType> result;
+    kernels::invokeMTPPackedGreedySampling(
+        bufferCast<float const>(*outputs.at(mLastTokenLogits ? "last_token_logits" : "logits")),
+        bufferCast<SizeType32 const>(*samplingRows), bufferCast<TokenIdType>(*selectedTokens), batchSize, mVocabSize,
+        manager.getStream().get());
     for (SizeType32 i = 0; i < batchSize; ++i)
     {
-        result.push_back(bufferCast<TokenIdType const>(*hostTokens)[i]);
         auto& state = *states[i];
-        state.kv = std::move(nextKv[i]);
-        state.length = sequenceLengths[i];
+        auto const outputKv = ITensor::slice(outputs.at("present_key_value_0"), i, 1);
+        if (!state.kv)
+        {
+            state.kv = manager.gpu(outputKv->getShape(), outputKv->getDataType());
+        }
+        manager.copy(*outputKv, *state.kv);
+        if (!state.candidate)
+        {
+            state.candidate = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+        }
+        manager.copy(*ITensor::slice(selectedTokens, i, 1), *state.candidate);
+        // Keep target outputs alive until the asynchronous draft has consumed them.
+        workspace.retained.push_back(state.hiddenStates);
+        workspace.retained.push_back(state.rotaryCache);
+        // Padding KV is tentative: the next append overwrites it at the logical length.
+        state.length += static_cast<SizeType32>(state.tokens.size());
         state.promptLength = promptLengths[i];
         state.tokens.clear();
         state.hiddenStates.reset();
         state.rotaryCache.reset();
     }
-    return result;
 }
 } // namespace tensorrt_llm::batch_manager

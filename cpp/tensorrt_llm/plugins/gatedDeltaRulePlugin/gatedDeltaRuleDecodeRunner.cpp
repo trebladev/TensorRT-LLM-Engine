@@ -82,6 +82,10 @@ GatedDeltaRuleDecodeRunner::GatedDeltaRuleDecodeRunner(
 
     mFunction = loadKernel(mDriver, *cubin);
     mSharedMemoryBytes = cubin->sharedMemoryBytes;
+    auto const* verification = findGatedDeltaRuleDecodeCubin(sm, numQHeads, numVHeads, headKDim, headVDim, true);
+    TLLM_CHECK_WITH_INFO(verification != nullptr, "No GatedDeltaRule short verification cubin");
+    mVerificationFunction = loadKernel(mDriver, *verification);
+    mVerificationSharedMemoryBytes = verification->sharedMemoryBytes;
 #endif
 }
 
@@ -122,6 +126,36 @@ void GatedDeltaRuleDecodeRunner::run(GatedDeltaRuleDecodeParams const& params, c
     auto const gridZ = static_cast<unsigned int>(params.batchSize * mNumVHeads);
     TLLM_CU_CHECK(mDriver->cuLaunchKernel(mFunction, kGridX, gridY, gridZ, kBlockX, kBlockY, kBlockZ,
         static_cast<unsigned int>(mSharedMemoryBytes), stream, kernelParams, nullptr));
+}
+
+void GatedDeltaRuleDecodeRunner::runVerification(GatedDeltaRuleDecodeParams const& params, cudaStream_t stream) const
+{
+    TLLM_CHECK(params.batchSize > 0 && params.finalState != nullptr);
+    TLLM_CHECK(params.stateSlotStrideElements >= static_cast<int64_t>(mNumVHeads) * mHeadVDim * mHeadKDim);
+    CUdeviceptr query = reinterpret_cast<CUdeviceptr>(params.query);
+    CUdeviceptr key = reinterpret_cast<CUdeviceptr>(params.key);
+    CUdeviceptr value = reinterpret_cast<CUdeviceptr>(params.value);
+    CUdeviceptr logDecay = reinterpret_cast<CUdeviceptr>(params.logDecay);
+    CUdeviceptr beta = reinterpret_cast<CUdeviceptr>(params.beta);
+    CUdeviceptr output = reinterpret_cast<CUdeviceptr>(params.output);
+    CUdeviceptr state = reinterpret_cast<CUdeviceptr>(params.state);
+    CUdeviceptr finalState = reinterpret_cast<CUdeviceptr>(params.finalState);
+    CUdeviceptr sourceSlots = reinterpret_cast<CUdeviceptr>(params.sourceStateSlotMapping);
+    CUdeviceptr targetSlots = reinterpret_cast<CUdeviceptr>(params.targetStateSlotMapping);
+    CUdeviceptr snapshots = reinterpret_cast<CUdeviceptr>(params.snapshotSlotMapping);
+    CUdeviceptr cuSeqLens = reinterpret_cast<CUdeviceptr>(params.cuSeqLens);
+    int64_t stride = params.stateSlotStrideElements;
+    int32_t useSnapshots = params.snapshotSlotMapping != nullptr;
+    float scale = 1.0F / std::sqrt(static_cast<float>(mHeadKDim));
+    CUdeviceptr globalScratch{};
+    CUdeviceptr profileScratch{};
+    void* arguments[]{&query, &key, &value, &logDecay, &beta, &output, &state, &finalState, &sourceSlots, &targetSlots,
+        &snapshots, &cuSeqLens, &stride, &useSnapshots, &scale, &globalScratch, &profileScratch};
+    constexpr unsigned int kBlockThreads = 128;
+    constexpr int32_t kValueTile = 16;
+    TLLM_CU_CHECK(mDriver->cuLaunchKernel(mVerificationFunction, params.batchSize, mNumVHeads,
+        (mHeadVDim + kValueTile - 1) / kValueTile, kBlockThreads, 1, 1, mVerificationSharedMemoryBytes, stream,
+        arguments, nullptr));
 }
 
 } // namespace tensorrt_llm::plugins

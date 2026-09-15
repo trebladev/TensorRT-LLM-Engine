@@ -88,6 +88,26 @@ prefill tensors with a Q/K/V batch dimension greater than one, mixed
 prefill/decode batches, non-SM89 cubins, and additional head configurations are
 not currently supported.
 
+## Short speculative verification
+
+Paged-state generation batches containing one or two tokens per request use a
+single fused AOT kernel when the packed token count exceeds the request count.
+This replaces the general chunk-prefill pipeline for K=1 speculative verification.
+Ordinary single-token decode and context prefill retain their existing kernels.
+Non-paged verification retains the chunk-prefill implementation.
+
+The fused kernel preserves normalized BF16 Q/K, rounded chunk intermediates,
+FP32 recurrent state, separate source/target slots, and per-token snapshots.
+Snapshots are computed from the initial chunk state so rejected draft tokens
+can be discarded by selecting the accepted snapshot. The final output uses the
+same FMA ordering as the chunk output kernel, including cancellation-sensitive
+BF16 rounding. Combined recurrent/convolution records retain their configured
+stride; convolution tails are not written by GDN.
+
+The supported hardware and head configurations are the same as decode above.
+No serialized plugin fields change, so existing compatible engines can load the
+updated plugin without rebuilding engines.
+
 ## Prerequisites
 
 Use a TensorRT-LLM development environment with CUDA, TensorRT, CMake, Conan,
@@ -104,11 +124,12 @@ Skip this step when only changing the C++ runner or plugin wiring.
 ```bash
 python3 cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/aot/compile_decode.py --arch 89
 python3 cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/aot/compile_prefill.py --arch 89
+python3 cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/aot/compile_verification.py --arch 89
 ```
 
 The scripts write deterministic `.cubin.tar.zst` archives to
 `cpp/tensorrt_llm/plugins/gatedDeltaRulePlugin/cubin/`. A complete SM89 set
-contains four decode archives and 35 prefill archives.
+contains four decode archives, four short-verification archives, and 35 prefill archives.
 
 The Triton 3.6 AOT ABI appends `global_scratch` and `profile_scratch` launch
 arguments. If the Triton version or a kernel signature changes, verify the

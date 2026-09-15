@@ -35,6 +35,6 @@ struct GatedDeltaRuleDecodeCubin
 };
 
 GatedDeltaRuleDecodeCubin const* findGatedDeltaRuleDecodeCubin(
-    int32_t sm, int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim);
+    int32_t sm, int32_t numQHeads, int32_t numVHeads, int32_t headKDim, int32_t headVDim, bool verification = false);
 
 } // namespace tensorrt_llm::plugins

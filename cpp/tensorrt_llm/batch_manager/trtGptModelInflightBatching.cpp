@@ -17,6 +17,7 @@
 
 #include "trtGptModelInflightBatching.h"
 #include "qwen35MtpWorker.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/mtpKernels.h"
 
 #include "tensorrt_llm/batch_manager/allocateKvCache.h"
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
@@ -2097,6 +2098,30 @@ TrtGptModelInflightBatching::prepareBuffers(
         mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig, mWorldConfig,
         getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
+    if (mNativeMtp)
+    {
+        auto& manager = getBufferManager();
+        mNativeMtp->waitReady(manager.getStream());
+        SizeType32 offset = 0;
+        for (auto const& request : contextRequests)
+        {
+            offset += request->getContextChunkSize();
+        }
+        for (auto const& request : generationRequests)
+        {
+            auto const count = request->getNumDraftTokens();
+            if (count > 0)
+            {
+                TLLM_CHECK(count == 1);
+                // The host draft vector carries only the shape. Patch its GPU
+                // input after normal staging, without reading the candidate on CPU.
+                manager.copy(*mNativeMtp->candidate(request->mRequestId),
+                    *ITensor::slice(inputMap.at("input_ids"), offset + 1, 1));
+            }
+            offset += count + 1;
+        }
+    }
+
     // For Variable-Beam-Width-Search
     mRuntime->setCurrentBeamWidths(
         tensorrt_llm::batch_manager::utils::getRequestBeamWidths(contextRequests, generationRequests));
@@ -2590,6 +2615,18 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     {
         mCreateNewDecoderRequests->refreshExternalDraftTokens(scheduledRequests.generationRequests, *mDecoderState,
             mModelConfig, mWorldConfig, *mDecoder->getDecoderStream());
+        auto const& stream = *mDecoder->getDecoderStream();
+        mNativeMtp->waitReady(stream);
+        BufferManager manager(std::make_shared<CudaStream>(stream.get()));
+        auto const& external = mDecoderState->getJointDecodingInput().externalDraftTokensInputs;
+        for (auto const& request : scheduledRequests.generationRequests)
+        {
+            if (request->getNumDraftTokens() > 0)
+            {
+                manager.copy(*mNativeMtp->candidate(request->mRequestId),
+                    *ITensor::slice(external->draftTokenIds, {request->mSeqSlot.value(), 0}, 1));
+            }
+        }
     }
 
     auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
@@ -2756,6 +2793,57 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
     auto const* const finishReasonsHostData
         = bufferCast<kernels::FinishedState>(*decoderOutputBuffers.finishReasonsHost);
 
+    // Commit the entire batch before termination can release or reassign any slot.
+    if (mModelConfig.isAttentionLinearHybrid() && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
+    {
+        auto& manager = getBufferManager();
+        auto const capacity = scheduledRequests.generationRequests.size() * mLinearAttentionLayerStateViews.size();
+        if (capacity > 0)
+        {
+            auto const shape = ITensor::makeShape({static_cast<int64_t>(capacity * 2)});
+            if (!mMtpCommitPointersHost || mMtpCommitPointersHost->getSize() < capacity * 2)
+            {
+                mMtpCommitPointersHost = BufferManager::pinned(shape, nvinfer1::DataType::kINT64);
+                mMtpCommitPointersDevice = manager.gpu(shape, nvinfer1::DataType::kINT64);
+            }
+            auto* pointers = bufferCast<int64_t>(*mMtpCommitPointersHost);
+            SizeType32 count = 0;
+            auto const recordBytes = mModelConfig.getLinearAttentionConfig()->getStateSlotBytes();
+            auto const& cache = static_cast<kv_cache_manager::KVCacheManager const&>(*mKvCacheManager);
+            for (auto const& request : scheduledRequests.generationRequests)
+            {
+                if (request->isGenerationCompleteState() || request->getNumDraftTokens() == 0)
+                {
+                    continue;
+                }
+                auto const slot = request->mSeqSlot.value();
+                auto const emitted = sequenceLengthsHostData[slot * mOperatingBeamWidth] - request->getNumTokens(0);
+                TLLM_CHECK(emitted == 1 || emitted == 2
+                    || (emitted == 0 && decoderFinishedSumPtr[slot] == request->getBeamWidthByIter(true)));
+                auto const selected = std::max(1, emitted);
+                auto const offset = static_cast<int64_t>(cache.getRecurrentStateSlot(request->mRequestId))
+                    * LinearAttentionBuffers::kVerificationStateRecords * recordBytes;
+                for (auto const& layer : mLinearAttentionLayerStateViews)
+                {
+                    TLLM_CHECK(offset >= 0
+                        && offset + (selected + 1) * recordBytes <= static_cast<int64_t>(layer->getSizeInBytes()));
+                    auto* destination = static_cast<std::uint8_t*>(layer->data()) + offset;
+                    pointers[2 * count] = reinterpret_cast<int64_t>(destination + selected * recordBytes);
+                    pointers[2 * count + 1] = reinterpret_cast<int64_t>(destination);
+                    ++count;
+                }
+            }
+            if (count > 0)
+            {
+                manager.copy(*ITensor::slice(mMtpCommitPointersHost, 0, 2 * count),
+                    *ITensor::slice(mMtpCommitPointersDevice, 0, 2 * count));
+                kernels::invokeMTPCommitStateRecords(bufferCast<int64_t const>(*mMtpCommitPointersDevice), count,
+                    recordBytes, manager.getStream().get());
+                manager.getStream().synchronize();
+            }
+        }
+    }
+
     // Update only requests that ran through the decoder
     for (auto const& llmReq : scheduledRequests.generationRequests)
     {
@@ -2845,22 +2933,6 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                     || (numOutputTokens == 0 && decoderFinishedSumPtr[seqSlot] == reqBeamWidth),
                 "K=1 external verification must emit one or two tokens unless already finished.");
             auto const selectedRecord = std::max(1, numOutputTokens);
-            auto const& cacheManager = static_cast<kv_cache_manager::KVCacheManager const&>(*mKvCacheManager);
-            auto const blockSlot = cacheManager.getRecurrentStateSlot(llmReq->mRequestId);
-            auto const recordBytes = mModelConfig.getLinearAttentionConfig()->getStateSlotBytes();
-            auto const byteOffset = static_cast<std::int64_t>(blockSlot)
-                * LinearAttentionBuffers::kVerificationStateRecords * recordBytes;
-            for (auto const& layerState : mLinearAttentionLayerStateViews)
-            {
-                TLLM_CHECK(byteOffset >= 0
-                    && byteOffset + (selectedRecord + 1) * recordBytes
-                        <= static_cast<std::int64_t>(layerState->getSizeInBytes()));
-                auto* committed = static_cast<std::uint8_t*>(layerState->data()) + byteOffset;
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(committed, committed + selectedRecord * recordBytes, recordBytes,
-                    cudaMemcpyDeviceToDevice, getBufferManager().getStream().get()));
-            }
-            // Complete the copy before request termination can release/reassign the block.
-            getBufferManager().getStream().synchronize();
             // Only the candidate was appended to context KV; the bonus was not.
             mKvCacheManager->rewindKVCache(llmReq->mRequestId, 2 - selectedRecord);
         }
@@ -3006,13 +3078,14 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 
     if (mNativeMtp)
     {
-        auto const candidates = mNativeMtp->draft();
+        auto const candidates = mNativeMtp->draftDevice();
         for (auto const& request : scheduledRequests.generationRequests)
         {
-            auto const it = candidates.find(request->mRequestId);
-            if (it != candidates.end())
+            if (std::find(candidates.begin(), candidates.end(), request->mRequestId) != candidates.end())
             {
-                request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>(1, it->second));
+                // External-draft metadata needs a length; GPU consumers receive
+                // the actual candidate directly from the worker at launch time.
+                request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>(1, 0));
             }
         }
     }

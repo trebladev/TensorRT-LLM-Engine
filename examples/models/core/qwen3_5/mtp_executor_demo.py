@@ -40,7 +40,9 @@ def build_engines(
     engine_dir.mkdir(parents=True, exist_ok=True)
     model = Qwen35MTP.from_hugging_face(model_dir)
     draft_path = engine_dir / "mtp.engine"
-    draft_path.write_bytes(bytes(build_draft_engine(model, max_seq_len + 1, max_batch_size)))
+    draft_path.write_bytes(
+        bytes(build_draft_engine(model, max_seq_len + 1, max_batch_size, last_token_logits=True))
+    )
     del model
     gc.collect()
     torch.cuda.empty_cache()

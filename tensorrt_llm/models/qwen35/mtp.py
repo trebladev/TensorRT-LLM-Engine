@@ -23,7 +23,7 @@ import torch
 from transformers import AutoConfig
 
 from ..._common import default_net
-from ...functional import Tensor, concat
+from ...functional import Tensor, concat, gather_last_token_logits
 from ...layers import Attention, Linear, RmsNorm
 from ..convert_utils import iterate_shard_files, load_state_dict
 from ..modeling_utils import PretrainedModel
@@ -86,7 +86,13 @@ class Qwen35MTP(Qwen35ForCausalLM):
         )
         self.fc = Linear(config.hidden_size * 2, config.hidden_size, bias=False, dtype=config.dtype)
 
-    def forward(self, input_ids: Tensor, target_hidden_states: Tensor, **kwargs) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_hidden_states: Tensor,
+        last_token_logits: bool = False,
+        **kwargs,
+    ) -> Tensor:
         """Process packed, causally ordered token/hidden-state pairs with KV caching."""
         if not kwargs.get("use_cache", True):
             raise ValueError("MTP requires use_cache=true")
@@ -109,8 +115,23 @@ class Qwen35MTP(Qwen35ForCausalLM):
             mrope_params=kwargs["mrope_params"],
             spec_decoding_params=kwargs.get("spec_decoding_params"),
         )
-        logits = self.lm_head(self.transformer.ln_f(hidden_states))
-        logits.mark_output("logits", self._logits_dtype)
+        hidden_states = self.transformer.ln_f(hidden_states)
+        if last_token_logits:
+            if kwargs.get("last_token_ids") is None:
+                raise ValueError("Last-token MTP projection requires last_token_ids")
+            # Preserve every position's attention/KV update; only the output
+            # projection needs the last valid row, before trailing padding.
+            hidden_states = gather_last_token_logits(
+                hidden_states,
+                kwargs["last_token_ids"],
+                default_net().plugin_config.remove_input_padding,
+            )
+        logits = self.lm_head(hidden_states)
+        # An explicit output name lets the worker also accept older engines
+        # whose logits still contain every packed token row.
+        logits.mark_output(
+            "last_token_logits" if last_token_logits else "logits", self._logits_dtype
+        )
         present.mark_output("present_key_value_0", self.config.kv_dtype)
         return logits
 

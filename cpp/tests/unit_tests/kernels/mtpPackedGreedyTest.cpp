@@ -84,3 +84,42 @@ TEST(MtpPackedGreedy, MatchesFirstMaximumForPackedRows)
         }
     }
 }
+
+TEST(MtpStateCommit, CopiesSelectedRecordsAndPreservesOtherBytes)
+{
+    auto stream = std::make_shared<CudaStream>();
+    BufferManager manager(stream);
+    constexpr int kRecords = 6;
+    constexpr int kSlotStride = 8192;
+    constexpr int kBytes = kRecords * 3 * kSlotStride;
+    auto host = BufferManager::cpu(ITensor::makeShape({kBytes}), nvinfer1::DataType::kINT8);
+    auto* initial = bufferCast<int8_t>(*host);
+    for (int i = 0; i < kBytes; ++i)
+    {
+        initial[i] = static_cast<int8_t>((i * 17 + i / kSlotStride) % 127);
+    }
+    auto addresses = BufferManager::pinned(ITensor::makeShape({2 * kRecords}), nvinfer1::DataType::kINT64);
+    // Include a partial vector and a full combined recurrent/convolution record.
+    for (int const bytes : {1, 15, 16, 273, kSlotStride / 2})
+    {
+        auto pool = manager.copyFrom(*host, MemoryType::kGPU);
+        std::vector<int8_t> expected(initial, initial + kBytes);
+        auto* pointers = bufferCast<int64_t>(*addresses);
+        for (int i = 0; i < kRecords; ++i)
+        {
+            int const dst = (kRecords - 1 - i) * 3 * kSlotStride + i % 2;
+            int const src = dst + (1 + i % 2) * kSlotStride;
+            pointers[2 * i] = reinterpret_cast<int64_t>(bufferCast<int8_t>(*pool) + src);
+            pointers[2 * i + 1] = reinterpret_cast<int64_t>(bufferCast<int8_t>(*pool) + dst);
+            std::copy_n(initial + src, bytes, expected.begin() + dst);
+        }
+        auto deviceAddresses = manager.copyFrom(*addresses, MemoryType::kGPU);
+        tensorrt_llm::kernels::invokeMTPCommitStateRecords(
+            bufferCast<int64_t>(*deviceAddresses), kRecords, bytes, stream->get());
+        auto result = manager.copyFrom(*pool, MemoryType::kCPU);
+        stream->synchronize();
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bufferCast<int8_t>(*result))) << "bytes=" << bytes;
+    }
+    tensorrt_llm::kernels::invokeMTPCommitStateRecords(nullptr, 0, kSlotStride, stream->get());
+    stream->synchronize();
+}

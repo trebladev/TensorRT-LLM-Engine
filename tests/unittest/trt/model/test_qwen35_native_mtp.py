@@ -28,6 +28,12 @@ from examples.models.core.qwen3_5.mtp_executor_demo import build_engines
 from tensorrt_llm.runtime import ModelRunnerCpp
 
 
+@pytest.fixture(params=[False, True], autouse=True)
+def draft_batching_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise merged generation and the explicit equal-length fallback."""
+    monkeypatch.setenv("TRTLLM_QWEN35_MTP_DISABLE_DRAFT_BATCHING", "1" if request.param else "0")
+
+
 @pytest.fixture(scope="module")
 def native_engine(tmp_path_factory):
     cached = os.environ.get("QWEN35_MTP_ENGINE_DIR")

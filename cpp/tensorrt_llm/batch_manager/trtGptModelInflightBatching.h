@@ -513,6 +513,8 @@ private:
     // RNN state manager for recurrent layers (optional)
     std::unique_ptr<RnnStateManager> mRnnStateManager;
     std::vector<TensorPtr> mLinearAttentionLayerStateViews;
+    TensorPtr mMtpCommitPointersHost;
+    TensorPtr mMtpCommitPointersDevice;
     std::vector<TensorPtr> mLinearAttentionRecurrentStatePointers;
     std::vector<TensorPtr> mLinearAttentionConvStatePointers;
 

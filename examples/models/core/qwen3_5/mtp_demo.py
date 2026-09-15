@@ -33,9 +33,13 @@ from .target_verification_demo import build_session
 
 
 def build_draft_engine(
-    model: Qwen35MTP, max_seq_len: int, max_batch_size: int = 1
+    model: Qwen35MTP,
+    max_seq_len: int,
+    max_batch_size: int = 1,
+    *,
+    last_token_logits: bool = False,
 ) -> trt.IHostMemory:
-    """Build a serializable continuous-KV draft engine."""
+    """Build a continuous-KV draft engine, optionally projecting one row per request."""
     builder = Builder()
     builder_config = builder.create_builder_config(precision="bfloat16", strongly_typed=True)
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
@@ -51,6 +55,7 @@ def build_draft_engine(
     with net_guard(network):
         network.set_named_parameters(model.named_parameters())
         model(
+            last_token_logits=last_token_logits,
             **model.prepare_inputs(
                 max_batch_size=max_batch_size,
                 max_input_len=max_seq_len,
@@ -60,7 +65,7 @@ def build_draft_engine(
                 use_cache=True,
                 max_draft_len=1,
                 speculative_decoding_draft_tokens_external=True,
-            )
+            ),
         )
     engine = builder.build_engine(network, builder_config)
     if engine is None:

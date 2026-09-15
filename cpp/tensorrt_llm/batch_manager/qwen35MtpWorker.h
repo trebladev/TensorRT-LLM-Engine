@@ -16,8 +16,10 @@
  */
 #pragma once
 
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
+#include <array>
 
 #include <map>
 #include <string>
@@ -25,7 +27,7 @@
 
 namespace tensorrt_llm::batch_manager
 {
-//! Synchronous native K=1 drafter with independent request histories and batched forwards.
+//! Native K=1 drafter with independent request histories and batched forwards.
 class Qwen35MtpWorker
 {
 public:
@@ -35,13 +37,20 @@ public:
         runtime::SizeType32 hiddenSize, runtime::SizeType32 vocabSize, runtime::SizeType32 maxBatchSize,
         runtime::SizeType32 rotaryDim);
 
+    ~Qwen35MtpWorker();
+
     //! Retain this request's packed target outputs until acceptance selects the valid prefix.
     void capture(std::uint64_t requestId, bool context, TensorPtr const& hiddenStates, TensorPtr const& rotaryCache,
         runtime::SizeType32 positionDelta);
 
     //! Queue shifted prompt tokens or newly accepted tokens for the next batched forward.
     void queue(std::uint64_t requestId, Tokens tokens);
+    //! Host result adapter for standalone callers; production uses draftDevice().
     std::map<std::uint64_t, runtime::TokenIdType> draft();
+    //! Enqueue candidates without a device-to-host transfer.
+    std::vector<std::uint64_t> draftDevice();
+    [[nodiscard]] TensorPtr const& candidate(std::uint64_t requestId) const;
+    void waitReady(runtime::CudaStream const& stream) const;
 
     [[nodiscard]] bool isContext(std::uint64_t requestId) const;
     //! Release history when its request completes, fails, is canceled, or pauses.
@@ -55,12 +64,24 @@ private:
         runtime::SizeType32 positionDelta = 0;
         bool context = false;
         TensorPtr kv;
+        TensorPtr candidate;
         TensorPtr hiddenStates;
         TensorPtr rotaryCache;
         Tokens tokens;
     };
 
-    std::vector<runtime::TokenIdType> draftBatch(std::vector<RequestState*> const& states);
+    struct Workspace
+    {
+        std::vector<TensorPtr> host;
+        std::vector<TensorPtr> device;
+        std::vector<TensorPtr> retained;
+        runtime::TllmRuntime::TensorMap outputs;
+    };
+
+    void draftBatch(std::vector<RequestState*> const& states);
+    std::array<Workspace, 3> mWorkspaces;
+    runtime::CudaEvent mReady;
+    bool mPending = false;
 
     runtime::TllmRuntime mRuntime;
     runtime::SizeType32 mMaxSequenceLength;
@@ -68,6 +89,8 @@ private:
     runtime::SizeType32 mVocabSize;
     runtime::SizeType32 mMaxBatchSize;
     runtime::SizeType32 mRotaryDim;
+    bool mMergeDraftBatches;
+    bool mLastTokenLogits = false;
     std::map<std::uint64_t, RequestState> mRequests;
 };
 } // namespace tensorrt_llm::batch_manager

@@ -469,7 +469,7 @@ int32_t GatedDeltaRulePlugin::enqueuePrefill(PluginTensorDesc const* inputDesc, 
 }
 
 int32_t GatedDeltaRulePlugin::enqueueDecode(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
-    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream, bool verification) noexcept
 {
     try
     {
@@ -504,9 +504,9 @@ int32_t GatedDeltaRulePlugin::enqueueDecode(PluginTensorDesc const* inputDesc, P
         auto const& valueDims = inputDesc[valueIdx].dims;
         TLLM_CHECK_WITH_INFO(queryDims.nbDims == 4 && valueDims.nbDims == 4,
             "GatedDeltaRulePlugin decode expects rank-4 query and value tensors");
-        TLLM_CHECK_WITH_INFO(queryDims.d[0] * queryDims.d[1] == numRequests,
+        TLLM_CHECK_WITH_INFO(verification || queryDims.d[0] * queryDims.d[1] == numRequests,
             "GatedDeltaRulePlugin decode expects exactly one query token per request");
-        TLLM_CHECK_WITH_INFO(valueDims.d[0] * valueDims.d[1] == numRequests,
+        TLLM_CHECK_WITH_INFO(verification || valueDims.d[0] * valueDims.d[1] == numRequests,
             "GatedDeltaRulePlugin decode expects exactly one value token per request");
         TLLM_CHECK_WITH_INFO(queryDims.d[2] == mNumQHeads && queryDims.d[3] == mHeadKDim,
             "GatedDeltaRulePlugin query shape does not match the configured heads");
@@ -538,7 +538,23 @@ int32_t GatedDeltaRulePlugin::enqueueDecode(PluginTensorDesc const* inputDesc, P
             static_cast<int32_t const*>(inputs[sourceStateSlotMappingIdx]),
             static_cast<int32_t const*>(inputs[targetStateSlotMappingIdx]),
             static_cast<int32_t const*>(inputs[cuSeqLensIdx]), numRequests};
-        mDecodeRunner->run(params, stream);
+        if (verification)
+        {
+            TLLM_CHECK(mPagedState);
+            params.finalState = outputs[1];
+            if (mUseStateSnapshots)
+            {
+                auto const idx = getHostHasInitialStateIdx() + 1;
+                TLLM_CHECK(
+                    inputDesc[idx].dims.nbDims == 1 && inputDesc[idx].dims.d[0] == queryDims.d[0] * queryDims.d[1]);
+                params.snapshotSlotMapping = static_cast<int32_t const*>(inputs[idx]);
+            }
+            mDecodeRunner->runVerification(params, stream);
+        }
+        else
+        {
+            mDecodeRunner->run(params, stream);
+        }
         return 0;
     }
     catch (std::exception const& e)
@@ -613,8 +629,12 @@ int32_t GatedDeltaRulePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginT
             TLLM_LOG_ERROR("GatedDeltaRule verification requires one or two packed tokens per request");
             return -1;
         }
-        // Use the stateful chunk path as the correctness reference for K=1.
-        // The caller owns the resulting tentative state until acceptance.
+        // The paged-state short path preserves chunk BF16 intermediates and
+        // per-token snapshots. The caller commits only the accepted prefix.
+        if (mPagedState)
+        {
+            return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream, true);
+        }
         return enqueuePrefill(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream);

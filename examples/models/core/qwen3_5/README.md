@@ -72,8 +72,12 @@ Pass `mtp_draft_engine_path` to `ModelRunnerCpp.from_dir`, or set
 The C++ worker primes draft KV from shifted prompt/hidden-state pairs, refreshes
 one candidate per request per iteration, and retains only each accepted prefix.
 Draft KV, lengths, and hidden-state slices are keyed by request ID. Prefills are
-batched with packed MRoPE coefficients; accepted single/two-token extensions
-run in separate generation groups. Requests run
+batched with packed MRoPE coefficients. Generation combines single/two-token
+extensions in one forward, padding after each valid prefix to the batch's maximum
+extension length. Sampling reads the last valid row; only valid tokens advance
+the logical draft history, and subsequent appends overwrite padding KV.
+If padding would exceed any request's KV capacity, that step falls back to
+separate equal-length groups. Requests run
 until EOS or their output limit; the last single-token position uses ordinary
 verification-free decoding. Request termination, cancellation, and pause release only that request's draft history.
 
@@ -83,15 +87,38 @@ engines to enable variable generation lengths before using batched native MTP.
 The target can mix prefill and generation, and generation requests may have one
 or two packed tokens. Disable prefix reuse, chunked context, overlap, and CUDA graphs.
 Returned generation logits/log probabilities, guided decoding, disaggregation, and prompt
-embeddings are unsupported. Draft argmax reduces the last logits row on GPU and
-copies back one token ID per request, preserving the first-maximum tie rule.
-Each draft group still synchronizes.
-Continuous draft KV is packed and copied back per request on each forward.
-Throughput gains remain workload-dependent; fewer copies and compact recurrent-state
-replay remain future work. BF16 computation is not bitwise invariant to batch shape:
-near-tied logits can select different greedy tokens even without MTP. Regression
-tests require matching token prefixes and check the reference logits explicitly
-for the final mixed-batch token, allowing at most one BF16 rounding unit.
+embeddings are unsupported. Draft argmax reduces the last logits row on GPU,
+preserving the first-maximum tie rule. Native execution retains candidate IDs
+on the GPU: target input staging and decoder acceptance consume the worker's
+candidate buffers after a CUDA event dependency. CPU draft vectors carry only
+the candidate count in this path.
+Set `TRTLLM_QWEN35_MTP_DISABLE_DRAFT_BATCHING=1` before creating the executor
+to restore equal-length generation groups. Unset it or set it to `0` for merged
+batching. This switch is read once per worker; existing engines need no rebuild.
+New native draft builds select each request's last valid hidden-state row before
+LM-head projection, returning `last_token_logits` with shape `[batch, vocab]`.
+Attention and KV updates still process all packed rows, including any trailing
+padding. The updated worker also accepts older draft engines with full packed
+`logits`; those engines retain their previous computation. Rebuild the draft
+engine and use the updated runtime to enable row selection; the target engine
+is unchanged. `build_draft_engine(..., last_token_logits=True)` enables this
+layout explicitly. Its default and the Python `build_draft_session` retain
+all-position logits for numerical reference tests.
+
+Draft input/staging and output buffers are reused separately for context and
+one/two-token generation groups. The production draft path returns after enqueue;
+its standalone host-result adapter still synchronizes. Target recurrent and
+convolution state commits use one batched copy kernel and one completion fence
+before request termination can release slots. CPU acceptance bookkeeping remains.
+Continuous draft KV is still packed and copied back per request on each forward,
+using reusable storage; a persistent indexed draft KV pool remains future work.
+Throughput gains remain workload-dependent. BF16 computation is not bitwise invariant to batch shape:
+near-tied logits can select different greedy tokens even without MTP. Merging
+draft batches can change candidates and acceptance boundaries, which can also
+change target rounding and final output tokens. Numerical and task-quality
+validation must accompany state/mask checks; bitwise equality to grouped decoding
+is not a general guarantee. The fixed synthetic regression cases retain their
+explicit token-prefix and reference-logit checks.
 
 `tests/unittest/trt/model/test_qwen35_native_mtp.py` compares persistent generation
 with target greedy decoding, including output limits, cache block boundaries,
@@ -99,6 +126,11 @@ EOS, request reuse, multiple active requests, and staggered arrivals with mixed
 output budgets. Scheduler statistics check that generation actually runs
 concurrently and overlaps with prefill. Set `LLM_MODELS_ROOT` to the checkpoint parent directory.
 `QWEN35_MTP_ENGINE_DIR` optionally reuses engines built by this demo.
+`test_qwen35_mtp_batching.py` additionally checks valid-row projection against
+an all-position draft engine, ragged context, mixed generation widths, padding
+isolation, and valid KV equality. Its optional `QWEN35_MTP_REFERENCE_ENGINE_DIR`
+must point to an all-position draft engine; `QWEN35_MTP_ENGINE_DIR` must point
+to a newly built last-token engine for the projection comparisons.
 
 ### Native MTP generation with persistent TensorRT Sessions
 
