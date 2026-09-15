@@ -17,6 +17,7 @@
 
 import argparse
 import gc
+import json
 from pathlib import Path
 
 import tensorrt as trt
@@ -38,8 +39,10 @@ def build_draft_engine(
     max_batch_size: int = 1,
     *,
     last_token_logits: bool = False,
+    paged_kv_cache: bool = False,
+    tokens_per_block: int = 32,
 ) -> trt.IHostMemory:
-    """Build a continuous-KV draft engine, optionally projecting one row per request."""
+    """Build a draft engine with continuous or persistent paged attention KV."""
     builder = Builder()
     builder_config = builder.create_builder_config(precision="bfloat16", strongly_typed=True)
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
@@ -50,7 +53,9 @@ def build_draft_engine(
     network.plugin_config.gemm_plugin = "bfloat16"
     network.plugin_config.mamba_conv1d_plugin = "bfloat16"
     network.plugin_config.remove_input_padding = True
-    network.plugin_config.paged_kv_cache = False
+    network.plugin_config.paged_kv_cache = paged_kv_cache
+    if paged_kv_cache:
+        network.plugin_config.tokens_per_block = tokens_per_block
     network.plugin_config.paged_state = True
     with net_guard(network):
         network.set_named_parameters(model.named_parameters())
@@ -71,6 +76,40 @@ def build_draft_engine(
     if engine is None:
         raise RuntimeError("Failed to build the MTP draft engine")
     return engine
+
+
+def save_paged_draft_engine(
+    model: Qwen35MTP,
+    path: Path,
+    max_seq_len: int,
+    max_batch_size: int,
+    tokens_per_block: int = 32,
+) -> None:
+    """Save the native worker's paged engine and its cache allocation geometry."""
+    engine = build_draft_engine(
+        model,
+        max_seq_len,
+        max_batch_size,
+        last_token_logits=True,
+        paged_kv_cache=True,
+        tokens_per_block=tokens_per_block,
+    )
+    path.write_bytes(bytes(engine))
+    Path(str(path) + ".json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "dtype": "bfloat16",
+                "num_kv_heads": model.config.num_key_value_heads,
+                "head_size": model.config.head_size,
+                "tokens_per_block": tokens_per_block,
+                "max_seq_len": max_seq_len,
+                "max_batch_size": max_batch_size,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 def build_draft_session(model: Qwen35MTP, max_seq_len: int) -> Qwen35MTPSession:

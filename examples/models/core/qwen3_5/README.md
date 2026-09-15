@@ -57,15 +57,15 @@ Build matching target/draft engines and run automatic drafting:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m examples.models.core.qwen3_5.mtp_executor_demo \
     --model_dir /path/to/Qwen3.5-2B \
-    --engine_dir /tmp/qwen35_mtp --max_batch_size 4 --build \
+    --engine_dir engines/qwen35/mtp_paged --max_batch_size 4 --build \
     --prompt "The capital of France is" --max_new_tokens 24
 ```
 
 Omit `--build` to reuse the engines. Use the same `--max_batch_size` at runtime.
 Repeat `--prompt` to submit multiple prompts together. Rebuild and install the C++ runtime, plugins,
 and Python bindings from this branch before running the demo. The target uses
-paged attention KV and exports `mtp_hidden_states`; `mtp.engine` uses continuous
-KV and includes the extra verification position reserved by the target builder.
+paged attention KV and exports `mtp_hidden_states`; `mtp.engine` uses its own
+persistent paged KV and includes the extra verification position reserved by the target builder.
 
 Pass `mtp_draft_engine_path` to `ModelRunnerCpp.from_dir`, or set
 `ExecutorConfig.spec_dec_config.mtp_draft_engine_path` through the Python bindings.
@@ -110,8 +110,19 @@ one/two-token generation groups. The production draft path returns after enqueue
 its standalone host-result adapter still synchronizes. Target recurrent and
 convolution state commits use one batched copy kernel and one completion fence
 before request termination can release slots. CPU acceptance bookkeeping remains.
-Continuous draft KV is still packed and copied back per request on each forward,
-using reusable storage; a persistent indexed draft KV pool remains future work.
+New native builds use a persistent paged draft KV pool with 32 tokens per block.
+Each active request owns a fixed slot; changing batch membership only updates
+block indices. Attention reads history and appends KV directly in that slot,
+removing the per-forward history gather/scatter. Accepted logical lengths select
+the next write position, overwriting any trailing padding. Slots are returned
+only after pending draft work completes. This is a fixed-capacity pool, without
+prefix sharing or dynamic block allocation.
+
+`save_paged_draft_engine` saves `mtp.engine.json` alongside `mtp.engine`; keep
+both files together because the worker needs the cache geometry to allocate its
+pool. Only the draft engine needs rebuilding. Existing continuous draft engines
+remain supported with their gather/scatter path. The Python Session reference
+continues to use continuous KV.
 Throughput gains remain workload-dependent. BF16 computation is not bitwise invariant to batch shape:
 near-tied logits can select different greedy tokens even without MTP. Merging
 draft batches can change candidates and acceptance boundaries, which can also
@@ -130,7 +141,9 @@ concurrently and overlaps with prefill. Set `LLM_MODELS_ROOT` to the checkpoint 
 an all-position draft engine, ragged context, mixed generation widths, padding
 isolation, and valid KV equality. Its optional `QWEN35_MTP_REFERENCE_ENGINE_DIR`
 must point to an all-position draft engine; `QWEN35_MTP_ENGINE_DIR` must point
-to a newly built last-token engine for the projection comparisons.
+to a continuous last-token engine for the projection comparisons.
+`qwen35MtpWorkerTest` supports either layout and checks capacity fallback,
+physical-slot isolation across page boundaries, batch shrinkage, and ID reuse.
 
 ### Native MTP generation with persistent TensorRT Sessions
 

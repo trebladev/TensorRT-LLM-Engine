@@ -28,21 +28,19 @@ from tensorrt_llm.models.qwen35.model import Qwen35ForCausalLM
 from tensorrt_llm.models.qwen35.mtp import Qwen35MTP
 from tensorrt_llm.runtime import ModelRunnerCpp
 
-from .mtp_demo import build_draft_engine
+from .mtp_demo import save_paged_draft_engine
 
 
 def build_engines(
     model_dir: Path, engine_dir: Path, max_seq_len: int = 128, max_batch_size: int = 1
 ) -> Path:
-    """Save a paged-KV target and a continuous-KV MTP draft engine."""
+    """Save a paged-KV target and a persistent paged-KV MTP draft engine."""
     if max_batch_size < 1 or max_seq_len < 3:
         raise ValueError("max_batch_size must be positive and max_seq_len must be at least 3")
     engine_dir.mkdir(parents=True, exist_ok=True)
     model = Qwen35MTP.from_hugging_face(model_dir)
     draft_path = engine_dir / "mtp.engine"
-    draft_path.write_bytes(
-        bytes(build_draft_engine(model, max_seq_len + 1, max_batch_size, last_token_logits=True))
-    )
+    save_paged_draft_engine(model, draft_path, max_seq_len + 1, max_batch_size)
     del model
     gc.collect()
     torch.cuda.empty_cache()

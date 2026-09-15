@@ -85,5 +85,73 @@ TEST(Qwen35MtpWorkerTest, MixedExtensionsAtCapacity)
     queue(1, true, {21});
     ASSERT_EQ(worker.draft().size(), 1);
 }
+
+// The two workers see identical packed inputs but allocate physical slots in
+// opposite orders. Every candidate must survive page boundaries and slot reuse.
+TEST(Qwen35MtpWorkerTest, SlotIsolationAcrossPages)
+{
+    auto const* directory = std::getenv("QWEN35_MTP_ENGINE_DIR");
+    if (directory == nullptr)
+    {
+        GTEST_SKIP() << "Set QWEN35_MTP_ENGINE_DIR to a Qwen3.5-2B BF16 batch>=4 engine directory";
+    }
+    constexpr SizeType32 kCapacity = 129;
+    constexpr SizeType32 kHiddenSize = 2048;
+    constexpr SizeType32 kRotaryDim = 64;
+    TllmLogger logger;
+    ASSERT_TRUE(initTrtLlmPlugins(&logger));
+    auto const path = (std::filesystem::path(directory) / "mtp.engine").string();
+    Qwen35MtpWorker first(path, &logger, kCapacity, kHiddenSize, 248320, 4, kRotaryDim);
+    Qwen35MtpWorker second(path, &logger, kCapacity, kHiddenSize, 248320, 4, kRotaryDim);
+    BufferManager manager(std::make_shared<CudaStream>());
+    auto queue = [&](Qwen35MtpWorker& worker, std::uint64_t id, bool context, SizeType32 count, SizeType32 step)
+    {
+        auto host = BufferManager::cpu(ITensor::makeShape({count, kHiddenSize}), nvinfer1::DataType::kBF16);
+        // Deterministic BF16 values in [0.5, 1), varying by request and step.
+        auto* bits = static_cast<std::uint16_t*>(host->data());
+        for (std::size_t i = 0; i < host->getSize(); ++i)
+        {
+            bits[i] = static_cast<std::uint16_t>(0x3f00 + (i * 13 + id * 7 + step * 11) % 128);
+        }
+        Qwen35MtpWorker::TensorPtr hidden = manager.copyFrom(*host, MemoryType::kGPU);
+        Qwen35MtpWorker::TensorPtr rope
+            = manager.gpu(ITensor::makeShape({count * kRotaryDim}), nvinfer1::DataType::kFLOAT);
+        manager.setZero(*rope);
+        manager.getStream().synchronize();
+        worker.capture(id, context, hidden, rope, 0);
+        worker.queue(id, Qwen35MtpWorker::Tokens(count, static_cast<TokenIdType>(11 + id * 17 + step)));
+    };
+    for (std::uint64_t id : {1, 2, 3, 4})
+    {
+        queue(first, id, true, 30 + id % 3, 0);
+    }
+    for (std::uint64_t id : {4, 3, 2, 1})
+    {
+        queue(second, id, true, 30 + id % 3, 0);
+    }
+    EXPECT_EQ(first.draft(), second.draft());
+    for (SizeType32 step = 1; step <= 65; ++step)
+    {
+        // Shrink the active batch, then reinitialize the same ID in a released
+        // slot. Retained requests must keep their independent histories.
+        if (step == 12)
+        {
+            first.release(2);
+            second.release(2);
+        }
+        for (std::uint64_t id : {1, 2, 3, 4})
+        {
+            if (id == 2 && step >= 12 && step < 16)
+            {
+                continue;
+            }
+            auto const context = id == 2 && step == 16;
+            auto const count = context ? 31 : 1 + (step + id) % 2;
+            queue(first, id, context, count, step);
+            queue(second, id, context, count, step);
+        }
+        EXPECT_EQ(first.draft(), second.draft()) << "step=" << step;
+    }
+}
 } // namespace
 } // namespace tensorrt_llm::batch_manager

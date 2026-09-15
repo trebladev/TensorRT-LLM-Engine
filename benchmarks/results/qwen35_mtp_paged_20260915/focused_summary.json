@@ -1,0 +1,54 @@
+{
+  "summary": [
+    {
+      "isl": 32,
+      "batch": 4,
+      "old": {
+        "mean_wall_ms": 373.52086207829416,
+        "pooled_tokens_per_s": 685.37001809109,
+        "accepted": 1252,
+        "proposals": 1738
+      },
+      "new": {
+        "mean_wall_ms": 371.3215889098744,
+        "pooled_tokens_per_s": 689.4293454672663,
+        "accepted": 1252,
+        "proposals": 1738
+      },
+      "mtp_latency_reduction_pct": 0.5887952700105892
+    },
+    {
+      "isl": 64,
+      "batch": 4,
+      "old": {
+        "mean_wall_ms": 367.53954750020057,
+        "pooled_tokens_per_s": 696.5236849780371,
+        "accepted": 1340,
+        "proposals": 1662
+      },
+      "new": {
+        "mean_wall_ms": 367.53992177546024,
+        "pooled_tokens_per_s": 696.5229756902356,
+        "accepted": 1340,
+        "proposals": 1662
+      },
+      "mtp_latency_reduction_pct": -0.0001018326496238231
+    }
+  ],
+  "checks": [
+    {
+      "trial": 0,
+      "comparison": "new_vs_old",
+      "all_acceptance_counts_equal": true,
+      "all_output_ids_equal": true,
+      "different_rows": []
+    },
+    {
+      "trial": 1,
+      "comparison": "new_vs_old",
+      "all_acceptance_counts_equal": true,
+      "all_output_ids_equal": true,
+      "different_rows": []
+    }
+  ]
+}

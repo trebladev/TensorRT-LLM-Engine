@@ -63,6 +63,7 @@ private:
         runtime::SizeType32 promptLength = 0;
         runtime::SizeType32 positionDelta = 0;
         bool context = false;
+        runtime::SizeType32 slot = -1;
         TensorPtr kv;
         TensorPtr candidate;
         TensorPtr hiddenStates;
@@ -91,6 +92,12 @@ private:
     runtime::SizeType32 mRotaryDim;
     bool mMergeDraftBatches;
     bool mLastTokenLogits = false;
+    bool mPagedKv = false;
+    runtime::SizeType32 mBlocksPerSlot = 0;
+    TensorPtr mKvPool;
+    TensorPtr mPoolPointers;
+    TensorPtr mPoolMapping;
+    std::vector<runtime::SizeType32> mFreeSlots;
     std::map<std::uint64_t, RequestState> mRequests;
 };
 } // namespace tensorrt_llm::batch_manager

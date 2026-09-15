@@ -132,13 +132,12 @@ class Qwen35MTP(Qwen35ForCausalLM):
         logits.mark_output(
             "last_token_logits" if last_token_logits else "logits", self._logits_dtype
         )
-        present.mark_output("present_key_value_0", self.config.kv_dtype)
+        if not default_net().plugin_config.paged_kv_cache:
+            present.mark_output("present_key_value_0", self.config.kv_dtype)
         return logits
 
     def prepare_inputs(self, *args, **kwargs) -> dict:
         """Use the target's K=1 profiles, with an additional packed hidden input."""
-        if default_net().plugin_config.paged_kv_cache:
-            raise ValueError("The MTP Session requires continuous attention KV")
         if kwargs.get("max_draft_len") != 1:
             raise ValueError("MTP requires K=1 engine profiles")
         kwargs["speculative_decoding_draft_tokens_external"] = False

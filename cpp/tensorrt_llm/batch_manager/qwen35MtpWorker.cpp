@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <numeric>
 
 namespace tensorrt_llm::batch_manager
@@ -42,16 +44,52 @@ Qwen35MtpWorker::Qwen35MtpWorker(std::string const& enginePath, nvinfer1::ILogge
 {
     auto const& engine = mRuntime.getEngine();
     TLLM_CHECK_WITH_INFO(engine.getNbOptimizationProfiles() == 1, "Native MTP requires a single-profile draft engine");
+    mPagedKv = engine.getTensorIOMode("kv_cache_block_offsets") == nvinfer1::TensorIOMode::kINPUT;
     TLLM_CHECK_WITH_INFO(engine.getTensorIOMode("target_hidden_states") == nvinfer1::TensorIOMode::kINPUT
-            && engine.getTensorIOMode("past_key_value_0") == nvinfer1::TensorIOMode::kINPUT,
-        "Native MTP requires a continuous-KV draft engine");
+            && (mPagedKv || engine.getTensorIOMode("past_key_value_0") == nvinfer1::TensorIOMode::kINPUT),
+        "Native MTP requires a continuous or paged KV draft engine");
     auto const hiddenShape = engine.getTensorShape("target_hidden_states");
     TLLM_CHECK_WITH_INFO(hiddenShape.nbDims == 2 && hiddenShape.d[1] == hiddenSize
             && engine.getTensorDataType("target_hidden_states") == nvinfer1::DataType::kBF16,
         "Native MTP draft hidden-state dimensions or dtype differ from target");
-    auto const kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
-    TLLM_CHECK_WITH_INFO(kvShape.nbDims == 5 && kvShape.d[0] >= maxBatchSize && kvShape.d[3] >= maxSequenceLength,
-        "Native MTP draft cache must cover the target maximum sequence length, and runtime batch size");
+    if (mPagedKv)
+    {
+        // Paged attention exposes pointers, not the allocation dimensions. Keep
+        // its geometry alongside the serialized engine, like the target config.
+        std::ifstream configFile(enginePath + ".json");
+        TLLM_CHECK_WITH_INFO(configFile.good(), "Paged MTP requires %s.json", enginePath.c_str());
+        auto const config = nlohmann::json::parse(configFile);
+        TLLM_CHECK(config.at("version").get<int>() == 1 && config.at("dtype").get<std::string>() == "bfloat16");
+        auto const blockSize = config.at("tokens_per_block").get<SizeType32>();
+        auto const heads = config.at("num_kv_heads").get<SizeType32>();
+        auto const headSize = config.at("head_size").get<SizeType32>();
+        TLLM_CHECK(blockSize > 0 && (blockSize & (blockSize - 1)) == 0 && heads > 0 && headSize > 0);
+        TLLM_CHECK(config.at("max_seq_len").get<SizeType32>() >= maxSequenceLength
+            && config.at("max_batch_size").get<SizeType32>() >= maxBatchSize);
+        mBlocksPerSlot = (maxSequenceLength + blockSize - 1) / blockSize;
+        auto const shape = engine.getProfileShape("kv_cache_block_offsets", 0, nvinfer1::OptProfileSelector::kMAX);
+        TLLM_CHECK(shape.nbDims == 4 && shape.d[0] == 1 && shape.d[1] >= maxBatchSize && shape.d[2] == 2
+            && shape.d[3] >= mBlocksPerSlot);
+        auto& manager = mRuntime.getBufferManager();
+        mKvPool = manager.gpu(ITensor::makeShape({static_cast<ITensor::DimType64>(maxBatchSize) * mBlocksPerSlot, 2,
+                                  heads, blockSize, headSize}),
+            nvinfer1::DataType::kBF16);
+        mPoolPointers = BufferManager::pinned(ITensor::makeShape({1, 2}), nvinfer1::DataType::kINT64);
+        bufferCast<std::int64_t>(*mPoolPointers)[0] = reinterpret_cast<std::int64_t>(mKvPool->data());
+        bufferCast<std::int64_t>(*mPoolPointers)[1] = 0;
+        mPoolMapping = BufferManager::pinned(ITensor::makeShape({1, 2}), nvinfer1::DataType::kINT32);
+        std::fill_n(bufferCast<SizeType32>(*mPoolMapping), 2, 0);
+        for (SizeType32 slot = maxBatchSize; slot > 0; --slot)
+        {
+            mFreeSlots.push_back(slot - 1);
+        }
+    }
+    else
+    {
+        auto const kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
+        TLLM_CHECK_WITH_INFO(kvShape.nbDims == 5 && kvShape.d[0] >= maxBatchSize && kvShape.d[3] >= maxSequenceLength,
+            "Native MTP draft cache must cover the target maximum sequence length, and runtime batch size");
+    }
     for (int i = 0; i < engine.getNbIOTensors(); ++i)
     {
         if (std::string(engine.getIOTensorName(i)) == "last_token_logits")
@@ -95,6 +133,11 @@ void Qwen35MtpWorker::release(std::uint64_t requestId)
     {
         mReady.synchronize();
     }
+    auto const it = mRequests.find(requestId);
+    if (mPagedKv && it != mRequests.end() && it->second.slot >= 0)
+    {
+        mFreeSlots.push_back(it->second.slot);
+    }
     mRequests.erase(requestId);
 }
 
@@ -109,7 +152,16 @@ void Qwen35MtpWorker::capture(std::uint64_t requestId, bool context, TensorPtr c
     if (context)
     {
         release(requestId);
-        mRequests.emplace(requestId, RequestState{});
+        if (mPagedKv)
+        {
+            TLLM_CHECK_WITH_INFO(!mFreeSlots.empty(), "Native MTP draft KV slots exhausted");
+        }
+        auto& state = mRequests.emplace(requestId, RequestState{}).first->second;
+        if (mPagedKv)
+        {
+            state.slot = mFreeSlots.back();
+            mFreeSlots.pop_back();
+        }
     }
     TLLM_CHECK_WITH_INFO(mRequests.count(requestId), "Native MTP generation has no matching draft history");
     TLLM_CHECK(hiddenStates && rotaryCache);
@@ -273,10 +325,14 @@ void Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
         positionDeltas.push_back(state->positionDelta);
     }
     auto const numTokens = static_cast<SizeType32>(tokens.size());
-    auto kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
-    kvShape.d[0] = batchSize;
-    kvShape.d[3] = mMaxSequenceLength;
-    TensorPtr kv = acquire(true, kvShape, nvinfer1::DataType::kBF16);
+    TensorPtr kv;
+    if (!mPagedKv)
+    {
+        auto kvShape = engine.getProfileShape("past_key_value_0", 0, nvinfer1::OptProfileSelector::kMAX);
+        kvShape.d[0] = batchSize;
+        kvShape.d[3] = mMaxSequenceLength;
+        kv = acquire(true, kvShape, nvinfer1::DataType::kBF16);
+    }
     TensorPtr hidden = acquire(true, ITensor::makeShape({numTokens, mHiddenSize}), nvinfer1::DataType::kBF16);
     if (!context)
     {
@@ -285,7 +341,7 @@ void Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
     auto ropeShape = engine.getProfileShape("mrope_rotary_cos_sin", 0, nvinfer1::OptProfileSelector::kMAX);
     ropeShape.d[0] = batchSize;
     TensorPtr rope = acquire(true, ropeShape, nvinfer1::DataType::kFLOAT);
-    if (context)
+    if (context && !mPagedKv)
     {
         manager.setZero(*kv);
     }
@@ -302,7 +358,7 @@ void Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
             manager.copy(*ITensor::slice(state.rotaryCache, 0, count * mRotaryDim),
                 *ITensor::slice(ropeFlat, offset * mRotaryDim, count * mRotaryDim));
         }
-        else
+        else if (!mPagedKv)
         {
             TLLM_CHECK(state.kv);
             manager.copy(*state.kv, *ITensor::slice(kv, i, 1));
@@ -337,6 +393,26 @@ void Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
         {"spec_decoding_generation_lengths", batchInts(std::vector<SizeType32>(batchSize, width), true)},
         {"spec_decoding_position_offsets", ints(offsets, ITensor::makeShape({batchSize, width}), true)},
         {"spec_decoding_packed_mask", ints(mask, ITensor::makeShape({batchSize * width, 1}), true)}};
+    if (mPagedKv)
+    {
+        std::vector<SizeType32> blocks(batchSize * 2 * mBlocksPerSlot);
+        for (SizeType32 i = 0; i < batchSize; ++i)
+        {
+            for (SizeType32 kvIndex = 0; kvIndex < 2; ++kvIndex)
+            {
+                for (SizeType32 block = 0; block < mBlocksPerSlot; ++block)
+                {
+                    blocks[(i * 2 + kvIndex) * mBlocksPerSlot + block]
+                        = (states[i]->slot * mBlocksPerSlot + block) * 2 + kvIndex;
+                }
+            }
+        }
+        auto const shape = ITensor::makeShape({1, batchSize, 2, mBlocksPerSlot});
+        allInputs.emplace("kv_cache_block_offsets", ints(blocks, shape, true));
+        allInputs.emplace("host_kv_cache_block_offsets", ints(blocks, shape, false));
+        allInputs.emplace("host_kv_cache_pool_pointers", mPoolPointers);
+        allInputs.emplace("host_kv_cache_pool_mapping", mPoolMapping);
+    }
     TllmRuntime::TensorMap inputs;
     for (int i = 0; i < engine.getNbIOTensors(); ++i)
     {
@@ -369,12 +445,15 @@ void Qwen35MtpWorker::draftBatch(std::vector<RequestState*> const& states)
     for (SizeType32 i = 0; i < batchSize; ++i)
     {
         auto& state = *states[i];
-        auto const outputKv = ITensor::slice(outputs.at("present_key_value_0"), i, 1);
-        if (!state.kv)
+        if (!mPagedKv)
         {
-            state.kv = manager.gpu(outputKv->getShape(), outputKv->getDataType());
+            auto const outputKv = ITensor::slice(outputs.at("present_key_value_0"), i, 1);
+            if (!state.kv)
+            {
+                state.kv = manager.gpu(outputKv->getShape(), outputKv->getDataType());
+            }
+            manager.copy(*outputKv, *state.kv);
         }
-        manager.copy(*outputKv, *state.kv);
         if (!state.candidate)
         {
             state.candidate = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
