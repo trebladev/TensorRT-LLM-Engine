@@ -268,8 +268,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             "Attention-linear hybrid models only support external draft verification.");
         if (specMode.isDraftTokensExternal())
         {
-            TLLM_CHECK_WITH_INFO(mModelConfig.getMaxDecodingDraftTokens() == 1 && tensorParallelism == 1,
-                "Qwen3.5 external draft verification requires K=1 and TP=1.");
+            TLLM_CHECK_WITH_INFO(mModelConfig.getMaxDecodingDraftTokens() >= 1
+                    && mModelConfig.getMaxDecodingDraftTokens() <= 30 && tensorParallelism == 1,
+                "Qwen3.5 external draft verification requires 1 <= K <= 30 and TP=1.");
             TLLM_CHECK_WITH_INFO(!kvCacheConfig.getEnableBlockReuse() && !executorConfig.getEnableChunkedContext(),
                 "Qwen3.5 external draft verification requires prefix reuse and chunked context disabled.");
         }
@@ -320,7 +321,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
                 && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
                 && mModelConfig.getDataType() == nvinfer1::DataType::kBF16 && mWorldConfig.getSize() == 1
                 && getMaxBeamWidth() == 1,
-            "Native Qwen3.5 MTP requires a BF16 K=1 hybrid target, single rank, and beam width one");
+            "Native Qwen3.5 MTP requires a BF16 hybrid target, single rank, and beam width one");
         TLLM_CHECK_WITH_INFO(!isTrtOverlap() && !isCudaGraphMode() && !nativeSpecConfig->fastLogits
                 && !executorConfig.getCacheTransceiverConfig() && !executorConfig.getGuidedDecodingConfig(),
             "Native MTP does not support overlap, CUDA graphs, fast logits, disaggregation, or guided decoding");
@@ -329,7 +330,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             "Build the native MTP target with capture_mtp_hidden_states=True");
         mNativeMtp = std::make_unique<Qwen35MtpWorker>(*nativeSpecConfig->mtpDraftEnginePath, mLogger.get(),
             getMaxSequenceLen(), mModelConfig.getHiddenSize(), mModelConfig.getVocabSize(), getMaxBatchSize(),
-            mModelConfig.getRotaryEmbeddingDim());
+            mModelConfig.getRotaryEmbeddingDim(), mModelConfig.getMaxDecodingDraftTokens());
     }
 
     setupSpeculativeDecodingModule(mDecodingConfig);
@@ -817,7 +818,7 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         kv_cache_manager::LinearAttentionMetadata metadata{};
         metadata.cacheType = kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
         auto const recordsPerBlock = mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
-            ? LinearAttentionBuffers::kVerificationStateRecords
+            ? mModelConfig.getMaxDecodingDraftTokens() + 2
             : 1;
         metadata.allRecurrentStatesBytes = linearConfig.getStateSlotBytes() * recordsPerBlock;
         constexpr SizeType32 kRecurrentStateSnapshotInterval = 256;
@@ -2112,11 +2113,11 @@ TrtGptModelInflightBatching::prepareBuffers(
             auto const count = request->getNumDraftTokens();
             if (count > 0)
             {
-                TLLM_CHECK(count == 1);
+                TLLM_CHECK(count <= mModelConfig.getMaxDecodingDraftTokens());
                 // The host draft vector carries only the shape. Patch its GPU
                 // input after normal staging, without reading the candidate on CPU.
                 manager.copy(*mNativeMtp->candidate(request->mRequestId),
-                    *ITensor::slice(inputMap.at("input_ids"), offset + 1, 1));
+                    *ITensor::slice(inputMap.at("input_ids"), offset + 1, count));
             }
             offset += count + 1;
         }
@@ -2624,7 +2625,8 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
             if (request->getNumDraftTokens() > 0)
             {
                 manager.copy(*mNativeMtp->candidate(request->mRequestId),
-                    *ITensor::slice(external->draftTokenIds, {request->mSeqSlot.value(), 0}, 1));
+                    *ITensor::slice(
+                        external->draftTokenIds, {request->mSeqSlot.value(), 0}, request->getNumDraftTokens()));
             }
         }
     }
@@ -2818,11 +2820,11 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                 }
                 auto const slot = request->mSeqSlot.value();
                 auto const emitted = sequenceLengthsHostData[slot * mOperatingBeamWidth] - request->getNumTokens(0);
-                TLLM_CHECK(emitted == 1 || emitted == 2
+                TLLM_CHECK((emitted >= 1 && emitted <= request->getNumDraftTokens() + 1)
                     || (emitted == 0 && decoderFinishedSumPtr[slot] == request->getBeamWidthByIter(true)));
                 auto const selected = std::max(1, emitted);
                 auto const offset = static_cast<int64_t>(cache.getRecurrentStateSlot(request->mRequestId))
-                    * LinearAttentionBuffers::kVerificationStateRecords * recordBytes;
+                    * (mModelConfig.getMaxDecodingDraftTokens() + 2) * recordBytes;
                 for (auto const& layer : mLinearAttentionLayerStateViews)
                 {
                     TLLM_CHECK(offset >= 0
@@ -2924,17 +2926,17 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         if (mModelConfig.isAttentionLinearHybrid() && mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
             && llmReq->getNumDraftTokens() > 0)
         {
-            // The final emitted token is pending. One output commits the before-draft
-            // snapshot; two outputs commit the state that includes the accepted draft.
+            // The final emitted token is pending. Commit the state after the
+            // pending input and the accepted draft prefix.
             auto const numOutputTokens = numNewTokens.at(0);
             // External-draft decoding excludes an accepted EOS from its sequence
             // length. In that terminal case retain the state before the candidate.
-            TLLM_CHECK_WITH_INFO(numOutputTokens == 1 || numOutputTokens == 2
+            TLLM_CHECK_WITH_INFO((numOutputTokens >= 1 && numOutputTokens <= llmReq->getNumDraftTokens() + 1)
                     || (numOutputTokens == 0 && decoderFinishedSumPtr[seqSlot] == reqBeamWidth),
-                "K=1 external verification must emit one or two tokens unless already finished.");
+                "External verification must emit at most K+1 tokens unless already finished.");
             auto const selectedRecord = std::max(1, numOutputTokens);
-            // Only the candidate was appended to context KV; the bonus was not.
-            mKvCacheManager->rewindKVCache(llmReq->mRequestId, 2 - selectedRecord);
+            // Draft candidates were appended to KV; the final emitted token was not.
+            mKvCacheManager->rewindKVCache(llmReq->mRequestId, llmReq->getNumDraftTokens() + 1 - selectedRecord);
         }
 
         // External-draft acceptance excludes EOS from the reported sequence length.
@@ -2958,7 +2960,8 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                 auto const& tokens = llmReq->getTokens(0);
                 auto const begin = mNativeMtp->isContext(llmReq->mRequestId) ? 1 : currentNumOfTokens;
                 std::vector<TokenIdType> acceptedTokens(tokens.begin() + begin, tokens.end());
-                mNativeMtp->queue(llmReq->mRequestId, std::move(acceptedTokens));
+                mNativeMtp->queue(llmReq->mRequestId, std::move(acceptedTokens),
+                    std::min(mModelConfig.getMaxDecodingDraftTokens(), remaining - 1));
             }
             llmReq->setDraftTokens(nextDraft);
         }
@@ -3085,7 +3088,8 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             {
                 // External-draft metadata needs a length; GPU consumers receive
                 // the actual candidate directly from the worker at launch time.
-                request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>(1, 0));
+                request->setDraftTokens(std::make_shared<std::vector<TokenIdType>>(
+                    mNativeMtp->candidate(request->mRequestId)->getSize(), 0));
             }
         }
     }

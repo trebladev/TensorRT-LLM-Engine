@@ -1394,31 +1394,32 @@ def test_gated_delta_rule_ragged_snapshots() -> None:
 
 
 @pytest.mark.parametrize("num_q_heads,num_v_heads", ((8, 8), (16, 16), (16, 32), (16, 48)))
-@pytest.mark.parametrize("lengths", ((2,), (1, 2, 1, 2), (2, 2, 2, 2)))
+@pytest.mark.parametrize("lengths", ((1,), (2,), (3,), (4,), (1, 4, 2, 3), (31, 1)))
 @pytest.mark.parametrize("snapshots", (False, True))
-def test_gated_delta_rule_short_verification_chunk_equivalence(
+def test_gated_delta_rule_recurrent_verification(
     num_q_heads: int, num_v_heads: int, lengths: tuple[int, ...], snapshots: bool
 ) -> None:
-    """Compare fused generation to chunk prefill through mixed accept/reject commits.
+    """Check every snapshot and accepted-prefix continuation against FP32 recurrence.
 
-    Both paths consume the same initial records, with non-contiguous slots and
-    a sentinel convolution tail. Only the selected snapshot is carried into the
-    next round, so tentative state or peer-request writes cannot go unnoticed.
+    Non-contiguous request slots and sentinel convolution tails detect writes
+    into peer requests, unselected slots, or the adjacent convolution state.
     """
-    torch.manual_seed(20260914)
+    torch.manual_seed(20260916)
     batch = len(lengths)
     total = sum(lengths)
+    slots_per_request = max(lengths) + 2
     state_elements = num_v_heads * HEAD_V_DIM * HEAD_K_DIM
-    tail_elements = 64
-    records = torch.randn((4 * batch, state_elements + tail_elements), device="cuda") * 0.02
+    records = torch.randn((slots_per_request * batch, state_elements + 64), device="cuda") * 0.02
     records[:, state_elements:] = 7
-    source = torch.arange(batch - 1, -1, -1, device="cuda", dtype=torch.int32) * 4
-    target = source + 2
+    source = torch.arange(batch - 1, -1, -1, device="cuda", dtype=torch.int32) * slots_per_request
+    target = source + torch.tensor(lengths, device="cuda", dtype=torch.int32)
     boundaries = [0, *np.cumsum(lengths).tolist()]
-    mapping = torch.full((total,), -1, device="cuda", dtype=torch.int32)
-    for i, length in enumerate(lengths):
-        mapping[boundaries[i]] = source[i] + 1
-        mapping[boundaries[i] + length - 1] = target[i]
+    mapping = torch.cat(
+        [
+            source[i] + torch.arange(1, length + 1, device="cuda", dtype=torch.int32)
+            for i, length in enumerate(lengths)
+        ]
+    )
     inputs = {
         "query": torch.randn((1, total, num_q_heads, 128), device="cuda", dtype=torch.bfloat16),
         "key": torch.randn((1, total, num_q_heads, 128), device="cuda", dtype=torch.bfloat16),
@@ -1426,7 +1427,7 @@ def test_gated_delta_rule_short_verification_chunk_equivalence(
         "log_decay": -0.1 * torch.rand((1, total, num_v_heads), device="cuda"),
         "beta": torch.sigmoid(torch.randn((1, total, num_v_heads), device="cuda")),
         "state": torch.tensor([records.data_ptr()], dtype=torch.int64),
-        "host_request_types": torch.zeros(batch, dtype=torch.int32),
+        "host_request_types": torch.ones(batch, dtype=torch.int32),
         "cu_seqlens": torch.tensor(boundaries, device="cuda", dtype=torch.int32),
         "state_slot_mapping": source,
         "target_state_slot_mapping": target,
@@ -1442,34 +1443,113 @@ def test_gated_delta_rule_short_verification_chunk_equivalence(
         remove_input_padding=True,
         state_slot_stride_bytes=records.stride(0) * records.element_size(),
     )
-    baseline = records.clone()
-    optimized = baseline.clone()
-    for step in range(3):
-        records.copy_(baseline)
-        inputs["host_request_types"].zero_()
-        expected_output, expected_final = _run_gated_delta_rule_session(session, inputs)
-        expected_records = records.clone()
-        fast_initial = optimized.clone()
-        records.copy_(fast_initial)
-        inputs["host_request_types"].fill_(1)
+    reference_records = records.clone()
+    for step in range(4):
+        initial = records.clone()
+        reference_state = reference_records[:, :state_elements].reshape(
+            -1, num_v_heads, HEAD_V_DIM, HEAD_K_DIM
+        )
+        expected_output, expected_state = _gated_delta_rule_prefill_reference(
+            inputs["query"],
+            inputs["key"],
+            inputs["value"],
+            inputs["log_decay"],
+            inputs["beta"],
+            reference_state,
+            inputs["cu_seqlens"],
+            source,
+            inputs["host_has_initial_state"],
+            target,
+            mapping if snapshots else None,
+        )
         output, final = _run_gated_delta_rule_session(session, inputs)
-        # The kernel retains chunk BF16 rounding; allow reduction-order effects,
-        # substantially tighter than the general recurrent reference tolerance.
+        actual_state = records[:, :state_elements].reshape_as(expected_state)
         torch.testing.assert_close(output, expected_output, atol=2e-3, rtol=1e-2)
-        torch.testing.assert_close(final, expected_final, atol=2e-5, rtol=1e-4)
-        torch.testing.assert_close(records, expected_records, atol=2e-5, rtol=1e-4)
+        torch.testing.assert_close(actual_state, expected_state, atol=2e-5, rtol=1e-4)
+        if total > batch or snapshots:
+            torch.testing.assert_close(final, expected_state[target.long()], atol=2e-5, rtol=1e-4)
         torch.testing.assert_close(
-            records[:, state_elements:], baseline[:, state_elements:], atol=0, rtol=0
+            records[:, state_elements:], initial[:, state_elements:], atol=0, rtol=0
         )
-        torch.testing.assert_close(
-            records[source.long()], fast_initial[source.long()], atol=0, rtol=0
-        )
-        torch.testing.assert_close(records[3::4], baseline[3::4], atol=0, rtol=0)
-        # Alternate accepted full extensions and rejected first-token snapshots.
+        written = mapping if snapshots else target
+        untouched = torch.ones(records.shape[0], device="cuda", dtype=torch.bool)
+        untouched[written.long()] = False
+        torch.testing.assert_close(records[untouched], initial[untouched], atol=0, rtol=0)
+        reference_records[:, :state_elements].copy_(expected_state.flatten(1))
+        # Rotate acceptance through different prefixes, then resume both paths.
         for i, length in enumerate(lengths):
-            selected = source[i] + (1 if snapshots and length == 2 and (step + i) % 2 else 2)
-            baseline[source[i].long()] = expected_records[selected.long()]
-            optimized[source[i].long()] = records[selected.long()]
+            accepted = 1 + (step + i) % length if snapshots else length
+            selected = (source[i] + accepted).long()
+            records[source[i].long()] = records[selected]
+            reference_records[source[i].long()] = reference_records[selected]
         inputs["query"].normal_()
         inputs["key"].normal_()
         inputs["value"].normal_()
+
+
+@pytest.mark.parametrize("num_q_heads,num_v_heads", ((8, 8), (16, 16), (16, 32), (16, 48)))
+def test_gated_delta_rule_verification_matches_sequential_decode(
+    num_q_heads: int, num_v_heads: int
+) -> None:
+    """A packed ragged verify must agree with repeated production decode calls."""
+    torch.manual_seed(20260917)
+    lengths = (4, 3, 1)
+    total = sum(lengths)
+    initial = torch.randn((3, num_v_heads, 128, 128), device="cuda") * 0.02
+    pool = initial.clone()
+    inputs = {
+        "query": torch.randn((1, total, num_q_heads, 128), device="cuda", dtype=torch.bfloat16),
+        "key": torch.randn((1, total, num_q_heads, 128), device="cuda", dtype=torch.bfloat16),
+        "value": torch.randn((1, total, num_v_heads, 128), device="cuda", dtype=torch.bfloat16),
+        "log_decay": -0.1 * torch.rand((1, total, num_v_heads), device="cuda"),
+        "beta": torch.sigmoid(torch.randn((1, total, num_v_heads), device="cuda")),
+        "state": torch.tensor([pool.data_ptr()], dtype=torch.int64),
+        "host_request_types": torch.ones(3, dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, 4, 7, 8], device="cuda", dtype=torch.int32),
+        "state_slot_mapping": torch.arange(3, device="cuda", dtype=torch.int32),
+        "host_has_initial_state": torch.ones(3, dtype=torch.int8),
+    }
+    verify = _build_gated_delta_rule_session(
+        {name: tuple(t.shape) for name, t in inputs.items()},
+        num_q_heads,
+        num_v_heads,
+        paged_state=True,
+        remove_input_padding=True,
+    )
+    output, final = _run_gated_delta_rule_session(verify, inputs)
+    sequential = initial.clone()
+    decode_inputs = {name: tensor.clone() for name, tensor in inputs.items()}
+    for name in ("query", "key", "value", "log_decay", "beta"):
+        decode_inputs[name] = inputs[name][:, :1].contiguous()
+    decode_inputs.update(
+        state=torch.tensor([sequential.data_ptr()], dtype=torch.int64),
+        host_request_types=torch.ones(1, dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        state_slot_mapping=torch.zeros(1, device="cuda", dtype=torch.int32),
+        host_has_initial_state=torch.ones(1, dtype=torch.int8),
+    )
+    decode = _build_gated_delta_rule_session(
+        {name: tuple(t.shape) for name, t in decode_inputs.items()},
+        num_q_heads,
+        num_v_heads,
+        paged_state=True,
+        remove_input_padding=True,
+    )
+    token = 0
+    for request, length in enumerate(lengths):
+        decode_inputs["state_slot_mapping"].fill_(request)
+        for _ in range(length):
+            for name in ("query", "key", "value", "log_decay", "beta"):
+                decode_inputs[name] = inputs[name][:, token : token + 1].contiguous()
+            expected, _ = _run_gated_delta_rule_session(decode, decode_inputs)
+            # Separate launches round FP32 state through memory; the fused loop
+            # can change FMA scheduling and a final BF16 rounding boundary.
+            torch.testing.assert_close(
+                output[:, token : token + 1],
+                expected,
+                atol=2e-7,
+                rtol=torch.finfo(torch.bfloat16).eps,
+            )
+            token += 1
+    torch.testing.assert_close(pool, sequential, atol=2e-7, rtol=1e-5)
+    torch.testing.assert_close(final, sequential, atol=2e-7, rtol=1e-5)

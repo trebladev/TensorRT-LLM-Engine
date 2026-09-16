@@ -36,7 +36,7 @@ full-attention layers with gated-delta linear-attention layers.
 | Standard legacy runtime/generation | Supported through `ModelRunnerCpp` |
 | External-draft verification | K=1, BF16/TP=1, greedy through `ModelRunnerCpp`; no prefix reuse or chunked context |
 | Native MTP generation | K=1 BF16/TP=1 text-only, one request, greedy through two persistent TensorRT Sessions; see below |
-| C++ executor automatic MTP drafting | K=1 BF16, single rank, batched greedy; see below |
+| C++ executor automatic MTP drafting | 1 <= K <= 30, BF16, single rank, batched greedy; see below |
 | Disaggregated serving and offload | Not supported |
 
 The implementation has been validated with the `Qwen3.5-2B` Hugging Face
@@ -48,7 +48,7 @@ are expected to use the same graph, but have not been validated yet.
 > [!NOTE]
 > Native MTP weights and a persistent two-engine generation loop are available
 > as a Session correctness baseline and a restricted automatic C++ executor path.
-> Both currently support K=1 BF16 greedy text generation on one rank.
+> Both support BF16 greedy text generation on one rank. The C++ executor also supports K > 1.
 
 ### Native MTP generation inside the C++ executor
 
@@ -57,7 +57,7 @@ Build matching target/draft engines and run automatic drafting:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m examples.models.core.qwen3_5.mtp_executor_demo \
     --model_dir /path/to/Qwen3.5-2B \
-    --engine_dir engines/qwen35/mtp_paged --max_batch_size 4 --build \
+    --engine_dir engines/qwen35/mtp_paged --max_batch_size 4 --max_draft_len 3 --build \
     --prompt "The capital of France is" --max_new_tokens 24
 ```
 
@@ -65,14 +65,17 @@ Omit `--build` to reuse the engines. Use the same `--max_batch_size` at runtime.
 Repeat `--prompt` to submit multiple prompts together. Rebuild and install the C++ runtime, plugins,
 and Python bindings from this branch before running the demo. The target uses
 paged attention KV and exports `mtp_hidden_states`; `mtp.engine` uses its own
-persistent paged KV and includes the extra verification position reserved by the target builder.
+persistent paged KV and includes the K extra verification positions reserved by the target builder.
 
 Pass `mtp_draft_engine_path` to `ModelRunnerCpp.from_dir`, or set
 `ExecutorConfig.spec_dec_config.mtp_draft_engine_path` through the Python bindings.
 The C++ worker primes draft KV from shifted prompt/hidden-state pairs, refreshes
-one candidate per request per iteration, and retains only each accepted prefix.
+up to K candidates per request per iteration, and retains only each accepted prefix.
+The same MTP layer runs autoregressively, feeding its normalized hidden output and
+GPU-selected token into the next draft step. After verification, target hidden states
+refresh the accepted prefix; tentative recursive draft KV is overwritten.
 Draft KV, lengths, and hidden-state slices are keyed by request ID. Prefills are
-batched with packed MRoPE coefficients. Generation combines single/two-token
+batched with packed MRoPE coefficients. Generation combines variable-length
 extensions in one forward, padding after each valid prefix to the batch's maximum
 extension length. Sampling reads the last valid row; only valid tokens advance
 the logical draft history, and subsequent appends overwrite padding KV.
@@ -81,11 +84,19 @@ separate equal-length groups. Requests run
 until EOS or their output limit; the last single-token position uses ordinary
 verification-free decoding. Request termination, cancellation, and pause release only that request's draft history.
 
-This path requires BF16, K=1, TP=PP=CP=1, beam width one, and `top_k=1`.
+This path requires BF16, 1 <= K <= 30, TP=PP=CP=1, beam width one, and `top_k=1`.
+Set `--max_draft_len` when building both engines (default: 1). Runtime K comes
+from the target engine configuration. K is capped at 30 by the single-word causal
+mask. Each recurrent cache block holds K+2 state records, so memory grows with K.
+Rebuild the draft engine for K > 1 to export its hidden states.
+BF16 multi-token forwards can round near-tied logits differently from single-token
+decode, so long token sequences are not guaranteed to be bit-identical. The
+K=2/3 tests compare every emitted token with independently captured target logits
+and bound the first divergence from single-token decoding by BF16 rounding.
 Build both engines for at least the runtime `max_batch_size`. Rebuild old target
 engines to enable variable generation lengths before using batched native MTP.
 The target can mix prefill and generation, and generation requests may have one
-or two packed tokens. Disable prefix reuse, chunked context, overlap, and CUDA graphs.
+through K+1 packed tokens. Disable prefix reuse, chunked context, overlap, and CUDA graphs.
 Returned generation logits/log probabilities, guided decoding, disaggregation, and prompt
 embeddings are unsupported. Draft argmax reduces the last logits row on GPU,
 preserving the first-maximum tie rule. Native execution retains candidate IDs
@@ -340,8 +351,9 @@ small enough to retain per-step snapshots.
 
 The original roadmap below remains useful for tracking broader support.
 Stages 1–6 have restricted K=1 verification implementations, and stage 7 now
-has native Session and automatic C++ executor baselines. General K,
-compact replay, and optimized/distributed configurations remain future work:
+has native Session and automatic C++ executor baselines. The C++ executor now
+supports K up to 30 using full snapshots. Compact replay and optimized/distributed
+configurations remain future work:
 
 | Stage | Implementation | Test types |
 | --- | --- | --- |

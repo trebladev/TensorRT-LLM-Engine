@@ -40,9 +40,6 @@ public:
     using TensorMap = runtime::ITensor::TensorMap;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    // Physical cache blocks contain committed, before-draft, and after-draft records.
-    static constexpr SizeType32 kVerificationStateRecords = 3;
-
     TensorPtr sourceStateSlotMappingHost;
     TensorPtr sourceStateSlotMappingDevice;
     TensorPtr targetStateSlotMappingHost;
@@ -55,7 +52,7 @@ public:
     TensorPtr snapshotSlotMappingDevice;
 
     LinearAttentionBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
-        SizeType32 maxSnapshotTokens = 0, bool externalDraftVerification = false);
+        SizeType32 maxSnapshotTokens = 0, bool externalDraftVerification = false, SizeType32 maxDraftLength = 1);
 
     void reshape(SizeType32 numSequences);
 
@@ -68,6 +65,7 @@ public:
 
 private:
     bool mExternalDraftVerification;
+    SizeType32 mMaxDraftLength;
     TensorPtr mSpecDecodingUse;
     TensorPtr mSpecDecodingLengths;
     TensorPtr mSpecDecodingOffsets;

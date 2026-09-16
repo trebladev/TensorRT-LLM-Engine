@@ -19,7 +19,6 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
-#include <array>
 
 #include <map>
 #include <string>
@@ -27,7 +26,7 @@
 
 namespace tensorrt_llm::batch_manager
 {
-//! Native K=1 drafter with independent request histories and batched forwards.
+//! Native autoregressive drafter with independent request histories and batched forwards.
 class Qwen35MtpWorker
 {
 public:
@@ -35,7 +34,7 @@ public:
     using Tokens = std::vector<runtime::TokenIdType>;
     Qwen35MtpWorker(std::string const& enginePath, nvinfer1::ILogger* logger, runtime::SizeType32 maxSequenceLength,
         runtime::SizeType32 hiddenSize, runtime::SizeType32 vocabSize, runtime::SizeType32 maxBatchSize,
-        runtime::SizeType32 rotaryDim);
+        runtime::SizeType32 rotaryDim, runtime::SizeType32 maxDraftLength = 1);
 
     ~Qwen35MtpWorker();
 
@@ -44,7 +43,7 @@ public:
         runtime::SizeType32 positionDelta);
 
     //! Queue shifted prompt tokens or newly accepted tokens for the next batched forward.
-    void queue(std::uint64_t requestId, Tokens tokens);
+    void queue(std::uint64_t requestId, Tokens tokens, runtime::SizeType32 draftLength = 1);
     //! Host result adapter for standalone callers; production uses draftDevice().
     std::map<std::uint64_t, runtime::TokenIdType> draft();
     //! Enqueue candidates without a device-to-host transfer.
@@ -66,6 +65,8 @@ private:
         runtime::SizeType32 slot = -1;
         TensorPtr kv;
         TensorPtr candidate;
+        TensorPtr inputToken;
+        runtime::SizeType32 draftLength = 1;
         TensorPtr hiddenStates;
         TensorPtr rotaryCache;
         Tokens tokens;
@@ -79,8 +80,9 @@ private:
         runtime::TllmRuntime::TensorMap outputs;
     };
 
-    void draftBatch(std::vector<RequestState*> const& states);
-    std::array<Workspace, 3> mWorkspaces;
+    void draftBatch(
+        std::vector<RequestState*> const& states, runtime::SizeType32 depth = 0, runtime::SizeType32 group = 0);
+    std::vector<Workspace> mWorkspaces;
     runtime::CudaEvent mReady;
     bool mPending = false;
 
@@ -90,6 +92,7 @@ private:
     runtime::SizeType32 mVocabSize;
     runtime::SizeType32 mMaxBatchSize;
     runtime::SizeType32 mRotaryDim;
+    runtime::SizeType32 mMaxDraftLength;
     bool mMergeDraftBatches;
     bool mLastTokenLogits = false;
     bool mPagedKv = false;

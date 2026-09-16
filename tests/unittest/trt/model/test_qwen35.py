@@ -724,12 +724,19 @@ def test_qwen35_external_draft_verification(
 @pytest.mark.parametrize(
     "draft_length,external,tp_size,use_cache,variable_length,error",
     [
-        (0, True, 1, True, False, "one external draft token"),
-        (1, False, 1, True, False, "one external draft token"),
-        (2, True, 1, True, False, "one external draft token"),
+        (0, True, 1, True, False, "1 to 30 external draft tokens"),
+        (1, False, 1, True, False, "1 to 30 external draft tokens"),
+        (31, True, 1, True, False, "1 to 30 external draft tokens"),
         (1, True, 2, True, False, "TP=1"),
         (1, True, 1, False, False, "use_cache=true"),
-        (0, False, 1, True, True, "Variable generation lengths require K=1"),
+        (
+            0,
+            False,
+            1,
+            True,
+            True,
+            "Variable generation lengths require external target verification",
+        ),
     ],
 )
 def test_qwen35_verification_rejects_unsupported_settings(

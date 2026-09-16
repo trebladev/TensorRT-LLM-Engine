@@ -41,6 +41,7 @@ def build_draft_engine(
     last_token_logits: bool = False,
     paged_kv_cache: bool = False,
     tokens_per_block: int = 32,
+    max_draft_len: int = 1,
 ) -> trt.IHostMemory:
     """Build a draft engine with continuous or persistent paged attention KV."""
     builder = Builder()
@@ -68,7 +69,7 @@ def build_draft_engine(
                 max_num_tokens=max_seq_len * max_batch_size,
                 opt_num_tokens=min(64, max_seq_len) * max_batch_size,
                 use_cache=True,
-                max_draft_len=1,
+                max_draft_len=max_draft_len,
                 speculative_decoding_draft_tokens_external=True,
             ),
         )
@@ -84,6 +85,7 @@ def save_paged_draft_engine(
     max_seq_len: int,
     max_batch_size: int,
     tokens_per_block: int = 32,
+    max_draft_len: int = 1,
 ) -> None:
     """Save the native worker's paged engine and its cache allocation geometry."""
     engine = build_draft_engine(
@@ -93,6 +95,7 @@ def save_paged_draft_engine(
         last_token_logits=True,
         paged_kv_cache=True,
         tokens_per_block=tokens_per_block,
+        max_draft_len=max_draft_len,
     )
     path.write_bytes(bytes(engine))
     Path(str(path) + ".json").write_text(

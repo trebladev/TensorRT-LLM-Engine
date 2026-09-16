@@ -31,15 +31,16 @@ using namespace tensorrt_llm::runtime;
 namespace tensorrt_llm::batch_manager
 {
 
-LinearAttentionBuffers::LinearAttentionBuffers(
-    SizeType32 maxBatchSize, BufferManager const& manager, SizeType32 maxSnapshotTokens, bool externalDraftVerification)
+LinearAttentionBuffers::LinearAttentionBuffers(SizeType32 maxBatchSize, BufferManager const& manager,
+    SizeType32 maxSnapshotTokens, bool externalDraftVerification, SizeType32 maxDraftLength)
     : mExternalDraftVerification(externalDraftVerification)
+    , mMaxDraftLength(maxDraftLength)
 {
     if (mExternalDraftVerification)
     {
         TLLM_CHECK(maxSnapshotTokens > 0);
-        // Context candidates use causal attention; native MTP also enables
-        // two-token speculative generation on later iterations.
+        // Context candidates use causal attention; generation uses a causal
+        // verification window containing the pending token and draft tokens.
         mSpecDecodingUse = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
         bufferCast<SizeType32>(*mSpecDecodingUse)[0] = 0;
         mSpecDecodingLengths = manager.gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
@@ -47,9 +48,9 @@ LinearAttentionBuffers::LinearAttentionBuffers(
         mSpecDecodingMask = manager.gpu(ITensor::makeShape({maxBatchSize, 1}), nvinfer1::DataType::kINT32);
         mSpecDecodingLengthsHost = BufferManager::cpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
         mSpecDecodingOffsetsHost
-            = BufferManager::cpu(ITensor::makeShape({maxBatchSize, 2}), nvinfer1::DataType::kINT32);
-        mSpecDecodingMaskHost
-            = BufferManager::cpu(ITensor::makeShape({maxBatchSize * 2, 1}), nvinfer1::DataType::kINT32);
+            = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLength + 1}), nvinfer1::DataType::kINT32);
+        mSpecDecodingMaskHost = BufferManager::cpu(
+            ITensor::makeShape({maxBatchSize * (maxDraftLength + 1), 1}), nvinfer1::DataType::kINT32);
         manager.setZero(*mSpecDecodingLengths);
         manager.setZero(*mSpecDecodingOffsets);
         manager.setZero(*mSpecDecodingMask);
@@ -101,7 +102,7 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
     auto* cuSeqlens = bufferCast<SizeType32>(*cuSeqlensHost);
     auto* hasInitialState = bufferCast<SizeType32>(*hostHasInitialState);
 
-    auto const recordsPerBlock = mExternalDraftVerification ? kVerificationStateRecords : 1;
+    auto const recordsPerBlock = mExternalDraftVerification ? mMaxDraftLength + 2 : 1;
     TLLM_CHECK_WITH_INFO(!mExternalDraftVerification || !kvCacheManager.isEnableBlockReuse(),
         "Qwen3.5 external draft verification does not support prefix reuse.");
     SizeType32* snapshotSlots = nullptr;
@@ -131,9 +132,9 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
     {
         auto const draftLength = request->getNumDraftTokens();
         TLLM_CHECK_WITH_INFO(draftLength == 0
-                || (mExternalDraftVerification && draftLength == 1 && request->isLastContextChunk()
+                || (mExternalDraftVerification && draftLength <= mMaxDraftLength && request->isLastContextChunk()
                     && request->getContextCurrentPosition() == 0),
-            "Qwen3.5 external draft verification requires one candidate and unchunked context.");
+            "Qwen3.5 external draft verification requires supported candidates and unchunked context.");
         auto const contextStart = request->getContextCurrentPosition();
         auto const contextEnd = contextStart + request->getContextChunkSize();
         auto const sourceTokenIdx = contextStart > 0 ? std::make_optional(contextStart - 1) : std::nullopt;
@@ -161,9 +162,12 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
         }
         if (draftLength > 0)
         {
-            snapshotSlots[cumulativeLength + request->getContextChunkSize() - 1]
-                = recordsPerBlock * slots.targetSlot + 1;
-            targetStateSlotMapping[sequenceIdx] += 2;
+            for (SizeType32 token = 0; token < draftLength; ++token)
+            {
+                snapshotSlots[cumulativeLength + request->getContextChunkSize() - 1 + token]
+                    = recordsPerBlock * slots.targetSlot + token + 1;
+            }
+            targetStateSlotMapping[sequenceIdx] += draftLength + 1;
             // Fresh prefill zeroes the target record. Read that same zeroed record,
             // not the committed bank left by an earlier owner of this physical block.
             if (!slots.sourceSlot.has_value())
@@ -182,8 +186,8 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
         auto const beamWidth = request->getBeamWidthByIter();
         TLLM_CHECK_WITH_INFO(beamWidth == 1, "Qwen3.5 linear attention only supports beam width 1.");
         auto const draftLength = request->getNumDraftTokens();
-        TLLM_CHECK_WITH_INFO(draftLength == 0 || (mExternalDraftVerification && draftLength == 1),
-            "Qwen3.5 linear attention only supports K=1 verification");
+        TLLM_CHECK_WITH_INFO(draftLength == 0 || (mExternalDraftVerification && draftLength <= mMaxDraftLength),
+            "Qwen3.5 draft length exceeds the verification profile");
         auto const lastTokenIdx = request->getNumTokens(/*beam=*/0) - 1;
         auto const slots = kvCacheManager.getRecurrentStateSlotPair(
             request->mRequestId, /*sourceTokenIdx=*/lastTokenIdx, /*targetTokenIdx=*/lastTokenIdx);
@@ -191,8 +195,11 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
         targetStateSlotMapping[sequenceIdx] = recordsPerBlock * slots.targetSlot;
         if (draftLength > 0)
         {
-            snapshotSlots[cumulativeLength] = recordsPerBlock * slots.targetSlot + 1;
-            targetStateSlotMapping[sequenceIdx] += 2;
+            for (SizeType32 token = 0; token < draftLength; ++token)
+            {
+                snapshotSlots[cumulativeLength + token] = recordsPerBlock * slots.targetSlot + token + 1;
+            }
+            targetStateSlotMapping[sequenceIdx] += draftLength + 1;
         }
         cumulativeLength += 1 + draftLength;
         cuSeqlens[sequenceIdx + 1] = cumulativeLength;
@@ -232,7 +239,7 @@ void LinearAttentionBuffers::fill(RequestVector const& contextRequests, RequestV
             bufferCast<SizeType32>(*mSpecDecodingLengthsHost)[i] = count;
             for (SizeType32 token = 0; token < count; ++token)
             {
-                bufferCast<SizeType32>(*mSpecDecodingMaskHost)[tokenOffset++] = (1 << (token + 1)) - 1;
+                bufferCast<SizeType32>(*mSpecDecodingMaskHost)[tokenOffset++] = (1U << (token + 1)) - 1;
             }
         }
     }

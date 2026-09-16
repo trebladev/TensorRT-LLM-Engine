@@ -151,8 +151,8 @@ void GatedDeltaRuleDecodeRunner::runVerification(GatedDeltaRuleDecodeParams cons
     CUdeviceptr profileScratch{};
     void* arguments[]{&query, &key, &value, &logDecay, &beta, &output, &state, &finalState, &sourceSlots, &targetSlots,
         &snapshots, &cuSeqLens, &stride, &useSnapshots, &scale, &globalScratch, &profileScratch};
-    constexpr unsigned int kBlockThreads = 128;
-    constexpr int32_t kValueTile = 16;
+    constexpr unsigned int kBlockThreads = 32;
+    constexpr int32_t kValueTile = 8;
     TLLM_CU_CHECK(mDriver->cuLaunchKernel(mVerificationFunction, params.batchSize, mNumVHeads,
         (mHeadVDim + kValueTile - 1) / kValueTile, kBlockThreads, 1, 1, mVerificationSharedMemoryBytes, stream,
         arguments, nullptr));

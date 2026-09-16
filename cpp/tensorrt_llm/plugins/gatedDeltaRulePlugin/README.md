@@ -90,19 +90,21 @@ not currently supported.
 
 ## Short speculative verification
 
-Paged-state generation batches containing one or two tokens per request use a
-single fused AOT kernel when the packed token count exceeds the request count.
-This replaces the general chunk-prefill pipeline for K=1 speculative verification.
-Ordinary single-token decode and context prefill retain their existing kernels.
-Non-paged verification retains the chunk-prefill implementation.
+Paged-state multi-token generation uses one fused recurrent AOT kernel. Each
+request loads its initial FP32 state tile once, loops over its packed token
+range, and writes an output and optional state snapshot at every step. Ragged
+lengths are read from `cu_seqlens`; there is no two-token limit. Single-token
+batches with snapshots also use this kernel so every verification publishes its
+state. Ordinary decode without snapshots and context prefill retain their
+existing kernels. Non-paged verification retains the chunk-prefill implementation.
 
-The fused kernel preserves normalized BF16 Q/K, rounded chunk intermediates,
-FP32 recurrent state, separate source/target slots, and per-token snapshots.
-Snapshots are computed from the initial chunk state so rejected draft tokens
-can be discarded by selecting the accepted snapshot. The final output uses the
-same FMA ordering as the chunk output kernel, including cancellation-sensitive
-BF16 rounding. Combined recurrent/convolution records retain their configured
-stride; convolution tails are not written by GDN.
+The recurrence and Q/K normalization follow single-token decode, including its
+epsilon placement. Intermediate arithmetic remains FP32 instead of reproducing
+the BF16-rounded chunk algebra. Consequently verification can differ numerically
+from chunk prefill; validation compares it against sequential decode and checks
+accepted-prefix continuation. Separate source/target slots and per-token
+snapshots retain the existing commit protocol. Combined recurrent/convolution
+records retain their configured stride; convolution tails are not written by GDN.
 
 The supported hardware and head configurations are the same as decode above.
 No serialized plugin fields change, so existing compatible engines can load the

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Measure fixed-length native K=1 MTP against ordinary TensorRT decoding.
+"""Measure fixed-length native multi-token MTP against ordinary TensorRT decoding.
 
 Run each mode in a fresh process with CUDA_VISIBLE_DEVICES selecting one GPU.
 Engine loading, tokenization and request preparation are excluded from timings.
@@ -76,10 +76,14 @@ def _gpu_snapshot(handle) -> dict:
         "device_mib": pynvml.nvmlDeviceGetMemoryInfo(handle).used / 2**20,
         "sm_mhz": pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM),
         "temperature_c": pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU),
+        "gpu_utilization_pct": pynvml.nvmlDeviceGetUtilizationRates(handle).gpu,
+        "power_w": pynvml.nvmlDeviceGetPowerUsage(handle) / 1000,
     }
 
 
-def _measure(runner: ModelRunnerCpp, prompts: list[list[int]], osl: int, mtp: bool) -> dict:
+def _measure(
+    runner: ModelRunnerCpp, prompts: list[list[int]], osl: int, mtp: bool, max_draft_len: int = 1
+) -> dict:
     ropes = runner._prepare_mrope_executor(prompts, None)
     requests = [
         executor.Request(
@@ -101,7 +105,7 @@ def _measure(runner: ModelRunnerCpp, prompts: list[list[int]], osl: int, mtp: bo
     tokens = {rid: [] for rid in ids}
     events = {rid: [] for rid in ids}
     finished = set()
-    accepted = proposals = 0
+    accepted = proposals = verification_rounds = 0
     while len(finished) < len(ids):
         responses = runner.session.await_responses(timeout=datetime.timedelta(seconds=30))
         now = time.perf_counter() - start
@@ -115,13 +119,14 @@ def _measure(runner: ModelRunnerCpp, prompts: list[list[int]], osl: int, mtp: bo
             new = result.output_token_ids[0]
             previous = len(tokens[rid])
             if new:
-                if len(new) not in ((1, 2) if mtp else (1,)):
+                if not 1 <= len(new) <= (max_draft_len + 1 if mtp else 1):
                     raise RuntimeError(f"Unexpected streaming chunk length: {len(new)}")
                 if previous == 0 and len(new) != 1:
                     raise RuntimeError("Expected one prefill token")
                 if mtp and previous > 0 and osl - previous > 1:
-                    proposals += 1
+                    proposals += min(max_draft_len, osl - previous - 1)
                     accepted += len(new) - 1
+                    verification_rounds += 1
                 events[rid].append([now, len(new)])
                 tokens[rid].extend(new)
             if result.is_final:
@@ -138,6 +143,8 @@ def _measure(runner: ModelRunnerCpp, prompts: list[list[int]], osl: int, mtp: bo
         "latency_ms": [events[rid][-1][0] * 1000 for rid in ids],
         "accepted": accepted,
         "proposals": proposals,
+        "verification_rounds": verification_rounds,
+        "generation_rounds": sum(len(events[rid]) - 1 for rid in ids),
         "output_ids": [tokens[rid] for rid in ids],
         "events": [events[rid] for rid in ids],
         "input_ids": prompts,
@@ -161,12 +168,15 @@ def main() -> None:
     parser.add_argument("--isl", type=int, nargs="+", default=[32, 64])
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--osl", type=int, default=64)
+    parser.add_argument("--kv_cache_free_gpu_memory_fraction", type=float, default=0.1)
     args = parser.parse_args()
     if args.build_plain:
         _build_plain(args.model_dir, args.engine_dir)
         return
     if args.output is None:
         parser.error("--output is required for measurement")
+    if not 0 < args.kv_cache_free_gpu_memory_fraction < 1:
+        parser.error("kv_cache_free_gpu_memory_fraction must be between zero and one")
     if args.repeats < 1 or args.warmup < 1 or args.osl < 2:
         parser.error("repeats/warmup must be positive and osl must be at least 2")
     if any(c not in (1, 2, 3, 4) for c in args.concurrency):
@@ -174,13 +184,15 @@ def main() -> None:
     if any(n < 1 or n + args.osl > 128 for n in args.isl):
         parser.error("ISL must be positive and ISL + OSL must not exceed 128")
     engine_config = json.loads((args.engine_dir / "config.json").read_text())
-    speculative = engine_config["build_config"]["max_draft_len"] > 0
+    max_draft_len = engine_config["build_config"]["max_draft_len"]
+    speculative = max_draft_len > 0
     if speculative != (args.mode != "plain"):
         parser.error(
             "plain requires a non-speculative engine; target_only/mtp require a speculative target"
         )
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByUUID(str(torch.cuda.get_device_properties(0).uuid))
+    gpu_before_load = _gpu_snapshot(handle)
     runner = ModelRunnerCpp.from_dir(
         str(args.engine_dir),
         max_batch_size=4,
@@ -188,6 +200,7 @@ def main() -> None:
         kv_cache_enable_block_reuse=False,
         enable_chunked_context=False,
         max_tokens_in_paged_kv_cache=1024,
+        kv_cache_free_gpu_memory_fraction=args.kv_cache_free_gpu_memory_fraction,
         mtp_draft_engine_path=str(args.engine_dir / "mtp.engine") if args.mode == "mtp" else None,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
@@ -210,7 +223,7 @@ def main() -> None:
                     prompts = [
                         corpus[(max(repeat, 0) + i) % len(corpus)][:isl] for i in range(concurrency)
                     ]
-                    row = _measure(runner, prompts, args.osl, args.mode == "mtp")
+                    row = _measure(runner, prompts, args.osl, args.mode == "mtp", max_draft_len)
                     if repeat >= 0:
                         row.update(
                             isl=isl,
@@ -241,6 +254,8 @@ def main() -> None:
         runner.session.shutdown()
     metadata = {
         "mode": args.mode,
+        "max_draft_len": max_draft_len,
+        "gpu_before_load": gpu_before_load,
         "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),

@@ -56,22 +56,24 @@ def main() -> None:
                 str(q_heads),
                 "128",
                 "128",
-                "16",
+                "8",
             ),
-            4,
             1,
+            3,
             v_heads,
             q_heads,
         )
         compiled = triton.compile(
-            _make_source(spec), target=target, options={"num_warps": 4, "num_stages": 1}
+            _make_source(spec), target=target, options={"num_warps": 1, "num_stages": 3}
         )
         # These values form the C++ runner ABI in gatedDeltaRuleDecodeCubins.cpp.
         if (
-            compiled.metadata.shared != 4096
+            compiled.metadata.shared != 512
             or compiled.metadata.name != "gated_delta_rule_verification_kernel"
         ):
-            raise RuntimeError("Verification kernel ABI changed; update the C++ cubin metadata")
+            raise RuntimeError(
+                f"Verification kernel ABI changed: {compiled.metadata}; update the C++ cubin metadata"
+            )
         stem = f"gated_delta_rule_verification_bf16_h{q_heads}_hv{v_heads}_k128_v128_sm{args.arch}"
         path = args.output_dir / f"{stem}.cubin"
         path.write_bytes(compiled.asm["cubin"])

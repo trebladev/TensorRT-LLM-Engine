@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPU coverage for Qwen3.5 K=1 verification through the C++ executor."""
+"""GPU coverage for Qwen3.5 multi-token verification through the C++ executor."""
 
 import gc
+import json
 
 import pytest
 import torch
@@ -28,8 +29,8 @@ from tensorrt_llm.models.qwen35.model import Qwen35ForCausalLM
 from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
 
 
-@pytest.fixture(scope="module")
-def verification_engine(tmp_path_factory):
+@pytest.fixture(scope="module", params=[1, 2, 3])
+def verification_engine(tmp_path_factory, request):
     root = llm_models_root()
     if root is None:
         pytest.skip("LLM_MODELS_ROOT is required")
@@ -46,7 +47,7 @@ def verification_engine(tmp_path_factory):
         max_seq_len=127,
         max_num_tokens=384,
         opt_num_tokens=128,
-        max_draft_len=1,
+        max_draft_len=request.param,
         speculative_decoding_mode=SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
     )
     config.plugin_config.gpt_attention_plugin = "bfloat16"
@@ -66,7 +67,9 @@ def _runner(engine_dir, **overrides):
         max_batch_size=4,
         max_input_len=96,
         max_output_len=32,
-        max_attention_window_size=[128],
+        max_attention_window_size=[
+            json.loads((engine_dir / "config.json").read_text())["build_config"]["max_seq_len"]
+        ],
         kv_cache_enable_block_reuse=False,
         enable_chunked_context=False,
         use_runtime_defaults=False,
@@ -157,6 +160,27 @@ def test_qwen35_executor_external_draft(verification_engine):
         assert _generate(runner, prompts) == baseline
         with pytest.raises(RuntimeError, match="greedy topK=1"):
             _generate(runner, prompt, [[token]], top_k=2)
+    finally:
+        runner.session.shutdown()
+
+
+def test_qwen35_executor_partial_acceptance(verification_engine):
+    draft_length = json.loads((verification_engine / "config.json").read_text())["build_config"][
+        "max_draft_len"
+    ]
+    runner = _runner(verification_engine)
+    try:
+        prompts = [list(range(1, length + 1)) for length in (17, 63, 64, 65)]
+        baseline = _generate(runner, prompts, count=draft_length + 2)
+        for turn in range(draft_length + 1):
+            accepted = [(turn + i) % (draft_length + 1) for i in range(len(prompts))]
+            candidates = [tokens[:draft_length].copy() for tokens in baseline]
+            for candidate, count in zip(candidates, accepted):
+                if count < draft_length:
+                    candidate[count] = (candidate[count] + 1) % 8192
+            actual = _generate(runner, prompts, candidates, count=draft_length + 2)
+            assert actual == [tokens[: count + 1] for tokens, count in zip(baseline, accepted)]
+            assert _generate(runner, prompts, count=draft_length + 2) == baseline
     finally:
         runner.session.shutdown()
 

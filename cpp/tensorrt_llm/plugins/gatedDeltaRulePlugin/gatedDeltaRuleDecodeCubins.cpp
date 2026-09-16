@@ -89,7 +89,7 @@ auto const& getVerificationCubins()
     constexpr int32_t kSm = 89;
     constexpr int32_t kHeadKDim = 128;
     constexpr int32_t kHeadVDim = 128;
-    constexpr int32_t kSharedMemoryBytes = 4096;
+    constexpr int32_t kSharedMemoryBytes = 512;
     constexpr char const* kKernelName = "gated_delta_rule_verification_kernel";
     static std::array<GatedDeltaRuleDecodeCubin, 4> const cubins{{
         {kSm, 8, 8, kHeadKDim, kHeadVDim,

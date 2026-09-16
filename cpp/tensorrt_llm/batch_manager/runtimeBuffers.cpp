@@ -94,7 +94,7 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
             engine.getTensorIOMode("state_snapshot_slot_mapping") == nvinfer1::TensorIOMode::kINPUT
                 ? modelConfig.getMaxNumTokens().value()
                 : 0,
-            modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal());
+            modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal(), modelConfig.getMaxDecodingDraftTokens());
     }
 
     if (modelConfig.isRnnBased())

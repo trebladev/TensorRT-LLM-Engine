@@ -230,15 +230,15 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     bool const isVerification = !hasContext && numTokens != batchSize;
     if (hasContext && hasGeneration)
     {
-        maxSeqLen = std::max(maxSeqLen, 2);
+        maxSeqLen = std::max(maxSeqLen, static_cast<int>(numTokens - batchSize + 1));
     }
     if (isVerification)
     {
-        constexpr int kVerificationTokens = 2;
-        TLLM_CHECK_WITH_INFO(mRemovePadding && mUseInitialStateMask && numTokens >= batchSize
-                && numTokens <= kVerificationTokens * batchSize,
-            "Conv verification requires one or two packed tokens per request and an initial-state mask");
-        maxSeqLen = kVerificationTokens;
+        TLLM_CHECK_WITH_INFO(mRemovePadding && mUseInitialStateMask && numTokens >= batchSize,
+            "Conv verification requires packed tokens and an initial-state mask");
+        // Every request contributes at least one token; the remainder can all
+        // belong to one request in a ragged verification batch.
+        maxSeqLen = numTokens - batchSize + 1;
     }
 
     MambaConv1dParamsBase mambaConv1dParams;

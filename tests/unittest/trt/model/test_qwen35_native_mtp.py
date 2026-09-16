@@ -16,9 +16,11 @@
 """End-to-end persistent native MTP through the C++ executor."""
 
 import gc
+import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -34,26 +36,39 @@ def draft_batching_mode(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
     monkeypatch.setenv("TRTLLM_QWEN35_MTP_DISABLE_DRAFT_BATCHING", "1" if request.param else "0")
 
 
-@pytest.fixture(scope="module")
-def native_engine(tmp_path_factory):
+def _native_engine(tmp_path_factory, draft_length):
     cached = os.environ.get("QWEN35_MTP_ENGINE_DIR")
     if cached:
+        config = json.loads((Path(cached) / "config.json").read_text())
+        if config["build_config"]["max_draft_len"] != draft_length:
+            pytest.skip("Cached engine has a different draft length")
         return Path(cached)
     root = llm_models_root()
     if root is None or not (root / "Qwen3.5-2B").is_dir():
         pytest.skip("Qwen3.5-2B checkpoint is required")
     engine_dir = tmp_path_factory.mktemp("qwen35_native_mtp")
-    build_engines(root / "Qwen3.5-2B", engine_dir, max_batch_size=4)
+    build_engines(root / "Qwen3.5-2B", engine_dir, max_batch_size=4, max_draft_len=draft_length)
     gc.collect()
     torch.cuda.empty_cache()
     return engine_dir
 
 
-def runner_for(engine_dir, native, max_batch_size=1):
+@pytest.fixture(scope="module")
+def native_engine(tmp_path_factory):
+    return _native_engine(tmp_path_factory, 1)
+
+
+@pytest.fixture(scope="module", params=[1, 2, 3])
+def multi_native_engine(tmp_path_factory, request):
+    return _native_engine(tmp_path_factory, request.param)
+
+
+def runner_for(engine_dir, native, max_batch_size=1, *, debug_mode=False):
     return ModelRunnerCpp.from_dir(
         str(engine_dir),
         max_batch_size=max_batch_size,
         cuda_graph_mode=False,
+        debug_mode=debug_mode,
         kv_cache_enable_block_reuse=False,
         enable_chunked_context=False,
         kv_cache_free_gpu_memory_fraction=0.1,
@@ -62,7 +77,7 @@ def runner_for(engine_dir, native, max_batch_size=1):
     )
 
 
-def generate(runner, prompt, count, end_id=-1, *, return_logits=False):
+def generate(runner, prompt, count, end_id=-1):
     result = runner.generate(
         [torch.tensor(prompt, dtype=torch.int32)],
         max_new_tokens=count,
@@ -71,35 +86,77 @@ def generate(runner, prompt, count, end_id=-1, *, return_logits=False):
         pad_id=0,
         return_dict=True,
         output_sequence_lengths=True,
-        output_generation_logits=return_logits,
     )
     length = int(result["sequence_lengths"][0, 0])
     tokens = result["output_ids"][0, 0, len(prompt) : length].tolist()
-    if return_logits:
-        return tokens, result["generation_logits"][0, 0].float().cpu()
     return tokens
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-def test_native_mtp_greedy_and_reuse(native_engine, batch_size):
-    prompts = [list(range(1, length + 1)) for length in (17, 63, 64, 65)]
-    baseline = runner_for(native_engine, False)
+def _baseline_with_logits(engine, prompts, count, monkeypatch, tmp_path):
+    """Copy per-forward logits; returned generation-logit buffers may be reused."""
+    original_debug_config = executor.DebugConfig
+    monkeypatch.setattr(
+        executor,
+        "DebugConfig",
+        lambda **kwargs: original_debug_config(
+            debug_output_tensors=True,
+            debug_tensor_names=["logits"],
+            debug_tensors_max_iterations=0,
+        ),
+    )
+    baseline = runner_for(engine, False, debug_mode=True)
+    reference = []
     try:
-        reference = [generate(baseline, prompt, 24, return_logits=True) for prompt in prompts]
-        expected = [tokens for tokens, _ in reference]
+        for index, prompt in enumerate(prompts):
+            directory = tmp_path / f"reference_{index}"
+            directory.mkdir()
+            monkeypatch.setenv("TMPDIR", str(directory))
+            tokens = generate(baseline, prompt, count)
+            trace_root = directory / "tllm_debug" / "PP_1" / "TP_1"
+            traces = sorted(
+                trace_root.glob("iteration_*"), key=lambda path: int(path.name.split("_")[-1])
+            )
+            logits = [torch.from_numpy(np.load(path / "logits.npy")).float()[0] for path in traces]
+            assert len(logits) == len(tokens)
+            reference.append((tokens, logits))
     finally:
         baseline.session.shutdown()
-        del baseline
-        gc.collect()
+    return reference
+
+
+def _assert_baseline_prefix(actual, expected, logits):
+    """Require equal histories until a BF16-scale tie changes the greedy choice.
+
+    The per-forward test below additionally validates every emitted token after
+    such a divergence against the target row for its own history.
+    """
+    assert len(actual) == len(expected)
+    for index, (token, baseline_token) in enumerate(zip(actual, expected)):
+        if token != baseline_token:
+            scores = logits[index]
+            assert (
+                scores.max() - scores[token] <= torch.finfo(torch.bfloat16).eps * scores.max().abs()
+            )
+            break
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_native_mtp_greedy_and_reuse(native_engine, batch_size, monkeypatch, tmp_path):
+    prompts = [list(range(1, length + 1)) for length in (17, 63, 64, 65)]
+    reference = _baseline_with_logits(native_engine, prompts, 24, monkeypatch, tmp_path)
     native = runner_for(native_engine, True, batch_size)
     try:
         for count in (1, 2, 3, 8, 23, 24):
-            for prompt, tokens in zip(prompts, expected):
-                assert generate(native, prompt, count) == tokens[:count]
-        for prompt, tokens in zip(prompts, expected):
+            for prompt, (tokens, logits) in zip(prompts, reference):
+                _assert_baseline_prefix(generate(native, prompt, count), tokens[:count], logits)
+        for prompt, (tokens, logits) in zip(prompts, reference):
             for eos in tokens[:4]:
-                assert generate(native, prompt, 24, eos) == tokens[: tokens.index(eos) + 1]
-        assert generate(native, prompts[0], 24) == expected[0]
+                _assert_baseline_prefix(
+                    generate(native, prompt, 24, eos),
+                    tokens[: tokens.index(eos) + 1],
+                    logits,
+                )
+        _assert_baseline_prefix(generate(native, prompts[0], 24), *reference[0])
         # Enqueued requests must preserve independent histories as slots are reused.
         ropes = native._prepare_mrope_executor(prompts, None)
         requests = [
@@ -126,20 +183,12 @@ def test_native_mtp_greedy_and_reuse(native_engine, batch_size):
             for response in responses:
                 assert not response.has_error(), response.error_msg
                 emitted = response.result.output_token_ids[0]
-                saw_two_tokens |= len(emitted) == 2
+                saw_two_tokens |= len(emitted) >= 2
                 actual[response.request_id].extend(emitted)
                 if response.result.is_final:
                     finished.add(response.request_id)
         for i, request_id in enumerate(ids):
-            # Changing the final mixed-batch GEMM shape can move a near-tied
-            # logit by one BF16 rounding bin. All preceding tokens must match.
-            tokens = actual[request_id]
-            assert len(tokens) == len(expected[i])
-            assert tokens[:-1] == expected[i][:-1]
-            if tokens[-1] != expected[i][-1]:
-                logits = reference[i][1][-1]
-                gap = logits.max() - logits[tokens[-1]]
-                assert gap <= torch.finfo(torch.bfloat16).eps * logits.max().abs()
+            _assert_baseline_prefix(actual[request_id], *reference[i])
         assert saw_two_tokens, "Expected an accepted candidate plus a bonus token"
         stats = [
             item.inflight_batching_stats for item in native.session.get_latest_iteration_stats()
@@ -157,20 +206,15 @@ def test_native_mtp_greedy_and_reuse(native_engine, batch_size):
             responses = native.session.await_responses(timeout=30.0)
             assert responses, "Timed out waiting for cancellation"
             assert all(not response.has_error() for response in responses)
-        assert generate(native, prompts[1], 24) == expected[1]
+        _assert_baseline_prefix(generate(native, prompts[1], 24), *reference[1])
     finally:
         native.session.shutdown()
 
 
-def test_native_mtp_mixed_budgets_and_arrivals(native_engine):
+def test_native_mtp_mixed_budgets_and_arrivals(native_engine, monkeypatch, tmp_path):
     prompts = [list(range(1, length + 1)) for length in (17, 63, 64, 65)]
-    baseline = runner_for(native_engine, False)
-    try:
-        expected = [generate(baseline, prompt, 32) for prompt in prompts]
-    finally:
-        baseline.session.shutdown()
-        del baseline
-        gc.collect()
+    reference = _baseline_with_logits(native_engine, prompts, 32, monkeypatch, tmp_path)
+    expected = [tokens for tokens, _ in reference]
     native = runner_for(native_engine, True, 4)
     try:
         ropes = native._prepare_mrope_executor(prompts, None)
@@ -222,9 +266,13 @@ def test_native_mtp_mixed_budgets_and_arrivals(native_engine):
                     assert len(actual[request_id]) < len(tokens), (
                         "Cancellation must stop an active request early"
                     )
-                    assert actual[request_id] == tokens[: len(actual[request_id])]
+                    _assert_baseline_prefix(
+                        actual[request_id],
+                        tokens[: len(actual[request_id])],
+                        reference[i][1],
+                    )
                 else:
-                    assert actual[request_id] == tokens
+                    _assert_baseline_prefix(actual[request_id], tokens, reference[i][1])
             stats = [
                 item.inflight_batching_stats for item in native.session.get_latest_iteration_stats()
             ]
@@ -233,5 +281,158 @@ def test_native_mtp_mixed_budgets_and_arrivals(native_engine):
                 for item in stats
             )
         assert saw_mixed, "Expected overlapping context and generation requests"
+    finally:
+        native.session.shutdown()
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_native_mtp_multiple_drafts(multi_native_engine, batch_size, monkeypatch, tmp_path):
+    """Validate every emitted token against its actual target verification row.
+
+    Wider BF16 forwards can create ties absent in single-token decoding. Check
+    the first divergence against independent baseline logits, then check every
+    native emission against the target logits for its own accepted history.
+    Debug copies avoid the output-buffer aliasing of delayed logits fragments.
+    """
+    original_debug_config = executor.DebugConfig
+    monkeypatch.setattr(
+        executor,
+        "DebugConfig",
+        lambda **kwargs: original_debug_config(
+            debug_input_tensors=True,
+            debug_output_tensors=True,
+            debug_tensor_names=[
+                "input_ids",
+                "logits",
+                "host_request_types",
+                "host_past_key_value_lengths",
+                "gated_delta_cu_seqlens",
+            ],
+            debug_tensors_max_iterations=0,
+        ),
+    )
+
+    def trace_directory(name):
+        directory = tmp_path / name
+        directory.mkdir()
+        monkeypatch.setenv("TMPDIR", str(directory))
+        return directory / "tllm_debug" / "PP_1" / "TP_1"
+
+    def read_traces(directory):
+        return [
+            {path.stem: torch.from_numpy(np.load(path)) for path in entry.glob("*.npy")}
+            for entry in sorted(
+                directory.glob("iteration_*"), key=lambda path: int(path.name.split("_")[-1])
+            )
+        ]
+
+    config = json.loads((multi_native_engine / "config.json").read_text())
+    draft_length = config["build_config"]["max_draft_len"]
+    prompts = [list(range(1, length + 1)) for length in (17, 63, 64, 65)]
+    baseline = runner_for(multi_native_engine, False, debug_mode=True)
+    reference = []
+    try:
+        for index, prompt in enumerate(prompts):
+            directory = trace_directory(f"baseline_{index}")
+            tokens = generate(baseline, prompt, 32)
+            logits = [item["logits"].float()[0] for item in read_traces(directory)]
+            assert len(logits) == len(tokens)
+            reference.append((tokens, logits))
+    finally:
+        baseline.session.shutdown()
+        del baseline
+        gc.collect()
+
+    native = runner_for(multi_native_engine, True, batch_size, debug_mode=True)
+    saw_full_width = saw_rejection = False
+    try:
+        ropes = native._prepare_mrope_executor(prompts, None)
+        for turn, budgets in enumerate(((1, 2, draft_length + 2, 32), (24, 25, 20, 32))):
+            eos_ids = [-1, -1, reference[2][0][3] if turn else -1, -1]
+            requests = [
+                executor.Request(
+                    input_token_ids=prompt,
+                    max_tokens=budget,
+                    end_id=eos,
+                    pad_id=0,
+                    streaming=True,
+                    sampling_config=executor.SamplingConfig(top_k=1),
+                    output_config=executor.OutputConfig(exclude_input_from_output=True),
+                    mrope_config=rope,
+                )
+                for prompt, budget, eos, rope in zip(prompts, budgets, eos_ids, ropes)
+            ]
+            directory = trace_directory(f"native_{turn}")
+            ids = native.session.enqueue_requests(requests[:3])
+            actual = {request_id: [] for request_id in ids}
+            finished = set()
+            added = False
+            while len(finished) < len(ids) or not added:
+                responses = native.session.await_responses(timeout=30.0)
+                assert responses, "Timed out waiting for multi-token native MTP"
+                for response in responses:
+                    assert not response.has_error(), response.error_msg
+                    actual[response.request_id].extend(response.result.output_token_ids[0])
+                    if response.result.is_final:
+                        finished.add(response.request_id)
+                if not added:
+                    request_id = native.session.enqueue_request(requests[3])
+                    ids.append(request_id)
+                    actual[request_id] = []
+                    added = True
+
+            traces = {request_id: [] for request_id in ids}
+            for tensors in read_traces(directory):
+                request_ids = tensors["request_ids"].flatten().tolist()
+                ends = tensors["gated_delta_cu_seqlens"].tolist()
+                types = tensors["host_request_types"].tolist()
+                past = tensors["host_past_key_value_lengths"].tolist()
+                logits_offset = 0
+                for row, request_id in enumerate(request_ids):
+                    context = types[row] == 0
+                    width = ends[row + 1] - ends[row]
+                    rows = 1 if context else width
+                    prompt_length = len(prompts[ids.index(request_id)])
+                    start = 0 if context else past[row] + 1 - prompt_length
+                    traces[request_id].append(
+                        (
+                            start,
+                            tensors["logits"][logits_offset : logits_offset + rows].float().cpu(),
+                            tensors["input_ids"][ends[row] : ends[row + 1]].cpu(),
+                            context,
+                        )
+                    )
+                    logits_offset += rows
+                    saw_full_width |= not context and width == draft_length + 1
+
+            for i, request_id in enumerate(ids):
+                tokens = actual[request_id]
+                if eos_ids[i] in tokens:
+                    assert tokens[-1] == eos_ids[i]
+                else:
+                    assert len(tokens) == budgets[i]
+                expected, baseline_logits = reference[i]
+                for index, (token, expected_token) in enumerate(zip(tokens, expected)):
+                    if token != expected_token:
+                        scores = baseline_logits[index]
+                        assert (
+                            scores.max() - scores[token]
+                            <= torch.finfo(torch.bfloat16).eps * scores.max().abs()
+                        )
+                        break
+                entries = traces[request_id]
+                for index, (start, scores, inputs, context) in enumerate(entries):
+                    end = entries[index + 1][0] if index + 1 < len(entries) else len(tokens)
+                    count = end - start
+                    assert 0 < count <= scores.shape[0]
+                    emitted = torch.tensor(tokens[start:end], dtype=torch.long)
+                    selected = scores[torch.arange(count), emitted]
+                    torch.testing.assert_close(selected, scores[:count].amax(-1), atol=0, rtol=0)
+                    if not context:
+                        assert inputs[0].item() == tokens[start - 1]
+                        assert inputs[1:count].tolist() == tokens[start : end - 1]
+                        saw_rejection |= count < scores.shape[0]
+        assert saw_full_width, "Expected K+1 target verification rows"
+        assert saw_rejection, "Expected a rejected draft suffix"
     finally:
         native.session.shutdown()

@@ -62,7 +62,7 @@ def convert_mtp_weights(
 
 
 class Qwen35MTP(Qwen35ForCausalLM):
-    """K=1 BF16 draft engine; inputs pair token t+1 with target hidden state t.
+    """Autoregressive BF16 draft engine; inputs pair token t+1 with target hidden state t.
 
     Target states are taken after the target's final normalization. MTP has
     its own pre-FC norms, one full-attention decoder, and final normalization.
@@ -116,6 +116,7 @@ class Qwen35MTP(Qwen35ForCausalLM):
             spec_decoding_params=kwargs.get("spec_decoding_params"),
         )
         hidden_states = self.transformer.ln_f(hidden_states)
+        hidden_states.mark_output("mtp_hidden_states", self.dtype)
         if last_token_logits:
             if kwargs.get("last_token_ids") is None:
                 raise ValueError("Last-token MTP projection requires last_token_ids")
@@ -137,9 +138,9 @@ class Qwen35MTP(Qwen35ForCausalLM):
         return logits
 
     def prepare_inputs(self, *args, **kwargs) -> dict:
-        """Use the target's K=1 profiles, with an additional packed hidden input."""
-        if kwargs.get("max_draft_len") != 1:
-            raise ValueError("MTP requires K=1 engine profiles")
+        """Use the target's verification profiles, with an additional packed hidden input."""
+        if not 1 <= kwargs.get("max_draft_len", 0) <= 30:
+            raise ValueError("MTP requires 1 to 30 draft tokens in engine profiles")
         kwargs["speculative_decoding_draft_tokens_external"] = False
         kwargs["num_hidden_layers"] = 1
         kwargs["mrope_rotary_cos_sin_size"] = (

@@ -622,22 +622,21 @@ int32_t GatedDeltaRulePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginT
     int64_t const numTokens = static_cast<int64_t>(queryDims.d[0]) * queryDims.d[1];
     if (numTokens != numRequests)
     {
-        constexpr int32_t kVerificationTokens = 2;
-        if (!mRemoveInputPadding || queryDims.d[0] != 1 || numTokens < numRequests
-            || numTokens > kVerificationTokens * numRequests)
+        if (!mRemoveInputPadding || queryDims.d[0] != 1 || numTokens < numRequests)
         {
-            TLLM_LOG_ERROR("GatedDeltaRule verification requires one or two packed tokens per request");
+            TLLM_LOG_ERROR("GatedDeltaRule verification requires packed tokens for every request");
             return -1;
         }
-        // The paged-state short path preserves chunk BF16 intermediates and
-        // per-token snapshots. The caller commits only the accepted prefix.
+        // Recurrent verification advances each packed request inside one kernel,
+        // preserving per-token snapshots for accepted-prefix state commits.
         if (mPagedState)
         {
             return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream, true);
         }
         return enqueuePrefill(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
-    return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+    // A one-token verification still needs to publish its snapshot.
+    return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream, mPagedState && mUseStateSnapshots);
 }
 
 IPluginV3* GatedDeltaRulePlugin::attachToContext(IPluginResourceContext* context) noexcept

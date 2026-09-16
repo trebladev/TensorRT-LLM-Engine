@@ -189,7 +189,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             kv_cache_enable_block_reuse (bool):
                 Enables block reuse in kv cache.
             mtp_draft_engine_path (str):
-                Optional native Qwen3.5 K=1 draft engine for batched BF16 greedy generation.
+                Optional native Qwen3.5 draft engine for batched BF16 greedy generation.
+                The target engine determines the maximum draft length.
             enable_chunked_context (bool):
                 Enables chunked context.
             is_enc_dec (bool):

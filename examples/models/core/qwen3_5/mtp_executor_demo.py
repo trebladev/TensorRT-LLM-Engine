@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build and run native K=1 MTP entirely inside the C++ executor."""
+"""Build and run native autoregressive MTP entirely inside the C++ executor."""
 
 import argparse
 import gc
@@ -32,15 +32,23 @@ from .mtp_demo import save_paged_draft_engine
 
 
 def build_engines(
-    model_dir: Path, engine_dir: Path, max_seq_len: int = 128, max_batch_size: int = 1
+    model_dir: Path,
+    engine_dir: Path,
+    max_seq_len: int = 128,
+    max_batch_size: int = 1,
+    max_draft_len: int = 1,
 ) -> Path:
     """Save a paged-KV target and a persistent paged-KV MTP draft engine."""
     if max_batch_size < 1 or max_seq_len < 3:
         raise ValueError("max_batch_size must be positive and max_seq_len must be at least 3")
+    if not 1 <= max_draft_len <= 30 or max_seq_len <= max_draft_len + 1:
+        raise ValueError("Require 1 <= max_draft_len <= 30 and max_seq_len > max_draft_len + 1")
     engine_dir.mkdir(parents=True, exist_ok=True)
     model = Qwen35MTP.from_hugging_face(model_dir)
     draft_path = engine_dir / "mtp.engine"
-    save_paged_draft_engine(model, draft_path, max_seq_len + 1, max_batch_size)
+    save_paged_draft_engine(
+        model, draft_path, max_seq_len + max_draft_len, max_batch_size, max_draft_len=max_draft_len
+    )
     del model
     gc.collect()
     torch.cuda.empty_cache()
@@ -48,11 +56,11 @@ def build_engines(
     model.capture_mtp_hidden_states = True
     config = BuildConfig(
         max_batch_size=max_batch_size,
-        max_input_len=max_seq_len - 2,
+        max_input_len=max_seq_len - max_draft_len - 1,
         max_seq_len=max_seq_len,
         max_num_tokens=max_seq_len * max_batch_size,
         opt_num_tokens=min(64, max_seq_len) * max_batch_size,
-        max_draft_len=1,
+        max_draft_len=max_draft_len,
         speculative_decoding_mode=SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
     )
     config.plugin_config.gpt_attention_plugin = "bfloat16"
@@ -68,6 +76,7 @@ def main() -> None:
     parser.add_argument("--engine_dir", type=Path, required=True)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--max_batch_size", type=int, default=1)
+    parser.add_argument("--max_draft_len", type=int, default=1)
     parser.add_argument(
         "--prompt", action="append", help="Repeat to generate multiple prompts in one batch"
     )
@@ -77,7 +86,12 @@ def main() -> None:
     if args.max_batch_size < 1 or len(prompts) > args.max_batch_size:
         parser.error("max_batch_size must be positive and cover the number of prompts")
     if args.build:
-        build_engines(args.model_dir, args.engine_dir, max_batch_size=args.max_batch_size)
+        build_engines(
+            args.model_dir,
+            args.engine_dir,
+            max_batch_size=args.max_batch_size,
+            max_draft_len=args.max_draft_len,
+        )
         gc.collect()
         torch.cuda.empty_cache()
     runner = ModelRunnerCpp.from_dir(
